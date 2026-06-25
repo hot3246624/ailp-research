@@ -1,5 +1,6 @@
 /target/
 /data/
+/logs/
 .env
 .DS_Store
 *.log
