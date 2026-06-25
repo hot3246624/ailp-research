@@ -185,6 +185,7 @@ cargo run -p autopool-cli -- backfill-slipstream-events \
   --max-blocks-per-run 100 \
   --log-chunk-blocks 10 \
   --sleep-ms 250 \
+  --poll-seconds 30 \
   --iterations 1 \
   --limit 4
 ```

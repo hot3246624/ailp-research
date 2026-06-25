@@ -54,7 +54,7 @@ chmod 700 ~/.config/ailp
 printf '%s\n' 'https://your-base-rpc.example' > ~/.config/ailp/base_rpc_url
 chmod 600 ~/.config/ailp/base_rpc_url
 
-nohup bash -lc 'cd ~/ailp_research && . ~/.cargo/env && BASE_RPC_URL="$(cat ~/.config/ailp/base_rpc_url)" cargo run -q -p autopool-cli -- backfill-slipstream-events --data-dir data/base/aerodrome --lookback-blocks 7200 --max-blocks-per-run 100 --log-chunk-blocks 10 --sleep-ms 250 --poll-seconds 300 --iterations 0 --limit 4' \
+nohup bash -lc 'cd ~/ailp_research && . ~/.cargo/env && BASE_RPC_URL="$(cat ~/.config/ailp/base_rpc_url)" cargo run -q -p autopool-cli -- backfill-slipstream-events --data-dir data/base/aerodrome --lookback-blocks 7200 --max-blocks-per-run 200 --log-chunk-blocks 10 --sleep-ms 300 --poll-seconds 30 --iterations 0 --limit 4' \
   > logs/ailp-backfill.out 2> logs/ailp-backfill.err &
 echo $! > logs/ailp-backfill.pid
 ```

@@ -43,7 +43,7 @@ cargo run -p autopool-cli -- pilot-universe --min-tvl-usd 100000 --min-volume-us
 BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- sample-base-network --eth-usd 3500
 BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- resolve-slipstream-pools --limit 8
 BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- sample-slipstream-events --lookback-blocks 100 --log-chunk-blocks 10 --limit 4
-BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- backfill-slipstream-events --lookback-blocks 7200 --max-blocks-per-run 100 --log-chunk-blocks 10 --iterations 1
+BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- backfill-slipstream-events --lookback-blocks 7200 --max-blocks-per-run 200 --log-chunk-blocks 10 --poll-seconds 30 --iterations 1
 ```
 
 ## External References

@@ -112,7 +112,7 @@ enum Command {
         log_chunk_blocks: u64,
         #[arg(long, default_value_t = 250)]
         sleep_ms: u64,
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 30)]
         poll_seconds: u64,
         #[arg(long, default_value_t = 1)]
         iterations: u64,
