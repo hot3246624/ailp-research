@@ -13,5 +13,6 @@ autopool-defillama.workspace = true
 autopool-evm.workspace = true
 autopool-strategy.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

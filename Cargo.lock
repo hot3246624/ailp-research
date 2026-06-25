@@ -102,6 +102,7 @@ dependencies = [
  "autopool-evm",
  "autopool-strategy",
  "clap",
+ "serde",
  "serde_json",
  "tokio",
 ]

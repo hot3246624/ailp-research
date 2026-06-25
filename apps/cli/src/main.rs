@@ -4,9 +4,15 @@ use autopool_aerodrome::{
     build_pilot_universe,
 };
 use autopool_defillama::{DefiLlamaClient, PoolFilter};
-use autopool_evm::JsonRpcClient;
+use autopool_evm::{BURN_TOPIC, COLLECT_TOPIC, JsonRpcClient, MINT_TOPIC, SWAP_TOPIC};
 use autopool_strategy::WeightedRiskModel;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use serde_json::json;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
@@ -92,6 +98,32 @@ enum Command {
         limit: usize,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
+    },
+    BackfillSlipstreamEvents {
+        #[arg(long, env = "BASE_RPC_URL")]
+        rpc_url: String,
+        #[arg(long, default_value = "data/base/aerodrome")]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 7_200)]
+        lookback_blocks: u64,
+        #[arg(long, default_value_t = 100)]
+        max_blocks_per_run: u64,
+        #[arg(long, default_value_t = 10)]
+        log_chunk_blocks: u64,
+        #[arg(long, default_value_t = 250)]
+        sleep_ms: u64,
+        #[arg(long, default_value_t = 300)]
+        poll_seconds: u64,
+        #[arg(long, default_value_t = 1)]
+        iterations: u64,
+        #[arg(long, default_value_t = 100_000.0)]
+        min_tvl_usd: f64,
+        #[arg(long, default_value_t = 100_000.0)]
+        min_volume_usd_1d: f64,
+        #[arg(long, default_value_t = 0.5)]
+        max_reward_share: f64,
+        #[arg(long, default_value_t = 4)]
+        limit: usize,
     },
 }
 
@@ -179,6 +211,36 @@ async fn main() -> Result<()> {
                 limit,
                 format,
             )
+            .await?
+        }
+        Command::BackfillSlipstreamEvents {
+            rpc_url,
+            data_dir,
+            lookback_blocks,
+            max_blocks_per_run,
+            log_chunk_blocks,
+            sleep_ms,
+            poll_seconds,
+            iterations,
+            min_tvl_usd,
+            min_volume_usd_1d,
+            max_reward_share,
+            limit,
+        } => {
+            backfill_slipstream_events(BackfillConfig {
+                rpc_url,
+                data_dir,
+                lookback_blocks,
+                max_blocks_per_run,
+                log_chunk_blocks,
+                sleep_ms,
+                poll_seconds,
+                iterations,
+                min_tvl_usd,
+                min_volume_usd_1d,
+                max_reward_share,
+                limit,
+            })
             .await?
         }
     }
@@ -510,4 +572,292 @@ async fn sample_slipstream_events(
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct BackfillConfig {
+    rpc_url: String,
+    data_dir: PathBuf,
+    lookback_blocks: u64,
+    max_blocks_per_run: u64,
+    log_chunk_blocks: u64,
+    sleep_ms: u64,
+    poll_seconds: u64,
+    iterations: u64,
+    min_tvl_usd: f64,
+    min_volume_usd_1d: f64,
+    max_reward_share: f64,
+    limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCandidate {
+    candidate: autopool_aerodrome::SlipstreamCandidate,
+    deployment: autopool_aerodrome::SlipstreamDeployment,
+    pool_address: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EventTopic {
+    name: &'static str,
+    topic: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct BackfillProgress<'a> {
+    symbol: &'a str,
+    pool_address: &'a str,
+    from_block: u64,
+    to_block: u64,
+    events_written: usize,
+    next_block: u64,
+}
+
+const EVENT_TOPICS: [EventTopic; 4] = [
+    EventTopic {
+        name: "swap",
+        topic: SWAP_TOPIC,
+    },
+    EventTopic {
+        name: "mint",
+        topic: MINT_TOPIC,
+    },
+    EventTopic {
+        name: "burn",
+        topic: BURN_TOPIC,
+    },
+    EventTopic {
+        name: "collect",
+        topic: COLLECT_TOPIC,
+    },
+];
+
+async fn backfill_slipstream_events(config: BackfillConfig) -> Result<()> {
+    let rpc = JsonRpcClient::new(config.rpc_url.clone());
+    let resolved = resolve_pilot_candidates(
+        &config.rpc_url,
+        config.min_tvl_usd,
+        config.min_volume_usd_1d,
+        config.max_reward_share,
+        config.limit,
+    )
+    .await?;
+
+    fs::create_dir_all(config.data_dir.join("events"))?;
+    fs::create_dir_all(config.data_dir.join("checkpoints"))?;
+
+    let mut iteration = 0_u64;
+    loop {
+        iteration += 1;
+        let latest = rpc.latest_block_number().await?;
+        let mut total_written = 0_usize;
+
+        for item in &resolved {
+            let checkpoint_path = checkpoint_path(&config.data_dir, &item.pool_address);
+            let default_start = latest.saturating_sub(config.lookback_blocks.saturating_sub(1));
+            let start = read_next_block(&checkpoint_path)?.unwrap_or(default_start);
+
+            if start > latest {
+                continue;
+            }
+
+            let to_block = start
+                .saturating_add(config.max_blocks_per_run.saturating_sub(1))
+                .min(latest);
+            let written = backfill_candidate_window(&rpc, &config, item, start, to_block).await?;
+            write_checkpoint(&checkpoint_path, item, to_block + 1)?;
+            total_written += written;
+
+            println!(
+                "{}",
+                serde_json::to_string(&BackfillProgress {
+                    symbol: &item.candidate.symbol,
+                    pool_address: &item.pool_address,
+                    from_block: start,
+                    to_block,
+                    events_written: written,
+                    next_block: to_block + 1,
+                })?
+            );
+        }
+
+        eprintln!("iteration={iteration} latest={latest} total_events_written={total_written}");
+
+        if config.iterations != 0 && iteration >= config.iterations {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(config.poll_seconds)).await;
+    }
+
+    Ok(())
+}
+
+async fn resolve_pilot_candidates(
+    rpc_url: &str,
+    min_tvl_usd: f64,
+    min_volume_usd_1d: f64,
+    max_reward_share: f64,
+    limit: usize,
+) -> Result<Vec<ResolvedCandidate>> {
+    let client = DefiLlamaClient::default();
+    let snapshots = client
+        .fetch_snapshots(&PoolFilter {
+            chains: vec!["Base".to_string()],
+            projects: vec!["aerodrome-slipstream".to_string()],
+            min_tvl_usd: Some(min_tvl_usd),
+            lp_only: true,
+            dex_only: true,
+            exclude_outliers: true,
+        })
+        .await?;
+    let universe =
+        build_pilot_universe(&snapshots, min_tvl_usd, min_volume_usd_1d, max_reward_share);
+    let rpc = JsonRpcClient::new(rpc_url.to_string());
+    let factories = base_slipstream_factories_latest_first();
+    let mut resolved = Vec::new();
+
+    for candidate in universe.into_iter().take(limit) {
+        let Some(tick_spacing) = candidate.tick_spacing else {
+            continue;
+        };
+        if candidate.underlying_tokens.len() != 2 {
+            continue;
+        }
+
+        let token0 = &candidate.underlying_tokens[0];
+        let token1 = &candidate.underlying_tokens[1];
+
+        for factory in factories {
+            if let Some(pool_address) = rpc
+                .get_cl_pool(factory.pool_factory, token0, token1, tick_spacing)
+                .await?
+            {
+                resolved.push(ResolvedCandidate {
+                    candidate: candidate.clone(),
+                    deployment: factory.deployment,
+                    pool_address,
+                });
+                break;
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+async fn backfill_candidate_window(
+    rpc: &JsonRpcClient,
+    config: &BackfillConfig,
+    item: &ResolvedCandidate,
+    from_block: u64,
+    to_block: u64,
+) -> Result<usize> {
+    let mut written = 0_usize;
+    let mut cursor = from_block;
+
+    while cursor <= to_block {
+        let chunk_end = cursor
+            .saturating_add(config.log_chunk_blocks.saturating_sub(1))
+            .min(to_block);
+
+        for event_topic in EVENT_TOPICS {
+            let logs = rpc
+                .get_logs(&item.pool_address, cursor, chunk_end, event_topic.topic)
+                .await?;
+            if !logs.is_empty() {
+                let event_path = event_path(&config.data_dir, &item.pool_address)?;
+                append_event_logs(&event_path, item, event_topic.name, &logs)?;
+                written += logs.len();
+            }
+
+            if config.sleep_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(config.sleep_ms)).await;
+            }
+        }
+
+        if chunk_end == u64::MAX {
+            break;
+        }
+        cursor = chunk_end + 1;
+    }
+
+    Ok(written)
+}
+
+fn event_path(data_dir: &Path, pool_address: &str) -> Result<PathBuf> {
+    let dir = data_dir
+        .join("events")
+        .join(pool_address.to_ascii_lowercase());
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join("events.jsonl"))
+}
+
+fn checkpoint_path(data_dir: &Path, pool_address: &str) -> PathBuf {
+    data_dir
+        .join("checkpoints")
+        .join(format!("{}.json", pool_address.to_ascii_lowercase()))
+}
+
+fn read_next_block(path: &Path) -> Result<Option<u64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw)?;
+    Ok(value.get("next_block").and_then(|value| value.as_u64()))
+}
+
+fn write_checkpoint(path: &Path, item: &ResolvedCandidate, next_block: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&json!({
+            "symbol": item.candidate.symbol,
+            "pool_address": item.pool_address,
+            "deployment": format!("{:?}", item.deployment),
+            "next_block": next_block,
+            "updated_unix": current_unix_timestamp(),
+        }))?,
+    )?;
+
+    Ok(())
+}
+
+fn append_event_logs(
+    path: &Path,
+    item: &ResolvedCandidate,
+    event_type: &str,
+    logs: &[autopool_evm::EthLog],
+) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    for log in logs {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&json!({
+                "chain": "Base",
+                "project": "aerodrome-slipstream",
+                "symbol": item.candidate.symbol,
+                "pool_address": item.pool_address,
+                "deployment": format!("{:?}", item.deployment),
+                "event_type": event_type,
+                "log": log,
+            }))?
+        )?;
+    }
+
+    Ok(())
+}
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }

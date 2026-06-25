@@ -175,6 +175,34 @@ cargo run -p autopool-cli -- sample-slipstream-events \
 
 The provided Alchemy free-tier endpoint currently limits `eth_getLogs` to 10 blocks per request, so `--log-chunk-blocks 10` is required for longer windows. Larger historical backfills should use a paid RPC tier, an archive/indexer endpoint, or a dedicated event ingestion job with rate limiting and checkpointing.
 
+Run a checkpointed backfill into ignored local data files:
+
+```bash
+BASE_RPC_URL=https://your-base-rpc.example \
+cargo run -p autopool-cli -- backfill-slipstream-events \
+  --data-dir data/base/aerodrome \
+  --lookback-blocks 7200 \
+  --max-blocks-per-run 100 \
+  --log-chunk-blocks 10 \
+  --sleep-ms 250 \
+  --iterations 1 \
+  --limit 4
+```
+
+The command appends raw logs to:
+
+```text
+data/base/aerodrome/events/{pool_address}/events.jsonl
+```
+
+and writes restart checkpoints to:
+
+```text
+data/base/aerodrome/checkpoints/{pool_address}.json
+```
+
+Use `--iterations 0` for a long-running process. `data/` is git-ignored.
+
 ## Official Protocol Constants
 
 The pilot uses the current latest Aerodrome Slipstream Gauges V3 deployment from the official `aerodrome-finance/slipstream` repository:
