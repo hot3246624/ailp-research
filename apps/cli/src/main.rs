@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use autopool_aerodrome::{
     BASE_CHAIN_ID, BASE_SLIPSTREAM_GAUGES_V3, base_slipstream_factories_latest_first,
     build_pilot_universe,
@@ -7,10 +7,11 @@ use autopool_defillama::{DefiLlamaClient, PoolFilter};
 use autopool_evm::{BURN_TOPIC, COLLECT_TOPIC, JsonRpcClient, MINT_TOPIC, SWAP_TOPIC};
 use autopool_strategy::WeightedRiskModel;
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -124,6 +125,12 @@ enum Command {
         max_reward_share: f64,
         #[arg(long, default_value_t = 4)]
         limit: usize,
+    },
+    SummarizeSlipstreamEvents {
+        #[arg(long, default_value = "data/base/aerodrome")]
+        data_dir: PathBuf,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 }
 
@@ -242,6 +249,9 @@ async fn main() -> Result<()> {
                 limit,
             })
             .await?
+        }
+        Command::SummarizeSlipstreamEvents { data_dir, format } => {
+            summarize_slipstream_events(data_dir, format)?
         }
     }
 
@@ -853,6 +863,349 @@ fn append_event_logs(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredPoolEvent {
+    symbol: String,
+    pool_address: String,
+    event_type: String,
+    log: autopool_evm::EthLog,
+}
+
+#[derive(Debug, Default)]
+struct EventSummaryBuilder {
+    symbol: Option<String>,
+    pool_address: Option<String>,
+    events: usize,
+    swap_count: usize,
+    mint_count: usize,
+    burn_count: usize,
+    collect_count: usize,
+    other_count: usize,
+    unique_txs: BTreeSet<String>,
+    active_event_blocks: BTreeSet<u64>,
+    active_swap_blocks: BTreeSet<u64>,
+    block_min: Option<u64>,
+    block_max: Option<u64>,
+    ticks: Vec<i32>,
+    first_swap: Option<(u64, u64, i32)>,
+    last_swap: Option<(u64, u64, i32)>,
+    token0_in_swaps: usize,
+    token1_in_swaps: usize,
+    other_swaps: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SlipstreamEventFileSummary {
+    symbol: String,
+    pool_address: String,
+    events: usize,
+    swap_count: usize,
+    mint_count: usize,
+    burn_count: usize,
+    collect_count: usize,
+    other_count: usize,
+    unique_txs: usize,
+    block_min: Option<u64>,
+    block_max: Option<u64>,
+    span_blocks: Option<u64>,
+    active_event_blocks: usize,
+    active_swap_blocks: usize,
+    events_per_1k_blocks: Option<f64>,
+    swaps_per_1k_blocks: Option<f64>,
+    tick_first: Option<i32>,
+    tick_last: Option<i32>,
+    tick_min: Option<i32>,
+    tick_p05: Option<f64>,
+    tick_p50: Option<f64>,
+    tick_p95: Option<f64>,
+    tick_max: Option<i32>,
+    tick_span: Option<i32>,
+    token0_in_swaps: usize,
+    token1_in_swaps: usize,
+    other_swaps: usize,
+}
+
+impl EventSummaryBuilder {
+    fn add(&mut self, event: StoredPoolEvent) {
+        self.symbol.get_or_insert(event.symbol);
+        self.pool_address.get_or_insert(event.pool_address);
+        self.events += 1;
+
+        let block = event
+            .log
+            .block_number
+            .as_deref()
+            .and_then(parse_hex_u64_lossy);
+        if let Some(block) = block {
+            self.active_event_blocks.insert(block);
+            self.block_min = Some(self.block_min.map_or(block, |value| value.min(block)));
+            self.block_max = Some(self.block_max.map_or(block, |value| value.max(block)));
+        }
+
+        if let Some(tx_hash) = event.log.transaction_hash {
+            self.unique_txs.insert(tx_hash);
+        }
+
+        match event.event_type.to_ascii_lowercase().as_str() {
+            "swap" => {
+                self.swap_count += 1;
+                if let Some(block) = block {
+                    self.active_swap_blocks.insert(block);
+                    if let Some(tick) = decode_swap_tick_lossy(&event.log.data) {
+                        let log_index = event
+                            .log
+                            .log_index
+                            .as_deref()
+                            .and_then(parse_hex_u64_lossy)
+                            .unwrap_or_default();
+                        self.add_tick(block, log_index, tick);
+                    }
+                }
+
+                match decode_swap_amount_signs_lossy(&event.log.data) {
+                    Some((1, -1)) => self.token0_in_swaps += 1,
+                    Some((-1, 1)) => self.token1_in_swaps += 1,
+                    _ => self.other_swaps += 1,
+                }
+            }
+            "mint" => self.mint_count += 1,
+            "burn" => self.burn_count += 1,
+            "collect" => self.collect_count += 1,
+            _ => self.other_count += 1,
+        }
+    }
+
+    fn add_tick(&mut self, block: u64, log_index: u64, tick: i32) {
+        let key = (block, log_index, tick);
+        if self
+            .first_swap
+            .map_or(true, |current| (block, log_index) < (current.0, current.1))
+        {
+            self.first_swap = Some(key);
+        }
+        if self
+            .last_swap
+            .map_or(true, |current| (block, log_index) > (current.0, current.1))
+        {
+            self.last_swap = Some(key);
+        }
+        self.ticks.push(tick);
+    }
+
+    fn finish(self) -> SlipstreamEventFileSummary {
+        let span_blocks = match (self.block_min, self.block_max) {
+            (Some(min), Some(max)) => Some(max.saturating_sub(min).saturating_add(1)),
+            _ => None,
+        };
+        let events_per_1k_blocks = span_blocks.map(|span| per_1k_blocks(self.events, span));
+        let swaps_per_1k_blocks = span_blocks.map(|span| per_1k_blocks(self.swap_count, span));
+        let tick_min = self.ticks.iter().min().copied();
+        let tick_max = self.ticks.iter().max().copied();
+
+        SlipstreamEventFileSummary {
+            symbol: self.symbol.unwrap_or_else(|| "-".to_string()),
+            pool_address: self.pool_address.unwrap_or_else(|| "-".to_string()),
+            events: self.events,
+            swap_count: self.swap_count,
+            mint_count: self.mint_count,
+            burn_count: self.burn_count,
+            collect_count: self.collect_count,
+            other_count: self.other_count,
+            unique_txs: self.unique_txs.len(),
+            block_min: self.block_min,
+            block_max: self.block_max,
+            span_blocks,
+            active_event_blocks: self.active_event_blocks.len(),
+            active_swap_blocks: self.active_swap_blocks.len(),
+            events_per_1k_blocks,
+            swaps_per_1k_blocks,
+            tick_first: self.first_swap.map(|(_, _, tick)| tick),
+            tick_last: self.last_swap.map(|(_, _, tick)| tick),
+            tick_min,
+            tick_p05: percentile_ticks(&self.ticks, 5.0),
+            tick_p50: percentile_ticks(&self.ticks, 50.0),
+            tick_p95: percentile_ticks(&self.ticks, 95.0),
+            tick_max,
+            tick_span: tick_min.zip(tick_max).map(|(min, max)| max - min),
+            token0_in_swaps: self.token0_in_swaps,
+            token1_in_swaps: self.token1_in_swaps,
+            other_swaps: self.other_swaps,
+        }
+    }
+}
+
+fn summarize_slipstream_events(data_dir: PathBuf, format: OutputFormat) -> Result<()> {
+    let events_dir = data_dir.join("events");
+    if !events_dir.exists() {
+        anyhow::bail!("event directory does not exist: {}", events_dir.display());
+    }
+
+    let mut summaries = Vec::new();
+    for entry in fs::read_dir(&events_dir)? {
+        let entry = entry?;
+        let path = entry.path().join("events.jsonl");
+        if !path.exists() {
+            continue;
+        }
+
+        let file = File::open(&path)?;
+        let reader = BufReader::new(file);
+        let mut builder = EventSummaryBuilder::default();
+        for (index, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<StoredPoolEvent>(&line).with_context(|| {
+                format!("failed to parse {} line {}", path.display(), index + 1)
+            })?;
+            builder.add(event);
+        }
+        summaries.push(builder.finish());
+    }
+
+    summaries.sort_by(|left, right| {
+        right
+            .events
+            .cmp(&left.events)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+        return Ok(());
+    }
+
+    println!("base/aerodrome slipstream event summary");
+    println!(
+        "{:<18} {:>7} {:>7} {:>7} {:>8} {:>10} {:>10} {:>10} {:>13} {:>13}",
+        "symbol",
+        "events",
+        "swaps",
+        "lp_evt",
+        "txs",
+        "span_blk",
+        "swp/kblk",
+        "tick_span",
+        "tick_p05/p50",
+        "tick_p95"
+    );
+    for summary in summaries {
+        let lp_events = summary.mint_count + summary.burn_count + summary.collect_count;
+        println!(
+            "{:<18} {:>7} {:>7} {:>7} {:>8} {:>10} {:>10} {:>10} {:>13} {:>13}",
+            summary.symbol,
+            summary.events,
+            summary.swap_count,
+            lp_events,
+            summary.unique_txs,
+            optional_u64(summary.span_blocks),
+            optional_f64(summary.swaps_per_1k_blocks),
+            optional_i32(summary.tick_span),
+            format!(
+                "{}/{}",
+                optional_f64(summary.tick_p05),
+                optional_f64(summary.tick_p50)
+            ),
+            optional_f64(summary.tick_p95),
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_hex_u64_lossy(value: &str) -> Option<u64> {
+    u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+}
+
+fn per_1k_blocks(count: usize, span_blocks: u64) -> f64 {
+    if span_blocks == 0 {
+        return 0.0;
+    }
+    ((count as f64 * 100_000.0 / span_blocks as f64).round()) / 100.0
+}
+
+fn percentile_ticks(values: &[i32], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = (sorted.len() - 1) as f64 * percentile / 100.0;
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    if lower == upper {
+        Some(sorted[lower] as f64)
+    } else {
+        let weight_upper = index - lower as f64;
+        let weight_lower = 1.0 - weight_upper;
+        Some(sorted[lower] as f64 * weight_lower + sorted[upper] as f64 * weight_upper)
+    }
+    .map(|value| (value * 100.0).round() / 100.0)
+}
+
+fn decode_swap_tick_lossy(data: &str) -> Option<i32> {
+    let words = abi_words(data)?;
+    let word = words.get(4)?;
+    let lower = &word[word.len().saturating_sub(6)..];
+    let raw = i32::from_str_radix(lower, 16).ok()?;
+    Some(if raw & 0x80_0000 != 0 {
+        raw - 0x100_0000
+    } else {
+        raw
+    })
+}
+
+fn decode_swap_amount_signs_lossy(data: &str) -> Option<(i8, i8)> {
+    let words = abi_words(data)?;
+    Some((
+        abi_word_sign(words.first()?)?,
+        abi_word_sign(words.get(1)?)?,
+    ))
+}
+
+fn abi_words(data: &str) -> Option<Vec<&str>> {
+    let stripped = data.strip_prefix("0x")?;
+    if stripped.len() % 64 != 0 {
+        return None;
+    }
+    Some(
+        (0..stripped.len())
+            .step_by(64)
+            .map(|start| &stripped[start..start + 64])
+            .collect(),
+    )
+}
+
+fn abi_word_sign(word: &str) -> Option<i8> {
+    if word.len() != 64 || !word.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    if word.chars().all(|character| character == '0') {
+        return Some(0);
+    }
+    let first = word.as_bytes()[0].to_ascii_lowercase();
+    Some(if first >= b'8' { -1 } else { 1 })
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_i32(value: Option<i32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn current_unix_timestamp() -> u64 {

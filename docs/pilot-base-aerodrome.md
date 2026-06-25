@@ -204,6 +204,13 @@ data/base/aerodrome/checkpoints/{pool_address}.json
 
 Use `--iterations 0` for a long-running process. `data/` is git-ignored.
 
+Summarize the collected event files:
+
+```bash
+cargo run -p autopool-cli -- summarize-slipstream-events \
+  --data-dir data/base/aerodrome
+```
+
 ## Official Protocol Constants
 
 The pilot uses the current latest Aerodrome Slipstream Gauges V3 deployment from the official `aerodrome-finance/slipstream` repository:
