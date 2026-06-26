@@ -107,9 +107,14 @@ stronger fee-density research target while WETH-USDC is the major-pair control.
 
 ## Next steps
 
-1. Backfill the real WETH-USDC pool `0xb2cc…dc59` (needs an explicit-pool-address
-   option on `backfill-slipstream-events`; current backfill resolves via DeFiLlama).
+1. ~~Backfill the real WETH-USDC pool~~ — **done.** `backfill-slipstream-events`
+   now takes `--pool SYMBOL:0xADDRESS`, and a background job is collecting
+   `0xb2cc…dc59` into `data/base/aerodrome-opportunistic`. Replay it once it has a
+   useful window (note: 0.5 bps fee, so expect far lower fee density than WETH-AERO).
 2. Collect/replay a **volatile WETH-AERO window** to test whether tight static
-   ranges survive trends.
+   ranges survive trends. This is the key open question — the current result only
+   covers a calm regime.
 3. Add reward-emissions income and explicit out-of-range opportunity cost to the
    replay so the baseline comparison is complete.
+4. Snap ranges to tick spacing and model partial in-range fee capture on
+   boundary-crossing swaps.
