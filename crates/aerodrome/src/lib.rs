@@ -60,6 +60,7 @@ pub fn base_slipstream_factories_latest_first() -> [SlipstreamContracts; 3] {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PairRiskClass {
     Stable,
+    MajorStable,
     EthCorrelated,
     BtcCorrelated,
     NativeOrIncentive,
@@ -68,15 +69,33 @@ pub enum PairRiskClass {
 }
 
 impl PairRiskClass {
-    pub fn strategy_priority(self) -> u8 {
+    pub fn control_priority(self) -> u8 {
         match self {
             Self::Stable => 0,
             Self::EthCorrelated | Self::BtcCorrelated => 1,
-            Self::NativeOrIncentive => 2,
-            Self::LongTail => 3,
-            Self::Unknown => 4,
+            Self::MajorStable => 2,
+            Self::NativeOrIncentive => 3,
+            Self::LongTail => 4,
+            Self::Unknown => 5,
         }
     }
+
+    pub fn opportunistic_priority(self) -> u8 {
+        match self {
+            Self::NativeOrIncentive => 0,
+            Self::MajorStable => 1,
+            Self::LongTail => 2,
+            Self::EthCorrelated | Self::BtcCorrelated => 3,
+            Self::Stable => 4,
+            Self::Unknown => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PilotProfile {
+    Control,
+    Opportunistic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +152,22 @@ pub fn build_pilot_universe(
     min_volume_usd_1d: f64,
     max_reward_share: f64,
 ) -> Vec<SlipstreamCandidate> {
+    build_pilot_universe_for_profile(
+        snapshots,
+        min_tvl_usd,
+        min_volume_usd_1d,
+        max_reward_share,
+        PilotProfile::Control,
+    )
+}
+
+pub fn build_pilot_universe_for_profile(
+    snapshots: &[YieldSnapshot],
+    min_tvl_usd: f64,
+    min_volume_usd_1d: f64,
+    max_reward_share: f64,
+    profile: PilotProfile,
+) -> Vec<SlipstreamCandidate> {
     let mut candidates = snapshots
         .iter()
         .filter(|snapshot| !snapshot.outlier)
@@ -142,13 +177,22 @@ pub fn build_pilot_universe(
         .filter(|candidate| candidate.reward_share <= max_reward_share)
         .collect::<Vec<_>>();
 
-    candidates.sort_by(|left, right| {
-        left.pair_risk
-            .strategy_priority()
-            .cmp(&right.pair_risk.strategy_priority())
-            .then_with(|| right.volume_usd_1d.total_cmp(&left.volume_usd_1d))
-            .then_with(|| right.apy_base.total_cmp(&left.apy_base))
-    });
+    match profile {
+        PilotProfile::Control => candidates.sort_by(|left, right| {
+            left.pair_risk
+                .control_priority()
+                .cmp(&right.pair_risk.control_priority())
+                .then_with(|| right.volume_usd_1d.total_cmp(&left.volume_usd_1d))
+                .then_with(|| right.apy_base.total_cmp(&left.apy_base))
+        }),
+        PilotProfile::Opportunistic => candidates.sort_by(|left, right| {
+            left.pair_risk
+                .opportunistic_priority()
+                .cmp(&right.pair_risk.opportunistic_priority())
+                .then_with(|| opportunistic_score(right).total_cmp(&opportunistic_score(left)))
+                .then_with(|| right.volume_usd_1d.total_cmp(&left.volume_usd_1d))
+        }),
+    }
 
     candidates
 }
@@ -161,6 +205,10 @@ pub fn classify_pair(symbol: &str) -> PairRiskClass {
 
     if tokens.iter().all(|token| is_stable(token)) {
         return PairRiskClass::Stable;
+    }
+
+    if has_stable_and_major(&tokens) {
+        return PairRiskClass::MajorStable;
     }
 
     if tokens.iter().all(|token| is_eth_correlated(token)) {
@@ -180,16 +228,41 @@ pub fn classify_pair(symbol: &str) -> PairRiskClass {
 
 fn pilot_bucket(pair_risk: PairRiskClass, reward_share: f64) -> &'static str {
     if reward_share > 0.5 {
-        return "reward-heavy-control";
+        return match pair_risk {
+            PairRiskClass::NativeOrIncentive => "reward-heavy-native",
+            PairRiskClass::MajorStable => "reward-heavy-major",
+            PairRiskClass::LongTail => "reward-heavy-long-tail",
+            PairRiskClass::Stable => "reward-heavy-stable",
+            PairRiskClass::EthCorrelated | PairRiskClass::BtcCorrelated => {
+                "reward-heavy-correlated"
+            }
+            PairRiskClass::Unknown => "reward-heavy-unknown",
+        };
     }
 
     match pair_risk {
-        PairRiskClass::Stable => "stable-primary",
+        PairRiskClass::Stable => "stable-control",
+        PairRiskClass::MajorStable => "major-volatility",
         PairRiskClass::EthCorrelated | PairRiskClass::BtcCorrelated => "correlated-control",
-        PairRiskClass::NativeOrIncentive => "native-risk-control",
-        PairRiskClass::LongTail => "long-tail-control",
+        PairRiskClass::NativeOrIncentive => "native-opportunistic",
+        PairRiskClass::LongTail => "long-tail-opportunistic",
         PairRiskClass::Unknown => "unknown",
     }
+}
+
+fn opportunistic_score(candidate: &SlipstreamCandidate) -> f64 {
+    let volume_to_tvl = if candidate.tvl_usd > 0.0 {
+        candidate.volume_usd_1d / candidate.tvl_usd
+    } else {
+        0.0
+    };
+    let fee_bps = candidate.fee_tier_bps.unwrap_or(0.0);
+
+    candidate.apy_base * 1.5
+        + candidate.apy * 0.5
+        + volume_to_tvl.min(10.0) * 20.0
+        + fee_bps.min(100.0) * 0.25
+        - candidate.reward_share.max(0.0) * 10.0
 }
 
 fn split_symbol(symbol: &str) -> Vec<String> {
@@ -205,6 +278,13 @@ fn is_stable(token: &str) -> bool {
         token,
         "USDC" | "USDBC" | "USDT" | "DAI" | "EURC" | "EUSD" | "MSUSD" | "CRVUSD" | "LUSD"
     )
+}
+
+fn has_stable_and_major(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| is_stable(token))
+        && tokens
+            .iter()
+            .any(|token| is_eth_correlated(token) || is_btc_correlated(token))
 }
 
 fn is_eth_correlated(token: &str) -> bool {
@@ -229,6 +309,7 @@ mod tests {
     #[test]
     fn classifies_pilot_pair_risk() {
         assert_eq!(classify_pair("EURC-USDC"), PairRiskClass::Stable);
+        assert_eq!(classify_pair("WETH-USDC"), PairRiskClass::MajorStable);
         assert_eq!(classify_pair("WETH-MSETH"), PairRiskClass::EthCorrelated);
         assert_eq!(classify_pair("CBLTC-CBBTC"), PairRiskClass::BtcCorrelated);
         assert_eq!(classify_pair("USDC-AERO"), PairRiskClass::NativeOrIncentive);

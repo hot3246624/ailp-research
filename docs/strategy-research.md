@@ -80,6 +80,10 @@ Results must be compared after gas, swaps, and inventory mark-to-market.
 
 ## Initial Policies
 
+### Opportunistic Volatile Range
+
+Target pools with high APR, high fee tier, strong observed swap density, and acceptable TVL. Examples include WETH-USDC, WETH-AERO, and other active volatile pairs. These pools should be judged by fee density after inventory drift, not by headline APR alone.
+
 ### Gas-Aware Volatility Range
 
 Width increases with realized volatility and gas. Rebalance only when expected future fees exceed transaction costs by a configurable margin.
@@ -113,3 +117,4 @@ Avoid tight ranges when directional flow suggests the LP is being paid fees to a
 - Chain is cheap, but pool depth is too thin for real execution.
 - Strategy overfits one volatility regime.
 - Simulated rebalances assume a price that would not be available after mempool exposure.
+- High APR volatile pools hide adverse inventory selection: the LP can earn fees while accumulating the asset being sold by informed flow.

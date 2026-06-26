@@ -51,21 +51,24 @@ External discovery data:
 - DeFiLlama Aerodrome yield rows
 - Aerodrome pool metadata and emissions
 
-## First Pool Universe
+## Pool Universe Profiles
 
-Start with Aerodrome Slipstream pools only:
+Start with Aerodrome Slipstream pools only, but separate control pools from target opportunity pools.
 
 - minimum TVL
 - minimum 24h volume
 - non-outlier yield row
-- avoid pools where APY is mostly emissions unless reward liquidation is modeled
-- prioritize majors/stables before long-tail meme pairs
+- fee tier and observed fee density
+- APR and base/reward decomposition
+- observed swap density from chain logs
+- reward liquidation assumptions when APY is mostly emissions
 
-Candidate types:
+Profiles:
 
-- stable-stable: lower price volatility, lower IL, more tick precision
-- ETH/stable: high volume, meaningful directional inventory risk
-- AERO/stable or AERO/ETH: high native incentive relevance, but higher token-specific risk
+- `control`: stable and correlated pools used to validate replay math, tick decoding, gas accounting, and passive LP baselines.
+- `opportunistic`: higher APR, higher fee-tier, higher inventory-risk pools such as WETH-USDC, WETH-AERO, AERO-stable, and active long-tail pairs.
+
+USDC-USDT is not the economic target. It is a control pool. The actual strategy should be promoted only if it survives volatile pools where inventory risk, range exits, and flow toxicity matter.
 
 ## Strategy Hypotheses
 
@@ -125,8 +128,20 @@ Build the first pool universe:
 
 ```bash
 cargo run -p autopool-cli -- pilot-universe \
+  --profile opportunistic \
+  --min-tvl-usd 50000 \
+  --min-apy 10 \
+  --min-fee-bps 5 \
+  --include-symbol WETH-AERO \
+  --include-symbol WETH-USDC
+```
+
+Build the control universe:
+
+```bash
+cargo run -p autopool-cli -- pilot-universe \
+  --profile control \
   --min-tvl-usd 100000 \
-  --min-volume-usd-1d 100000 \
   --max-reward-share 0.5
 ```
 
@@ -134,9 +149,12 @@ Use JSON when handing candidates to downstream replay tooling:
 
 ```bash
 cargo run -p autopool-cli -- pilot-universe \
-  --min-tvl-usd 100000 \
-  --min-volume-usd-1d 100000 \
-  --max-reward-share 0.5 \
+  --profile opportunistic \
+  --min-tvl-usd 50000 \
+  --min-apy 10 \
+  --min-fee-bps 5 \
+  --include-symbol WETH-AERO \
+  --include-symbol WETH-USDC \
   --format json
 ```
 
@@ -154,9 +172,10 @@ Resolve candidate pools to on-chain Slipstream pools and read current pool state
 ```bash
 BASE_RPC_URL=https://your-base-rpc.example \
 cargo run -p autopool-cli -- resolve-slipstream-pools \
-  --min-tvl-usd 100000 \
-  --min-volume-usd-1d 100000 \
-  --max-reward-share 0.5 \
+  --profile opportunistic \
+  --min-tvl-usd 50000 \
+  --include-symbol WETH-AERO \
+  --include-symbol WETH-USDC \
   --limit 8
 ```
 
@@ -165,11 +184,12 @@ Sample recent `Swap/Mint/Burn/Collect` events:
 ```bash
 BASE_RPC_URL=https://your-base-rpc.example \
 cargo run -p autopool-cli -- sample-slipstream-events \
+  --profile opportunistic \
   --lookback-blocks 100 \
   --log-chunk-blocks 10 \
-  --min-tvl-usd 100000 \
-  --min-volume-usd-1d 100000 \
-  --max-reward-share 0.5 \
+  --min-tvl-usd 50000 \
+  --include-symbol WETH-AERO \
+  --include-symbol WETH-USDC \
   --limit 4
 ```
 
@@ -180,6 +200,7 @@ Run a checkpointed backfill into ignored local data files:
 ```bash
 BASE_RPC_URL=https://your-base-rpc.example \
 cargo run -p autopool-cli -- backfill-slipstream-events \
+  --profile opportunistic \
   --data-dir data/base/aerodrome \
   --lookback-blocks 7200 \
   --max-blocks-per-run 100 \
@@ -187,6 +208,8 @@ cargo run -p autopool-cli -- backfill-slipstream-events \
   --sleep-ms 250 \
   --poll-seconds 30 \
   --iterations 1 \
+  --include-symbol WETH-AERO \
+  --include-symbol WETH-USDC \
   --limit 4
 ```
 

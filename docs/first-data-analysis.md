@@ -39,7 +39,9 @@ Current discovery and on-chain resolution ranked these stable-primary pools:
 
 ## Interpretation
 
-USDC-USDT is the cleanest first replay target. It has the highest swap density in the sample, very low tick movement, low LP churn, and tick spacing of 1. This makes it a good environment for isolating the range-width and rebalance-threshold problem without immediately mixing in large tick jumps.
+USDC-USDT is the cleanest control replay target. It has the highest swap density in the sample, very low tick movement, low LP churn, and tick spacing of 1. This makes it useful for validating event decoding, fee-growth replay, gas accounting, and passive LP baselines.
+
+USDC-USDT is not the main economic target. Traditional stable LP returns are too low for the intended AILP opportunity set. The production research target is higher APR and higher fee-density volatile pools, especially WETH-USDC, WETH-AERO, and similar active pools where inventory risk is material.
 
 EURC-USDC is attractive by headline and base APY, but it is not the cleanest first target. Its tick span is 42 over the sample, close to one 50-tick spacing band, and LP events are unusually high relative to swaps. That makes it useful as a second stress case for liquidity churn, reward durability, and range edge behavior.
 
@@ -49,11 +51,11 @@ USDC-USDBC is too quiet for the first strategy loop. It can stay as a low-volati
 
 ## Strategy Consequences
 
-The first AILP policy should not try to maximize APR yet. It should answer this narrower question:
+The first AILP policy should not claim edge from a stable control pool. It should use control-pool replay to debug the engine, then answer this target question:
 
 ```text
-For USDC-USDT, what fixed or adaptive tick width beats passive LP after gas,
-inventory drift, and out-of-range opportunity cost?
+For high APR volatile pools, what fixed or adaptive tick width beats passive LP
+after gas, inventory drift, flow toxicity, and out-of-range opportunity cost?
 ```
 
 Required next measurements:
@@ -65,4 +67,4 @@ Required next measurements:
 - actual transaction-cost estimates from Base receipts
 - baseline comparisons: hold, passive wide range, fixed narrow range, volatility-scaled range
 
-The first backtest target should use USDC-USDT, with EURC-USDC held back as the first robustness case once fee-growth replay works.
+USDC-USDT should remain a sanity-check dataset. The first target backtest should include WETH-AERO and WETH-USDC once those event streams are collected.

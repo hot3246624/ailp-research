@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use autopool_aerodrome::{
-    BASE_CHAIN_ID, BASE_SLIPSTREAM_GAUGES_V3, base_slipstream_factories_latest_first,
-    build_pilot_universe,
+    BASE_CHAIN_ID, BASE_SLIPSTREAM_GAUGES_V3, PilotProfile, SlipstreamCandidate,
+    base_slipstream_factories_latest_first, build_pilot_universe_for_profile,
 };
+use autopool_core::YieldSnapshot;
 use autopool_defillama::{DefiLlamaClient, PoolFilter};
 use autopool_evm::{BURN_TOPIC, COLLECT_TOPIC, JsonRpcClient, MINT_TOPIC, SWAP_TOPIC};
 use autopool_strategy::WeightedRiskModel;
@@ -19,6 +20,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 enum OutputFormat {
     Table,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CandidateProfile {
+    Control,
+    Opportunistic,
+}
+
+impl From<CandidateProfile> for PilotProfile {
+    fn from(value: CandidateProfile) -> Self {
+        match value {
+            CandidateProfile::Control => Self::Control,
+            CandidateProfile::Opportunistic => Self::Opportunistic,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -49,10 +65,18 @@ enum Command {
     PilotUniverse {
         #[arg(long, default_value_t = 100_000.0)]
         min_tvl_usd: f64,
-        #[arg(long, default_value_t = 100_000.0)]
+        #[arg(long, default_value_t = 0.0)]
         min_volume_usd_1d: f64,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 1.0)]
         max_reward_share: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_apy: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_fee_bps: f64,
+        #[arg(long, value_enum, default_value_t = CandidateProfile::Opportunistic)]
+        profile: CandidateProfile,
+        #[arg(long = "include-symbol")]
+        include_symbols: Vec<String>,
         #[arg(long, default_value_t = 12)]
         limit: usize,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -73,10 +97,18 @@ enum Command {
         rpc_url: String,
         #[arg(long, default_value_t = 100_000.0)]
         min_tvl_usd: f64,
-        #[arg(long, default_value_t = 100_000.0)]
+        #[arg(long, default_value_t = 0.0)]
         min_volume_usd_1d: f64,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 1.0)]
         max_reward_share: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_apy: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_fee_bps: f64,
+        #[arg(long, value_enum, default_value_t = CandidateProfile::Opportunistic)]
+        profile: CandidateProfile,
+        #[arg(long = "include-symbol")]
+        include_symbols: Vec<String>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -91,10 +123,18 @@ enum Command {
         log_chunk_blocks: u64,
         #[arg(long, default_value_t = 100_000.0)]
         min_tvl_usd: f64,
-        #[arg(long, default_value_t = 100_000.0)]
+        #[arg(long, default_value_t = 0.0)]
         min_volume_usd_1d: f64,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 1.0)]
         max_reward_share: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_apy: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_fee_bps: f64,
+        #[arg(long, value_enum, default_value_t = CandidateProfile::Opportunistic)]
+        profile: CandidateProfile,
+        #[arg(long = "include-symbol")]
+        include_symbols: Vec<String>,
         #[arg(long, default_value_t = 4)]
         limit: usize,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -119,10 +159,18 @@ enum Command {
         iterations: u64,
         #[arg(long, default_value_t = 100_000.0)]
         min_tvl_usd: f64,
-        #[arg(long, default_value_t = 100_000.0)]
+        #[arg(long, default_value_t = 0.0)]
         min_volume_usd_1d: f64,
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 1.0)]
         max_reward_share: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_apy: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_fee_bps: f64,
+        #[arg(long, value_enum, default_value_t = CandidateProfile::Opportunistic)]
+        profile: CandidateProfile,
+        #[arg(long = "include-symbol")]
+        include_symbols: Vec<String>,
         #[arg(long, default_value_t = 4)]
         limit: usize,
     },
@@ -162,6 +210,10 @@ async fn main() -> Result<()> {
             min_tvl_usd,
             min_volume_usd_1d,
             max_reward_share,
+            min_apy,
+            min_fee_bps,
+            profile,
+            include_symbols,
             limit,
             format,
         } => {
@@ -169,6 +221,10 @@ async fn main() -> Result<()> {
                 min_tvl_usd,
                 min_volume_usd_1d,
                 max_reward_share,
+                min_apy,
+                min_fee_bps,
+                profile,
+                include_symbols,
                 limit,
                 format,
             )
@@ -185,6 +241,10 @@ async fn main() -> Result<()> {
             min_tvl_usd,
             min_volume_usd_1d,
             max_reward_share,
+            min_apy,
+            min_fee_bps,
+            profile,
+            include_symbols,
             limit,
             format,
         } => {
@@ -193,6 +253,10 @@ async fn main() -> Result<()> {
                 min_tvl_usd,
                 min_volume_usd_1d,
                 max_reward_share,
+                min_apy,
+                min_fee_bps,
+                profile,
+                include_symbols,
                 limit,
                 format,
             )
@@ -205,6 +269,10 @@ async fn main() -> Result<()> {
             min_tvl_usd,
             min_volume_usd_1d,
             max_reward_share,
+            min_apy,
+            min_fee_bps,
+            profile,
+            include_symbols,
             limit,
             format,
         } => {
@@ -215,6 +283,10 @@ async fn main() -> Result<()> {
                 min_tvl_usd,
                 min_volume_usd_1d,
                 max_reward_share,
+                min_apy,
+                min_fee_bps,
+                profile,
+                include_symbols,
                 limit,
                 format,
             )
@@ -232,6 +304,10 @@ async fn main() -> Result<()> {
             min_tvl_usd,
             min_volume_usd_1d,
             max_reward_share,
+            min_apy,
+            min_fee_bps,
+            profile,
+            include_symbols,
             limit,
         } => {
             backfill_slipstream_events(BackfillConfig {
@@ -246,6 +322,10 @@ async fn main() -> Result<()> {
                 min_tvl_usd,
                 min_volume_usd_1d,
                 max_reward_share,
+                min_apy,
+                min_fee_bps,
+                profile,
+                include_symbols,
                 limit,
             })
             .await?
@@ -330,10 +410,86 @@ async fn scan_yields(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct CandidateSelection {
+    min_tvl_usd: f64,
+    min_volume_usd_1d: f64,
+    max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
+}
+
+fn select_slipstream_candidates(
+    snapshots: &[YieldSnapshot],
+    selection: &CandidateSelection,
+) -> Vec<SlipstreamCandidate> {
+    let selected = build_pilot_universe_for_profile(
+        snapshots,
+        selection.min_tvl_usd,
+        selection.min_volume_usd_1d,
+        selection.max_reward_share,
+        selection.profile.into(),
+    )
+    .into_iter()
+    .filter(|candidate| candidate.apy >= selection.min_apy)
+    .filter(|candidate| candidate.fee_tier_bps.unwrap_or(0.0) >= selection.min_fee_bps)
+    .collect::<Vec<_>>();
+
+    if selection.include_symbols.is_empty() {
+        return selected;
+    }
+
+    let all_candidates = snapshots
+        .iter()
+        .filter(|snapshot| !snapshot.outlier)
+        .filter_map(SlipstreamCandidate::from_yield)
+        .filter(|candidate| candidate.tvl_usd >= selection.min_tvl_usd)
+        .collect::<Vec<_>>();
+    let mut forced = Vec::new();
+    let mut forced_keys = BTreeSet::new();
+
+    for symbol in &selection.include_symbols {
+        let key = symbol_key(symbol);
+        if forced_keys.contains(&key) {
+            continue;
+        }
+
+        if let Some(candidate) = all_candidates
+            .iter()
+            .find(|candidate| symbol_key(&candidate.symbol) == key)
+        {
+            forced.push(candidate.clone());
+            forced_keys.insert(key);
+        }
+    }
+
+    let mut merged = forced;
+    merged.extend(
+        selected
+            .into_iter()
+            .filter(|candidate| !forced_keys.contains(&symbol_key(&candidate.symbol))),
+    );
+    merged
+}
+
+fn symbol_key(symbol: &str) -> String {
+    symbol
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
 async fn pilot_universe(
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
     limit: usize,
     format: OutputFormat,
 ) -> Result<()> {
@@ -348,8 +504,16 @@ async fn pilot_universe(
             exclude_outliers: true,
         })
         .await?;
-    let universe =
-        build_pilot_universe(&snapshots, min_tvl_usd, min_volume_usd_1d, max_reward_share);
+    let selection = CandidateSelection {
+        min_tvl_usd,
+        min_volume_usd_1d,
+        max_reward_share,
+        min_apy,
+        min_fee_bps,
+        profile,
+        include_symbols,
+    };
+    let universe = select_slipstream_candidates(&snapshots, &selection);
 
     if format == OutputFormat::Json {
         println!(
@@ -359,7 +523,10 @@ async fn pilot_universe(
         return Ok(());
     }
 
-    println!("base/aerodrome slipstream pilot universe");
+    println!(
+        "base/aerodrome slipstream pilot universe ({:?})",
+        selection.profile
+    );
     println!(
         "contracts: pool_factory={} position_manager={} swap_router={}",
         BASE_SLIPSTREAM_GAUGES_V3.pool_factory,
@@ -367,13 +534,13 @@ async fn pilot_universe(
         BASE_SLIPSTREAM_GAUGES_V3.swap_router
     );
     println!(
-        "{:<18} {:<20} {:>8} {:>10} {:>12} {:>8} {:>8} {:>8}",
+        "{:<24} {:<20} {:>8} {:>10} {:>12} {:>8} {:>8} {:>8}",
         "bucket", "symbol", "fee_bps", "tvl_usd", "vol_1d", "base", "reward", "r_share"
     );
 
     for candidate in universe.into_iter().take(limit) {
         println!(
-            "{:<18} {:<20} {:>8} {:>10.0} {:>12.0} {:>7.2}% {:>7.2}% {:>7.2}",
+            "{:<24} {:<20} {:>8} {:>10.0} {:>12.0} {:>7.2}% {:>7.2}% {:>7.2}",
             candidate.pilot_bucket,
             candidate.symbol,
             candidate
@@ -427,6 +594,10 @@ async fn resolve_slipstream_pools(
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
     limit: usize,
     format: OutputFormat,
 ) -> Result<()> {
@@ -441,8 +612,16 @@ async fn resolve_slipstream_pools(
             exclude_outliers: true,
         })
         .await?;
-    let universe =
-        build_pilot_universe(&snapshots, min_tvl_usd, min_volume_usd_1d, max_reward_share);
+    let selection = CandidateSelection {
+        min_tvl_usd,
+        min_volume_usd_1d,
+        max_reward_share,
+        min_apy,
+        min_fee_bps,
+        profile,
+        include_symbols,
+    };
+    let universe = select_slipstream_candidates(&snapshots, &selection);
     let rpc = JsonRpcClient::new(rpc_url);
     let factories = base_slipstream_factories_latest_first();
     let mut resolved = Vec::new();
@@ -476,12 +655,12 @@ async fn resolve_slipstream_pools(
     }
 
     println!(
-        "{:<18} {:<20} {:<10} {:<42} {:>8} {:>8} {:>16}",
+        "{:<24} {:<20} {:<10} {:<42} {:>8} {:>8} {:>16}",
         "bucket", "symbol", "deploy", "pool", "tick", "spacing", "liquidity"
     );
     for (candidate, deployment, state) in resolved {
         println!(
-            "{:<18} {:<20} {:<10?} {:<42} {:>8} {:>8} {:>16}",
+            "{:<24} {:<20} {:<10?} {:<42} {:>8} {:>8} {:>16}",
             candidate.pilot_bucket,
             candidate.symbol,
             deployment,
@@ -502,6 +681,10 @@ async fn sample_slipstream_events(
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
     limit: usize,
     format: OutputFormat,
 ) -> Result<()> {
@@ -516,8 +699,16 @@ async fn sample_slipstream_events(
             exclude_outliers: true,
         })
         .await?;
-    let universe =
-        build_pilot_universe(&snapshots, min_tvl_usd, min_volume_usd_1d, max_reward_share);
+    let selection = CandidateSelection {
+        min_tvl_usd,
+        min_volume_usd_1d,
+        max_reward_share,
+        min_apy,
+        min_fee_bps,
+        profile,
+        include_symbols,
+    };
+    let universe = select_slipstream_candidates(&snapshots, &selection);
     let rpc = JsonRpcClient::new(rpc_url);
     let to_block = rpc.latest_block_number().await?;
     let from_block = to_block.saturating_sub(lookback_blocks.saturating_sub(1));
@@ -561,12 +752,12 @@ async fn sample_slipstream_events(
 
     println!("event window: {from_block}..{to_block}");
     println!(
-        "{:<18} {:<20} {:<10} {:>7} {:>7} {:>7} {:>8} {:>12}",
+        "{:<24} {:<20} {:<10} {:>7} {:>7} {:>7} {:>8} {:>12}",
         "bucket", "symbol", "deploy", "swaps", "mints", "burns", "collects", "last_tick"
     );
     for (candidate, deployment, summary) in summaries {
         println!(
-            "{:<18} {:<20} {:<10?} {:>7} {:>7} {:>7} {:>8} {:>12}",
+            "{:<24} {:<20} {:<10?} {:>7} {:>7} {:>7} {:>8} {:>12}",
             candidate.pilot_bucket,
             candidate.symbol,
             deployment,
@@ -597,6 +788,10 @@ struct BackfillConfig {
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
     limit: usize,
 }
 
@@ -649,6 +844,10 @@ async fn backfill_slipstream_events(config: BackfillConfig) -> Result<()> {
         config.min_tvl_usd,
         config.min_volume_usd_1d,
         config.max_reward_share,
+        config.min_apy,
+        config.min_fee_bps,
+        config.profile,
+        config.include_symbols.clone(),
         config.limit,
     )
     .await?;
@@ -708,6 +907,10 @@ async fn resolve_pilot_candidates(
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
     limit: usize,
 ) -> Result<Vec<ResolvedCandidate>> {
     let client = DefiLlamaClient::default();
@@ -721,8 +924,16 @@ async fn resolve_pilot_candidates(
             exclude_outliers: true,
         })
         .await?;
-    let universe =
-        build_pilot_universe(&snapshots, min_tvl_usd, min_volume_usd_1d, max_reward_share);
+    let selection = CandidateSelection {
+        min_tvl_usd,
+        min_volume_usd_1d,
+        max_reward_share,
+        min_apy,
+        min_fee_bps,
+        profile,
+        include_symbols,
+    };
+    let universe = select_slipstream_candidates(&snapshots, &selection);
     let rpc = JsonRpcClient::new(rpc_url.to_string());
     let factories = base_slipstream_factories_latest_first();
     let mut resolved = Vec::new();
