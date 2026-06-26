@@ -180,6 +180,48 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Replay collected swap events through baseline LP range policies and report
+    /// PnL attribution (fees, inventory IL, gas, slippage) versus a hold baseline.
+    ReplayEvents {
+        #[arg(long, default_value = "data/base/aerodrome-opportunistic")]
+        data_dir: PathBuf,
+        /// Pool address to replay. If omitted, replays the pool with the most swaps.
+        #[arg(long)]
+        pool_address: Option<String>,
+        /// Match a pool by symbol (e.g. WETH-AERO) instead of address.
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Pool fee tier in basis points (30 bps = 0.30%).
+        #[arg(long, default_value_t = 30.0)]
+        fee_bps: f64,
+        /// Decimals of token0 (lower-address token). WETH=18.
+        #[arg(long, default_value_t = 18)]
+        decimals0: u8,
+        /// Decimals of token1 (higher-address token). AERO=18, USDC=6.
+        #[arg(long, default_value_t = 18)]
+        decimals1: u8,
+        /// USD value of one token0 (numeraire anchor). WETH ~ 3300.
+        #[arg(long, default_value_t = 3300.0)]
+        token0_usd: f64,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital_usd: f64,
+        /// Gas cost per rebalance in USD (Base L2 is cheap).
+        #[arg(long, default_value_t = 0.05)]
+        rebalance_gas_usd: f64,
+        #[arg(long, default_value_t = 5.0)]
+        rebalance_slippage_bps: f64,
+        /// Half-width (ticks) for the narrow policies.
+        #[arg(long, default_value_t = 600)]
+        narrow_half_width: i32,
+        /// Half-width (ticks) for the passive-wide policy.
+        #[arg(long, default_value_t = 6_000)]
+        wide_half_width: i32,
+        /// Volatility multiplier for the vol-scaled policy.
+        #[arg(long, default_value_t = 1.5)]
+        vol_k: f64,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
 }
 
 #[tokio::main]
@@ -333,6 +375,37 @@ async fn main() -> Result<()> {
         Command::SummarizeSlipstreamEvents { data_dir, format } => {
             summarize_slipstream_events(data_dir, format)?
         }
+        Command::ReplayEvents {
+            data_dir,
+            pool_address,
+            symbol,
+            fee_bps,
+            decimals0,
+            decimals1,
+            token0_usd,
+            capital_usd,
+            rebalance_gas_usd,
+            rebalance_slippage_bps,
+            narrow_half_width,
+            wide_half_width,
+            vol_k,
+            format,
+        } => replay_events(ReplayArgs {
+            data_dir,
+            pool_address,
+            symbol,
+            fee_bps,
+            decimals0,
+            decimals1,
+            token0_usd,
+            capital_usd,
+            rebalance_gas_usd,
+            rebalance_slippage_bps,
+            narrow_half_width,
+            wide_half_width,
+            vol_k,
+            format,
+        })?,
     }
 
     Ok(())
@@ -1325,6 +1398,258 @@ fn summarize_slipstream_events(data_dir: PathBuf, format: OutputFormat) -> Resul
     }
 
     Ok(())
+}
+
+struct ReplayArgs {
+    data_dir: PathBuf,
+    pool_address: Option<String>,
+    symbol: Option<String>,
+    fee_bps: f64,
+    decimals0: u8,
+    decimals1: u8,
+    token0_usd: f64,
+    capital_usd: f64,
+    rebalance_gas_usd: f64,
+    rebalance_slippage_bps: f64,
+    narrow_half_width: i32,
+    wide_half_width: i32,
+    vol_k: f64,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayReport {
+    pool_address: String,
+    symbol: String,
+    swaps: usize,
+    block_first: Option<u64>,
+    block_last: Option<u64>,
+    tick_first: Option<i32>,
+    tick_last: Option<i32>,
+    config: serde_json::Value,
+    policies: Vec<autopool_backtest::PolicyReport>,
+}
+
+fn replay_events(args: ReplayArgs) -> Result<()> {
+    let events_dir = args.data_dir.join("events");
+    if !events_dir.exists() {
+        anyhow::bail!("event directory does not exist: {}", events_dir.display());
+    }
+
+    let target = select_replay_target(
+        &events_dir,
+        args.pool_address.as_deref(),
+        args.symbol.as_deref(),
+    )?;
+
+    let (symbol, swaps) = load_swaps(&target)?;
+    if swaps.is_empty() {
+        anyhow::bail!("no decodable swap events found in {}", target.display());
+    }
+
+    let pool_address = target
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let cfg = autopool_backtest::ReplayConfig {
+        decimals0: args.decimals0,
+        decimals1: args.decimals1,
+        fee_fraction: args.fee_bps / 10_000.0,
+        token0_usd: args.token0_usd,
+        capital_usd: args.capital_usd,
+        rebalance_gas_usd: args.rebalance_gas_usd,
+        rebalance_slippage_bps: args.rebalance_slippage_bps,
+        rebalance_swap_fraction: 0.5,
+    };
+
+    let policies = autopool_backtest::run_baseline_battery_with(
+        &swaps,
+        &cfg,
+        args.narrow_half_width,
+        args.wide_half_width,
+        args.vol_k,
+    );
+
+    let report = ReplayReport {
+        pool_address,
+        symbol,
+        swaps: swaps.len(),
+        block_first: swaps.first().map(|swap| swap.block),
+        block_last: swaps.last().map(|swap| swap.block),
+        tick_first: swaps.first().map(|swap| swap.tick),
+        tick_last: swaps.last().map(|swap| swap.tick),
+        config: json!({
+            "fee_bps": args.fee_bps,
+            "decimals0": args.decimals0,
+            "decimals1": args.decimals1,
+            "token0_usd": args.token0_usd,
+            "capital_usd": args.capital_usd,
+            "rebalance_gas_usd": args.rebalance_gas_usd,
+            "rebalance_slippage_bps": args.rebalance_slippage_bps,
+            "narrow_half_width": args.narrow_half_width,
+            "wide_half_width": args.wide_half_width,
+            "vol_k": args.vol_k,
+        }),
+        policies,
+    };
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "replay {} ({}) swaps={} blocks={}..{} ticks={}..{}",
+        report.symbol,
+        report.pool_address,
+        report.swaps,
+        optional_u64(report.block_first),
+        optional_u64(report.block_last),
+        optional_i32(report.tick_first),
+        optional_i32(report.tick_last),
+    );
+    println!(
+        "config: fee={:.2}bps capital=${:.0} token0=${:.0} gas=${:.3}/reb narrow=±{} wide=±{} vol_k={}",
+        args.fee_bps,
+        args.capital_usd,
+        args.token0_usd,
+        args.rebalance_gas_usd,
+        args.narrow_half_width,
+        args.wide_half_width,
+        args.vol_k,
+    );
+    println!(
+        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>10} {:>10} {:>8} {:>9}",
+        "policy", "net_pnl", "vs_hold", "fees", "il", "gas+slip", "in_range%", "rebals", "avg_w"
+    );
+    for policy in &report.policies {
+        println!(
+            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>10.2} {:>9.1}% {:>8} {:>9.0}",
+            policy.policy,
+            policy.net_pnl_usd,
+            policy.net_vs_hold_usd,
+            policy.fee_income_usd,
+            policy.inventory_il_usd,
+            policy.gas_cost_usd + policy.slippage_cost_usd,
+            policy.time_in_range_pct,
+            policy.rebalances,
+            policy.avg_half_width_ticks,
+        );
+    }
+
+    Ok(())
+}
+
+/// Find the events.jsonl to replay: by explicit pool address, by symbol match, or
+/// fall back to the file with the most swap events.
+fn select_replay_target(
+    events_dir: &Path,
+    pool_address: Option<&str>,
+    symbol: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(address) = pool_address {
+        let path = events_dir
+            .join(address.to_ascii_lowercase())
+            .join("events.jsonl");
+        if !path.exists() {
+            anyhow::bail!(
+                "no events for pool {address} under {}",
+                events_dir.display()
+            );
+        }
+        return Ok(path);
+    }
+
+    let mut best: Option<(usize, PathBuf)> = None;
+    let symbol_key = symbol.map(self::symbol_key);
+    for entry in fs::read_dir(events_dir)? {
+        let path = entry?.path().join("events.jsonl");
+        if !path.exists() {
+            continue;
+        }
+        let (file_symbol, swap_count) = peek_symbol_and_swap_count(&path)?;
+        if let Some(want) = &symbol_key {
+            if self::symbol_key(&file_symbol) != *want {
+                continue;
+            }
+        }
+        if best.as_ref().map_or(true, |(count, _)| swap_count > *count) {
+            best = Some((swap_count, path));
+        }
+    }
+
+    best.map(|(_, path)| path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no matching events.jsonl found under {}",
+            events_dir.display()
+        )
+    })
+}
+
+fn peek_symbol_and_swap_count(path: &Path) -> Result<(String, usize)> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut symbol = String::from("-");
+    let mut swaps = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<StoredPoolEvent>(&line) {
+            if symbol == "-" {
+                symbol = event.symbol.clone();
+            }
+            if event.event_type.eq_ignore_ascii_case("swap") {
+                swaps += 1;
+            }
+        }
+    }
+    Ok((symbol, swaps))
+}
+
+fn load_swaps(path: &Path) -> Result<(String, Vec<autopool_backtest::SwapObs>)> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut symbol = String::from("-");
+    let mut swaps = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<StoredPoolEvent>(&line)
+            .with_context(|| format!("failed to parse {} line {}", path.display(), index + 1))?;
+        if symbol == "-" {
+            symbol = event.symbol.clone();
+        }
+        if !event.event_type.eq_ignore_ascii_case("swap") {
+            continue;
+        }
+        let block = event
+            .log
+            .block_number
+            .as_deref()
+            .and_then(parse_hex_u64_lossy)
+            .unwrap_or_default();
+        let log_index = event
+            .log
+            .log_index
+            .as_deref()
+            .and_then(parse_hex_u64_lossy)
+            .unwrap_or_default();
+        if let Some(obs) = autopool_backtest::decode_swap_obs(&event.log.data, block, log_index) {
+            swaps.push(obs);
+        }
+    }
+    swaps.sort_by(|left, right| {
+        left.block
+            .cmp(&right.block)
+            .then_with(|| left.log_index.cmp(&right.log_index))
+    });
+    Ok((symbol, swaps))
 }
 
 fn parse_hex_u64_lossy(value: &str) -> Option<u64> {

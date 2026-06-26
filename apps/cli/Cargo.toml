@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 autopool-aerodrome.workspace = true
+autopool-backtest.workspace = true
 autopool-core.workspace = true
 autopool-defillama.workspace = true
 autopool-evm.workspace = true

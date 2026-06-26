@@ -4,6 +4,13 @@ use autopool_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod replay;
+
+pub use replay::{
+    PolicyReport, RangeMode, ReplayConfig, SwapObs, decode_swap_obs, run_baseline_battery,
+    run_baseline_battery_with,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestEvent {
     pub timestamp_unix: i64,
