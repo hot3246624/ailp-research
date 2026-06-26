@@ -48,9 +48,19 @@ BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- resolve-
 BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- sample-slipstream-events --profile opportunistic --include-symbol WETH-AERO --include-symbol WETH-USDC --lookback-blocks 100 --log-chunk-blocks 10 --limit 4
 BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- backfill-slipstream-events --profile opportunistic --include-symbol WETH-AERO --include-symbol WETH-USDC --lookback-blocks 7200 --max-blocks-per-run 200 --log-chunk-blocks 10 --poll-seconds 30 --iterations 1
 cargo run -p autopool-cli -- summarize-slipstream-events --data-dir data/base/aerodrome
+cargo run -p autopool-cli -- replay-events --symbol WETH-AERO --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 100
 ```
 
-See `docs/first-data-analysis.md` for the first Base / Aerodrome event-readout and the current reason to start replay work on USDC-USDT.
+The `replay-events` command turns collected swap events into LP profit-and-loss
+for a battery of baseline range policies (hold, passive-wide, narrow-static,
+narrow-rebalance, vol-scaled) with PnL attribution into fees, inventory IL, gas,
+and slippage. It is the first strategy-research environment (architecture
+Milestone 3).
+
+See `docs/first-data-analysis.md` for the first Base / Aerodrome event-readout, and
+`docs/replay-weth-aero.md` for the first range-policy replay results (fee density
+dominates a calm window; rebalancing-on-exit is a tax) and the discovery of the
+real active WETH-USDC pool.
 
 ## External References
 

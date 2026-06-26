@@ -8,6 +8,8 @@ pub enum SlipstreamDeployment {
     Initial,
     GaugeCaps,
     GaugesV3,
+    /// Pool supplied directly by address (bypasses factory resolution).
+    Manual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +118,29 @@ pub struct SlipstreamCandidate {
 }
 
 impl SlipstreamCandidate {
+    /// Build a minimal candidate for a manually specified pool address, where no
+    /// DeFiLlama yield row is available. Only `symbol` and the derived pair risk
+    /// are meaningful; the rest are zeroed.
+    pub fn manual(symbol: impl Into<String>) -> Self {
+        let symbol = symbol.into();
+        let pair_risk = classify_pair(&symbol);
+        Self {
+            symbol,
+            source_pool_id: "manual".to_string(),
+            underlying_tokens: Vec::new(),
+            tick_spacing: None,
+            tvl_usd: 0.0,
+            volume_usd_1d: 0.0,
+            apy: 0.0,
+            apy_base: 0.0,
+            apy_reward: 0.0,
+            reward_share: 0.0,
+            fee_tier_bps: None,
+            pair_risk,
+            pilot_bucket: pilot_bucket(pair_risk, 0.0).to_string(),
+        }
+    }
+
     pub fn from_yield(snapshot: &YieldSnapshot) -> Option<Self> {
         if snapshot.pool.protocol != DexProtocol::Aerodrome
             || !snapshot.pool.chain.name().eq_ignore_ascii_case("Base")

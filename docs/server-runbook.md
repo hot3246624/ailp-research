@@ -68,4 +68,22 @@ find data/base/aerodrome/checkpoints -type f -maxdepth 1 -print -exec cat {} \;
 find data/base/aerodrome/events -name events.jsonl -print -exec wc -l {} \;
 ```
 
+Backfill an explicit pool by address (bypasses DeFiLlama resolution). The active
+WETH-USDC venue is the Initial / spacing-100 / 0.5 bps pool, not the GaugeCaps pool
+DeFiLlama resolves to:
+
+```bash
+nohup bash -lc 'cd ~/ailp_research && . ~/.cargo/env && BASE_RPC_URL="$(cat ~/.config/ailp/base_rpc_url)" cargo run -q -p autopool-cli -- backfill-slipstream-events --data-dir data/base/aerodrome-opportunistic --pool WETH-USDC:0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59 --lookback-blocks 7200 --max-blocks-per-run 200 --log-chunk-blocks 10 --sleep-ms 500 --poll-seconds 60 --iterations 0' \
+  > logs/ailp-backfill-wethusdc.out 2> logs/ailp-backfill-wethusdc.err &
+echo $! > logs/ailp-backfill-wethusdc.pid
+```
+
+Replay a collected pool through the baseline range policies:
+
+```bash
+cargo run -q -p autopool-cli -- replay-events \
+  --data-dir data/base/aerodrome-opportunistic \
+  --symbol WETH-AERO --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 100
+```
+
 Do not put private keys or seed phrases on the server for the current research phase. Only read-only RPC access is required.

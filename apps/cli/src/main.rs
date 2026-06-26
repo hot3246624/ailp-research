@@ -171,6 +171,11 @@ enum Command {
         profile: CandidateProfile,
         #[arg(long = "include-symbol")]
         include_symbols: Vec<String>,
+        /// Backfill an explicit pool, bypassing DeFiLlama resolution. Format
+        /// `SYMBOL:0xADDRESS` (e.g. `WETH-USDC:0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59`).
+        /// Repeatable; when set, only these pools are backfilled.
+        #[arg(long = "pool")]
+        pools: Vec<String>,
         #[arg(long, default_value_t = 4)]
         limit: usize,
     },
@@ -350,6 +355,7 @@ async fn main() -> Result<()> {
             min_fee_bps,
             profile,
             include_symbols,
+            pools,
             limit,
         } => {
             backfill_slipstream_events(BackfillConfig {
@@ -368,6 +374,7 @@ async fn main() -> Result<()> {
                 min_fee_bps,
                 profile,
                 include_symbols,
+                pools,
                 limit,
             })
             .await?
@@ -865,6 +872,7 @@ struct BackfillConfig {
     min_fee_bps: f64,
     profile: CandidateProfile,
     include_symbols: Vec<String>,
+    pools: Vec<String>,
     limit: usize,
 }
 
@@ -912,18 +920,36 @@ const EVENT_TOPICS: [EventTopic; 4] = [
 
 async fn backfill_slipstream_events(config: BackfillConfig) -> Result<()> {
     let rpc = JsonRpcClient::new(config.rpc_url.clone());
-    let resolved = resolve_pilot_candidates(
-        &config.rpc_url,
-        config.min_tvl_usd,
-        config.min_volume_usd_1d,
-        config.max_reward_share,
-        config.min_apy,
-        config.min_fee_bps,
-        config.profile,
-        config.include_symbols.clone(),
-        config.limit,
-    )
-    .await?;
+    let resolved = if config.pools.is_empty() {
+        resolve_pilot_candidates(
+            &config.rpc_url,
+            config.min_tvl_usd,
+            config.min_volume_usd_1d,
+            config.max_reward_share,
+            config.min_apy,
+            config.min_fee_bps,
+            config.profile,
+            config.include_symbols.clone(),
+            config.limit,
+        )
+        .await?
+    } else {
+        config
+            .pools
+            .iter()
+            .map(|spec| parse_manual_pool(spec))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    if resolved.is_empty() {
+        anyhow::bail!("no pools resolved to backfill");
+    }
+    for item in &resolved {
+        eprintln!(
+            "backfilling {} {} ({:?})",
+            item.candidate.symbol, item.pool_address, item.deployment
+        );
+    }
 
     fs::create_dir_all(config.data_dir.join("events"))?;
     fs::create_dir_all(config.data_dir.join("checkpoints"))?;
@@ -973,6 +999,23 @@ async fn backfill_slipstream_events(config: BackfillConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse a manual pool spec `SYMBOL:0xADDRESS` into a resolved candidate.
+fn parse_manual_pool(spec: &str) -> Result<ResolvedCandidate> {
+    let (symbol, address) = spec
+        .split_once(':')
+        .with_context(|| format!("expected SYMBOL:0xADDRESS, got `{spec}`"))?;
+    let address = address.trim();
+    let stripped = address.strip_prefix("0x").unwrap_or(address);
+    if stripped.len() != 40 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid pool address in `{spec}`");
+    }
+    Ok(ResolvedCandidate {
+        candidate: SlipstreamCandidate::manual(symbol.trim()),
+        deployment: autopool_aerodrome::SlipstreamDeployment::Manual,
+        pool_address: address.to_ascii_lowercase(),
+    })
 }
 
 async fn resolve_pilot_candidates(
