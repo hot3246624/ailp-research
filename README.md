@@ -107,7 +107,11 @@ its fee-alpha. Caveat: such pools are low-volume, so absolute alpha/capacity are
 `collect→burn→swap→mint→stake` action sequence with slippage-protected min amounts,
 estimates gas, runs hard risk gates, and **never signs** — plus a clear account of how
 Uniswap v2 / v3 / v4 differ for execution (the engine is a v3 model; v2/v4 need
-separate adapters behind `EvmPoolKind`).
+separate adapters behind `EvmPoolKind`). The dry-run simulates the rebalance swap
+against real in-range liquidity (`simulate_v3_swap`) and gates on price impact —
+which **rejects $10k on the 200 bps fee-alpha pool (39 bps impact) while the deep
+0.5 bps pool passes (1.4 bps)**: execution makes the research's capacity caveat a hard,
+enforced limit (alpha lives in thin pools, depth in zero-fee pools — capacity is a few $k).
 
 ## External References
 

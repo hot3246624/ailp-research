@@ -56,6 +56,26 @@ It:
 Example (WETH-USDC 200 bps, fresh mint): plan = `swap(token0→token1) → mint → stake`,
 gas ≈ $0.016, all three gates PASS.
 
+## Real swap simulation makes the capacity constraint *enforced*
+
+The dry-run now simulates the rebalance swap against the pool's **real in-range
+liquidity** (`simulate_v3_swap`, v3 closed form) to get a true `expected_out` and
+**price impact**, and gates on it. This surfaces the binding real-world limit:
+
+| pool | fee | $10k rebalance swap impact | gate |
+| --- | ---: | ---: | --- |
+| WETH-USDC **0x56ae** (the fee-alpha winner) | 200 bps | **39.4 bps** | **REJECTED** (> 30 bps) |
+| WETH-USDC 0xb2cc (deep) | 0.5 bps | 1.4 bps | PASS (but no alpha) |
+
+**The execution gate rejects the strategy on the exact pool where the research found
+edge.** The 200 bps pool is the only one with positive fee-alpha, but it is *thin*, so
+a $10k position cannot be rebalanced without 39 bps of swap slippage — which would eat
+the edge. This turns the research's soft "modest capacity" caveat into a hard,
+quantified limit: **the fee-alpha pool's capacity is only a few $k** before impact
+dominates. The deep pool that *can* take size has no alpha. That tension — alpha lives
+in thin pools, depth lives in zero-fee pools — is the real ceiling on this venue, and
+the execution layer now enforces it before any signature.
+
 ## What is deliberately NOT done yet
 
 - **Final ABI calldata bytes** for each call and the `multicall` wrapper.
