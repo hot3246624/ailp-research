@@ -80,7 +80,12 @@ ranging-regime strategy and the meta-decision is whether to be an LP at all; and
 `docs/lvr-attribution.md` for LVR + reward attribution — the pool has real LP
 fee-alpha (fee − LVR > 0 in every regime), but it only converts to net
 outperformance in calm because inventory beta drags trends, which is the strongest
-argument for a dynamic delta hedge.
+argument for a dynamic delta hedge; and `docs/multi-path.md` for the moving-block
+bootstrap (`multi-path`) — across the realistic volatility×cost distribution the
+delta hedge collapses net-PnL variance (lowest std) but does not fix rebalance
+churn, so narrow rebalancing policies net-lose despite positive gross fee−LVR, and
+the robust positive-expectancy LP is *low-churn* (passive-wide beats hold 72% of
+paths). 21 bps is too thin — find higher-fee/ranging pools.
 
 ## External References
 
