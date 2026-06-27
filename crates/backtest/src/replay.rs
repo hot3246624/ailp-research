@@ -271,6 +271,14 @@ pub enum RangeMode {
         exit_threshold: f64,
         window: usize,
     },
+    /// Narrow rebalancing LP plus a *dynamic* short hedge that tracks the position's
+    /// changing AERO delta (its token1 holding), rehedged when the delta drifts past
+    /// `rehedge_band` of the entry exposure. Neutralizes inventory beta so the LP's
+    /// fee−LVR alpha can be harvested in any regime (the static hedge cannot).
+    DeltaHedged {
+        half_width_ticks: i32,
+        rehedge_band: f64,
+    },
 }
 
 /// Rolling regime estimate over the last `n` ticks: per-swap drift, tick-change
@@ -477,6 +485,12 @@ fn run_policy(
         _ => 0.0,
     };
     let hedged = hedge_fraction > 0.0;
+    let delta_hedged = matches!(mode, RangeMode::DeltaHedged { .. });
+    let rehedge_band = match mode {
+        RangeMode::DeltaHedged { rehedge_band, .. } => rehedge_band,
+        _ => f64::INFINITY,
+    };
+    let any_hedge = hedged || delta_hedged;
 
     let mut half_width_sum = 0.0_f64;
     let mut half_width_count = 0u64;
@@ -489,13 +503,18 @@ fn run_policy(
     let mut position: Option<Position> = Some(Position::open(cfg, entry_sqrt, lower, upper));
     let mut sidelined_token0 = 0.0_f64; // value parked in the money leg (token0)
 
-    // Static short hedge on the risk asset (token1), sized to entry exposure.
-    let entry_risk_price = risk_price_token0(cfg, entry_sqrt);
-    let short_risk_human = if hedged {
-        hedge_fraction * (position.as_ref().unwrap().amount1_entry / cfg.scale1())
+    // Short hedge on the risk asset (token1). `hedged` = static (entry-sized, never
+    // updated); `delta_hedged` = dynamic (tracks the position's current AERO delta).
+    let entry_a1_human = position.as_ref().unwrap().amount1_entry / cfg.scale1();
+    let mut short_aero = if hedged {
+        hedge_fraction * entry_a1_human
+    } else if delta_hedged {
+        entry_a1_human
     } else {
         0.0
     };
+    let mut hedge_pnl_token0 = 0.0_f64;
+    let mut q_prev = risk_price_token0(cfg, entry_sqrt);
 
     let mut fees_token0 = 0.0_f64;
     let mut toxic_fee_token0 = 0.0_f64;
@@ -564,12 +583,16 @@ fn run_policy(
             lvr_token0 += (old_at_new - lp_at_new).max(0.0);
         }
 
-        // Funding accrual on the short hedge notional.
-        if hedged {
+        // Short-hedge mark-to-market + funding (incremental, supports dynamic rehedge).
+        // PnL uses the short held *during* this price move; rehedging happens after
+        // the position actions below.
+        if any_hedge {
+            let q_now = risk_price_token0(cfg, post_sqrt);
+            hedge_pnl_token0 += short_aero * (q_prev - q_now);
+            q_prev = q_now;
             let dt_days =
                 swap.block.saturating_sub(prev_block) as f64 * exec.block_seconds / 86_400.0;
-            let short_notional_usd =
-                cfg.token0_to_usd(short_risk_human * risk_price_token0(cfg, post_sqrt));
+            let short_notional_usd = cfg.token0_to_usd(short_aero * q_now);
             funding_usd += exec.funding_bps_per_day / 10_000.0 * short_notional_usd * dt_days;
         }
 
@@ -737,6 +760,22 @@ fn run_policy(
             }
         }
 
+        // Dynamic delta rehedge: keep the short equal to the position's current AERO
+        // holding once it drifts past the band (relative to entry exposure).
+        if delta_hedged {
+            let target = position
+                .as_ref()
+                .map(|p| p.amounts_at(post_sqrt).1 / cfg.scale1())
+                .unwrap_or(0.0);
+            let drift = (target - short_aero).abs();
+            let reference = entry_a1_human.max(1e-12);
+            if drift > rehedge_band * reference || (target == 0.0 && short_aero > 0.0) {
+                let rehedge_notional_usd = cfg.token0_to_usd(drift * q_prev);
+                slippage_usd += rehedge_notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                short_aero = target;
+            }
+        }
+
         // One-sided risk hold: active and above range = stuck holding the risk asset.
         let holding_risk = position
             .as_ref()
@@ -755,10 +794,9 @@ fn run_policy(
             Some(pos) => pos.value_token0(cfg, post_sqrt),
             None => sidelined_token0,
         };
-        let hedge_pnl_t0 =
-            short_risk_human * (entry_risk_price - risk_price_token0(cfg, post_sqrt));
         let reward_kept = reward_token0 * (1.0 - cfg.reward_haircut);
-        let equity_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0 + reward_kept)
+        let equity_usd = cfg
+            .token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_token0 + reward_kept)
             - gas_usd
             - slippage_usd
             - funding_usd;
@@ -777,13 +815,13 @@ fn run_policy(
         Some(pos) => pos.value_token0(cfg, final_sqrt),
         None => sidelined_token0,
     };
-    let hedge_pnl_t0 = short_risk_human * (entry_risk_price - risk_price_token0(cfg, final_sqrt));
-    let hedge_pnl_usd = cfg.token0_to_usd(hedge_pnl_t0);
+    let hedge_pnl_usd = cfg.token0_to_usd(hedge_pnl_token0);
     let fee_income_usd = cfg.token0_to_usd(fees_token0);
     let reward_kept = reward_token0 * (1.0 - cfg.reward_haircut);
     let reward_income_usd = cfg.token0_to_usd(reward_kept);
     let lvr_usd = cfg.token0_to_usd(lvr_token0);
-    let final_value_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0 + reward_kept);
+    let final_value_usd =
+        cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_token0 + reward_kept);
 
     let inventory_il_usd = match &position {
         Some(pos) => {
@@ -886,6 +924,9 @@ fn initial_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         RangeMode::VolatilityScaled { floor_ticks, .. } => *floor_ticks.max(&1),
         RangeMode::Adaptive { floor_ticks, .. } => *floor_ticks.max(&1),
         RangeMode::RegimeGated { floor_ticks, .. } => *floor_ticks.max(&1),
+        RangeMode::DeltaHedged {
+            half_width_ticks, ..
+        } => *half_width_ticks,
     }
 }
 
@@ -928,6 +969,9 @@ fn next_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
             let vol = rolling_tick_vol(window, *w);
             ((vol_k * vol).round() as i32).clamp(*floor_ticks, *cap_ticks)
         }
+        RangeMode::DeltaHedged {
+            half_width_ticks, ..
+        } => *half_width_ticks,
         RangeMode::HoldInventory => 0,
     }
 }
@@ -941,6 +985,7 @@ fn should_rebalance(mode: &RangeMode) -> bool {
         } | RangeMode::VolatilityScaled { .. }
             | RangeMode::HardExitStop { .. }
             | RangeMode::HedgedRebalance { .. }
+            | RangeMode::DeltaHedged { .. }
     )
 }
 
@@ -1150,6 +1195,16 @@ pub fn run_baseline_battery_with(
                 window: 200,
             },
             "regime_gated",
+        ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::DeltaHedged {
+                half_width_ticks: narrow_half_width,
+                rehedge_band: 0.25,
+            },
+            "delta_hedged",
         ),
     ]
 }
@@ -1652,6 +1707,39 @@ mod tests {
             report.oos_max_drawdown_usd < 2000.0,
             "walk-forward should cap OOS drawdown, got {}",
             report.oos_max_drawdown_usd
+        );
+    }
+
+    #[test]
+    fn dynamic_delta_hedge_offsets_crash_beta() {
+        let cfg = cfg();
+        let exec = ExecConfig {
+            action_delay_blocks: 0,
+            block_seconds: 2.0,
+            funding_bps_per_day: 0.0, // isolate the hedge mechanism
+            risk_asset_is_token1: true,
+        };
+        // A crash (AERO falls, tick rises): the unhedged LP accumulates the falling
+        // asset; a dynamic short hedge profits and offsets that beta.
+        let swaps = scenario_swaps(Scenario::Crash, 80_000, 1_200, 6_000, 1e18, 1e24);
+        let reports = run_baseline_battery_with(&swaps, &cfg, &exec, 100, 6000, 1.5, 1.0, 6.0);
+        let pick = |name: &str| reports.iter().find(|r| r.policy == name).unwrap().clone();
+        let delta = pick("delta_hedged");
+        let unhedged = pick("narrow_rebalance");
+        assert!(
+            delta.hedge_pnl_usd > 0.0,
+            "dynamic short hedge should profit in a crash, got {}",
+            delta.hedge_pnl_usd
+        );
+        assert!(
+            delta.net_pnl_usd > unhedged.net_pnl_usd,
+            "delta-hedged {} should beat unhedged narrow {} in a crash",
+            delta.net_pnl_usd,
+            unhedged.net_pnl_usd
+        );
+        assert!(
+            delta.max_drawdown_usd < unhedged.max_drawdown_usd,
+            "hedge should cap drawdown in a crash"
         );
     }
 
