@@ -357,32 +357,60 @@ impl JsonRpcClient {
             "method": method,
             "params": params,
         });
-        let response = self
-            .http
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| EvmError::Provider(err.to_string()))?;
-        let status = response.status();
-        let body_text = response
-            .text()
-            .await
-            .map_err(|err| EvmError::Provider(err.to_string()))?;
-        if !status.is_success() {
-            return Err(EvmError::Provider(format!("{status}: {body_text}")));
-        }
-        let response = serde_json::from_str::<Value>(&body_text)
-            .map_err(|err| EvmError::InvalidRpcResponse(err.to_string()))?;
 
-        if let Some(error) = response.get("error") {
-            return Err(EvmError::Rpc(error.to_string()));
+        // Free RPC tiers rate-limit (HTTP 429) and occasionally 503. Retry with
+        // exponential backoff so the indexers and scans coexist on one endpoint.
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut last_err = EvmError::Provider("no attempts".to_string());
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let backoff_ms = 250u64 * (1u64 << (attempt - 1).min(5));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+
+            let response = match self.http.post(&self.rpc_url).json(&body).send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    last_err = EvmError::Provider(err.to_string());
+                    continue;
+                }
+            };
+            let status = response.status();
+            let body_text = match response.text().await {
+                Ok(text) => text,
+                Err(err) => {
+                    last_err = EvmError::Provider(err.to_string());
+                    continue;
+                }
+            };
+
+            if status.as_u16() == 429 || status.is_server_error() {
+                last_err = EvmError::Provider(format!("{status}: {body_text}"));
+                continue;
+            }
+            if !status.is_success() {
+                return Err(EvmError::Provider(format!("{status}: {body_text}")));
+            }
+
+            let response = serde_json::from_str::<Value>(&body_text)
+                .map_err(|err| EvmError::InvalidRpcResponse(err.to_string()))?;
+            if let Some(error) = response.get("error") {
+                // -32005 / "capacity" style errors are rate limits; retry those too.
+                let text = error.to_string();
+                if text.contains("rate") || text.contains("capacity") || text.contains("-32005") {
+                    last_err = EvmError::Rpc(text);
+                    continue;
+                }
+                return Err(EvmError::Rpc(text));
+            }
+
+            return response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| EvmError::InvalidRpcResponse(response.to_string()));
         }
 
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| EvmError::InvalidRpcResponse(response.to_string()))
+        Err(last_err)
     }
 }
 
