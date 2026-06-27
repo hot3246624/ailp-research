@@ -89,7 +89,11 @@ paths). 21 bps is too thin — find higher-fee/ranging pools; and `docs/pool-piv
 for the fee-density threshold (5 bps: fee−LVR < 0, no alpha; 21 bps: alpha but
 churn-eaten; need higher fee) and the robust scan showing Slipstream's active pools
 are all low-fee while high-fee pools are inactive — CTR-USDC (100 bps, real vol) is
-the one candidate worth a dedicated test.
+the one candidate worth a dedicated test. The deployable shape that emerges is
+`hedged_wide` (a wide, never-rebalanced band + dynamic delta hedge): on the real
+CTR-USDC crash it stayed ~flat (−$15) versus hold's −$537 and beat hold on 85% of
+paths with ~10× less drawdown — direction-robust, low-variance LP. Its mean edge is
+small at 100 bps (fee-alpha ≈ hedge cost); higher fee density is the remaining lever.
 
 ## External References
 

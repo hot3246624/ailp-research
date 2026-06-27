@@ -110,3 +110,38 @@ Across 5 / 21 / 100 bps, three pools, single windows and bootstrapped distributi
 So the recommended live shape is: **CTR-USDC-style (highest-fee active pool) + a wide
 band + minimal rebalancing + optional delta hedge for variance.** The next build is a
 *delta-hedged passive-wide* policy and a scan for more 100 bps-class active pools.
+
+## The deployable shape: `hedged_wide` (built)
+
+`RangeMode::HedgedWide` = a wide, never-rebalanced band (passive-wide's low churn and
+fee harvest) wrapped in the dynamic delta hedge (kills the inventory beta a wide band
+still carries). Multi-path on CTR-USDC:
+
+**Demeaned (martingale)** — isolates variance:
+
+| policy | mean | std | meanDD |
+| --- | ---: | ---: | ---: |
+| hold_50_50 | +133 | 653 | 702 |
+| passive_wide | +157 | 599 | 675 |
+| **hedged_wide** | −3 | **69** | **78** |
+
+**Raw (the real CTR down-crash)** — the killer test:
+
+| policy | mean | std | win% hold | meanDD |
+| --- | ---: | ---: | ---: | ---: |
+| hold_50_50 | −537 | 568 | — | 989 |
+| passive_wide | −567 | 675 | 56% | 1077 |
+| **hedged_wide** | **−15** | **57** | **85%** | **77** |
+
+`hedged_wide` is **direction-robust**: ~flat and tight whether the asset crashes or
+rallies, with ~10× less variance and drawdown than hold/passive-wide. On the real CTR
+crash it lost **$15 vs hold's $537** and beat hold on **85%** of paths.
+
+**Honest read:** its *mean* edge is small (in the driftless world fee-alpha barely
+covers funding + hedge cost at this pool, ≈ 0). Its value is **risk**: it removes the
+±$500 directional gamble that naked LP/hold carry, turning LP into a tight,
+direction-neutral, crash-proof position. For a risk-managed LP with no directional
+view that is the right shape. To make the *mean* clearly positive you need fee-alpha
+above hedge cost — i.e. higher fee density and/or cheaper funding than CTR-USDC's
+100 bps / 10 bps-day. That is the remaining lever, and the reason to keep scanning for
+even higher-fee active pools.
