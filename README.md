@@ -102,6 +102,13 @@ thesis: target **high fee × LOW volatility**, not high vol — churn cost *is*
 volatility, so a calm high-fee pool lets a tight (optionally delta-hedged) band keep
 its fee-alpha. Caveat: such pools are low-volume, so absolute alpha/capacity are modest.
 
+`docs/execution-dry-run.md` starts the execution phase (Milestone 5): a
+**Slipstream/v3-scoped** `dry-run-rebalance` planner that reads pool state, builds the
+`collect→burn→swap→mint→stake` action sequence with slippage-protected min amounts,
+estimates gas, runs hard risk gates, and **never signs** — plus a clear account of how
+Uniswap v2 / v3 / v4 differ for execution (the engine is a v3 model; v2/v4 need
+separate adapters behind `EvmPoolKind`).
+
 ## External References
 
 - DeFiLlama yields UI: https://defillama.com/yields

@@ -2275,7 +2275,9 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     if rebalancing {
         actions.push(json!({"step":"collect","contract":c.nonfungible_position_manager,"call":"collect(tokenId, max, max)","expects":"uncollected fees out"}));
         actions.push(json!({"step":"decreaseLiquidity","contract":c.nonfungible_position_manager,"call":"decreaseLiquidity(tokenId, liquidity, amount0Min, amount1Min, deadline)","amount0_out_est":c0,"amount1_out_est":c1,"amount0Min":c0*(1.0-slip),"amount1Min":c1*(1.0-slip)}));
-        actions.push(json!({"step":"burn","contract":c.nonfungible_position_manager,"call":"burn(tokenId)"}));
+        actions.push(
+            json!({"step":"burn","contract":c.nonfungible_position_manager,"call":"burn(tokenId)"}),
+        );
     }
 
     // Swap to reach the target ratio.
@@ -2288,7 +2290,11 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token0->token1)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip)}));
     } else if d1 < -1e-12 {
         let amount_in = -d1;
-        let expected_out = if price_human > 0.0 { amount_in / price_human } else { 0.0 };
+        let expected_out = if price_human > 0.0 {
+            amount_in / price_human
+        } else {
+            0.0
+        };
         actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token1->token0)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip)}));
     }
 
@@ -2300,7 +2306,11 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     // Risk gates.
     let gas_usd = net.estimated_rebalance_gas_usd.unwrap_or(0.0);
     let risk_token_share = {
-        let t1_in_t0 = if price_human > 0.0 { t1 / price_human } else { 0.0 };
+        let t1_in_t0 = if price_human > 0.0 {
+            t1 / price_human
+        } else {
+            0.0
+        };
         let total = t0 + t1_in_t0;
         if total > 0.0 { t1_in_t0 / total } else { 0.0 }
     };
@@ -2320,7 +2330,10 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     gates.push((
         "one_sided_inventory".into(),
         risk_token_share <= 0.8,
-        format!("risk-token (token1) share {:.0}% <= 80%", risk_token_share * 100.0),
+        format!(
+            "risk-token (token1) share {:.0}% <= 80%",
+            risk_token_share * 100.0
+        ),
     ));
     gates.push((
         "slippage_bounded".into(),
@@ -2360,7 +2373,11 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     );
     println!(
         "target band: [{lower}, {upper}]  desired token0={t0:.6} token1={t1:.6}  ({})",
-        if rebalancing { "rebalance" } else { "fresh mint" }
+        if rebalancing {
+            "rebalance"
+        } else {
+            "fresh mint"
+        }
     );
     println!("plan:");
     for (i, a) in actions.iter().enumerate() {
@@ -2377,7 +2394,11 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     }
     println!(
         "decision: {} (this is a proposal only; full ABI calldata + on-chain eth_call simulation from a funded sender is the next step)",
-        if all_pass { "GATES PASS — would propose" } else { "REJECTED by risk gates" }
+        if all_pass {
+            "GATES PASS — would propose"
+        } else {
+            "REJECTED by risk gates"
+        }
     );
 
     Ok(())
