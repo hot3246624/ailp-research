@@ -1047,6 +1047,36 @@ fn rolling_tick_vol(window: &[i32], n: usize) -> f64 {
     var.sqrt()
 }
 
+/// Token amounts (human units) and raw liquidity for opening a concentrated
+/// position of `capital_token0` (human token0) across `[lower_tick, upper_tick]` at
+/// `current_sqrt_x96`. The same v3 math used in the replay — exposed for the
+/// execution planner so the dry-run and the backtest agree on inventory.
+pub fn cl_mint_amounts(
+    decimals0: u8,
+    decimals1: u8,
+    lower_tick: i32,
+    upper_tick: i32,
+    current_sqrt_x96: f64,
+    capital_token0: f64,
+) -> (f64, f64, f64) {
+    let cfg = ReplayConfig {
+        decimals0,
+        decimals1,
+        fee_fraction: 0.0,
+        token0_usd: 1.0,
+        capital_usd: capital_token0,
+        rebalance_gas_usd: 0.0,
+        rebalance_slippage_bps: 0.0,
+        rebalance_swap_fraction: 0.5,
+        reward_apr: 0.0,
+        reward_haircut: 0.0,
+    };
+    let sqrt = current_sqrt_x96 / TWO_POW_96;
+    let pos = Position::open_with_capital(&cfg, sqrt, lower_tick, upper_tick, capital_token0);
+    let (a0, a1) = pos.amounts_at(sqrt);
+    (a0 / cfg.scale0(), a1 / cfg.scale1(), pos.liquidity)
+}
+
 fn hold_report(
     swaps: &[SwapObs],
     cfg: &ReplayConfig,

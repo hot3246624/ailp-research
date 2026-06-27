@@ -333,6 +333,54 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Build a DRY-RUN Aerodrome Slipstream (Uniswap-v3 model) rebalance plan for a
+    /// pool: reads pool state, proposes the collect→burn→swap→mint(+stake) action
+    /// sequence with slippage-protected min amounts, estimates gas, runs hard risk
+    /// gates, and NEVER signs or broadcasts. v2 (Aerodrome V1) and v4 need separate
+    /// adapters — this planner is Slipstream/v3 only.
+    DryRunRebalance {
+        #[arg(long, env = "BASE_RPC_URL")]
+        rpc_url: String,
+        #[arg(long)]
+        pool_address: String,
+        /// USD capital to deploy (or current position value when rebalancing).
+        #[arg(long, default_value_t = 10_000.0)]
+        capital_usd: f64,
+        /// USD value of one token0 (numeraire).
+        #[arg(long, default_value_t = 1.0)]
+        token0_usd: f64,
+        #[arg(long, default_value_t = 18)]
+        decimals0: u8,
+        #[arg(long, default_value_t = 18)]
+        decimals1: u8,
+        /// Target half-width in ticks (band = current_tick ± this, snapped to spacing).
+        #[arg(long, default_value_t = 600)]
+        half_width_ticks: i32,
+        /// Existing position to rebalance from (omit for a fresh mint).
+        #[arg(long)]
+        current_lower: Option<i32>,
+        #[arg(long)]
+        current_upper: Option<i32>,
+        /// Max slippage on the rebalance swap and mint, in bps.
+        #[arg(long, default_value_t = 30.0)]
+        slippage_bps: f64,
+        /// Gas units for the full rebalance multicall.
+        #[arg(long, default_value_t = 900_000)]
+        rebalance_gas_units: u64,
+        #[arg(long, default_value_t = 3000.0)]
+        eth_usd: f64,
+        /// Expected fee edge (USD) the rebalance is meant to capture; the gas/edge
+        /// gate rejects if gas exceeds `max_gas_to_edge_pct` of it.
+        #[arg(long, default_value_t = 0.0)]
+        expected_edge_usd: f64,
+        #[arg(long, default_value_t = 0.15)]
+        max_gas_to_edge_pct: f64,
+        /// Position is staked in the gauge (adds unstake/stake steps + gas).
+        #[arg(long, default_value_t = true)]
+        staked: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
 }
 
 /// Shared economic + execution parameters for the replay commands.
@@ -695,6 +743,44 @@ async fn main() -> Result<()> {
             &params,
             format,
         )?,
+        Command::DryRunRebalance {
+            rpc_url,
+            pool_address,
+            capital_usd,
+            token0_usd,
+            decimals0,
+            decimals1,
+            half_width_ticks,
+            current_lower,
+            current_upper,
+            slippage_bps,
+            rebalance_gas_units,
+            eth_usd,
+            expected_edge_usd,
+            max_gas_to_edge_pct,
+            staked,
+            format,
+        } => {
+            dry_run_rebalance(DryRunArgs {
+                rpc_url,
+                pool_address,
+                capital_usd,
+                token0_usd,
+                decimals0,
+                decimals1,
+                half_width_ticks,
+                current_lower,
+                current_upper,
+                slippage_bps,
+                rebalance_gas_units,
+                eth_usd,
+                expected_edge_usd,
+                max_gas_to_edge_pct,
+                staked,
+                format,
+            })
+            .await?
+        }
     }
 
     Ok(())
@@ -2089,6 +2175,211 @@ fn multi_path_cmd(
             p.mean_max_drawdown_usd,
         );
     }
+    Ok(())
+}
+
+struct DryRunArgs {
+    rpc_url: String,
+    pool_address: String,
+    capital_usd: f64,
+    token0_usd: f64,
+    decimals0: u8,
+    decimals1: u8,
+    half_width_ticks: i32,
+    current_lower: Option<i32>,
+    current_upper: Option<i32>,
+    slippage_bps: f64,
+    rebalance_gas_units: u64,
+    eth_usd: f64,
+    expected_edge_usd: f64,
+    max_gas_to_edge_pct: f64,
+    staked: bool,
+    format: OutputFormat,
+}
+
+fn hex_word_to_f64(hex: &str) -> f64 {
+    let stripped = hex.trim_start_matches("0x");
+    let mut acc = 0.0_f64;
+    for ch in stripped.chars() {
+        acc = acc * 16.0 + ch.to_digit(16).unwrap_or(0) as f64;
+    }
+    acc
+}
+
+fn snap_to_spacing(tick: i32, spacing: i32) -> i32 {
+    let s = spacing.max(1);
+    ((tick as f64 / s as f64).round() as i32) * s
+}
+
+/// Build a dry-run Slipstream (v3) rebalance plan. Reads pool state, computes the
+/// action sequence + slippage-protected amounts + gas, runs risk gates, prints, and
+/// never signs. Aerodrome V1 (v2) and Uniswap v4 are NOT handled here.
+async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
+    let rpc = JsonRpcClient::new(args.rpc_url.clone());
+    let state = rpc.read_cl_pool_state(&args.pool_address).await?;
+    let fee_bps = match rpc.eth_call(&args.pool_address, "0xddca3f43").await {
+        Ok(hex) => parse_hex_u64_lossy(&hex)
+            .map(|v| v as f64 / 100.0)
+            .unwrap_or(0.0),
+        Err(_) => 0.0,
+    };
+    let net = rpc
+        .sample_network(BASE_CHAIN_ID, args.rebalance_gas_units, Some(args.eth_usd))
+        .await?;
+
+    let sqrt_x96 = hex_word_to_f64(&state.sqrt_price_x96_hex);
+    let spacing = state.tick_spacing.max(1);
+    let lower = snap_to_spacing(state.current_tick - args.half_width_ticks, spacing);
+    let upper = snap_to_spacing(state.current_tick + args.half_width_ticks, spacing);
+    let capital_token0 = args.capital_usd / args.token0_usd;
+
+    // Target inventory for the new band (v3 math, agrees with the backtest).
+    let (t0, t1, target_liq) = autopool_backtest::cl_mint_amounts(
+        args.decimals0,
+        args.decimals1,
+        lower,
+        upper,
+        sqrt_x96,
+        capital_token0,
+    );
+    // Current inventory: from the old band if rebalancing, else all token0.
+    let (c0, c1) = match (args.current_lower, args.current_upper) {
+        (Some(cl), Some(cu)) => {
+            let (a0, a1, _) = autopool_backtest::cl_mint_amounts(
+                args.decimals0,
+                args.decimals1,
+                cl,
+                cu,
+                sqrt_x96,
+                capital_token0,
+            );
+            (a0, a1)
+        }
+        _ => (capital_token0, 0.0),
+    };
+
+    let price_human = {
+        let p_raw = (sqrt_x96 / 79_228_162_514_264_337_593_543_950_336.0).powi(2);
+        p_raw * 10f64.powi(args.decimals0 as i32 - args.decimals1 as i32)
+    };
+    let slip = args.slippage_bps / 10_000.0;
+
+    // Slipstream/v3 deployment contracts (verify the pool's deployment matches).
+    let c = BASE_SLIPSTREAM_GAUGES_V3;
+    let rebalancing = args.current_lower.is_some() && args.current_upper.is_some();
+    let mut actions: Vec<serde_json::Value> = Vec::new();
+
+    if rebalancing && args.staked {
+        actions.push(json!({"step":"unstake","contract":c.gauge_factory,"call":"gauge.withdraw(tokenId)","note":"emissions require staking; must unstake before modifying"}));
+    }
+    if rebalancing {
+        actions.push(json!({"step":"collect","contract":c.nonfungible_position_manager,"call":"collect(tokenId, max, max)","expects":"uncollected fees out"}));
+        actions.push(json!({"step":"decreaseLiquidity","contract":c.nonfungible_position_manager,"call":"decreaseLiquidity(tokenId, liquidity, amount0Min, amount1Min, deadline)","amount0_out_est":c0,"amount1_out_est":c1,"amount0Min":c0*(1.0-slip),"amount1Min":c1*(1.0-slip)}));
+        actions.push(json!({"step":"burn","contract":c.nonfungible_position_manager,"call":"burn(tokenId)"}));
+    }
+
+    // Swap to reach the target ratio.
+    let d0 = t0 - c0;
+    let d1 = t1 - c1;
+    if d0 < -1e-12 {
+        // excess token0 -> sell for token1
+        let amount_in = -d0;
+        let expected_out = amount_in * price_human;
+        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token0->token1)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip)}));
+    } else if d1 < -1e-12 {
+        let amount_in = -d1;
+        let expected_out = if price_human > 0.0 { amount_in / price_human } else { 0.0 };
+        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token1->token0)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip)}));
+    }
+
+    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(token0,token1,tickSpacing,tickLower,tickUpper,amount0Desired,amount1Desired,amount0Min,amount1Min,recipient,deadline)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip)}));
+    if args.staked {
+        actions.push(json!({"step":"stake","contract":c.gauge_factory,"call":"gauge.deposit(tokenId)","note":"stake the new NFT to earn emissions"}));
+    }
+
+    // Risk gates.
+    let gas_usd = net.estimated_rebalance_gas_usd.unwrap_or(0.0);
+    let risk_token_share = {
+        let t1_in_t0 = if price_human > 0.0 { t1 / price_human } else { 0.0 };
+        let total = t0 + t1_in_t0;
+        if total > 0.0 { t1_in_t0 / total } else { 0.0 }
+    };
+    let mut gates: Vec<(String, bool, String)> = Vec::new();
+    let gas_gate = args.expected_edge_usd <= 0.0
+        || gas_usd <= args.max_gas_to_edge_pct * args.expected_edge_usd;
+    gates.push((
+        "gas_vs_edge".into(),
+        gas_gate,
+        format!(
+            "gas ${:.4} vs {:.0}% of edge ${:.2}",
+            gas_usd,
+            args.max_gas_to_edge_pct * 100.0,
+            args.expected_edge_usd
+        ),
+    ));
+    gates.push((
+        "one_sided_inventory".into(),
+        risk_token_share <= 0.8,
+        format!("risk-token (token1) share {:.0}% <= 80%", risk_token_share * 100.0),
+    ));
+    gates.push((
+        "slippage_bounded".into(),
+        args.slippage_bps <= 100.0,
+        format!("max slippage {:.0} bps", args.slippage_bps),
+    ));
+    let all_pass = gates.iter().all(|(_, ok, _)| *ok);
+
+    let plan = json!({
+        "DRY_RUN": true,
+        "requires_signature": true,
+        "broadcast": false,
+        "protocol": "aerodrome-slipstream (uniswap-v3 concentrated-liquidity model)",
+        "not_handled": ["aerodrome-v1 (v2 x*y=k)", "uniswap-v4 (singleton + hooks + flash accounting)"],
+        "pool": args.pool_address,
+        "deployment_contracts_assumed": format!("{:?}", c.deployment),
+        "fee_bps": fee_bps,
+        "current_tick": state.current_tick,
+        "tick_spacing": spacing,
+        "gas_price_gwei": net.gas_price_gwei,
+        "est_gas_usd": gas_usd,
+        "target_range": {"lower": lower, "upper": upper, "liquidity_est": target_liq},
+        "actions": actions,
+        "gates": gates.iter().map(|(n,ok,d)| json!({"gate":n,"pass":ok,"detail":d})).collect::<Vec<_>>(),
+        "all_gates_pass": all_pass,
+    });
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+
+    println!("=== DRY RUN (Slipstream / Uniswap-v3) — NOT SIGNED, NOT BROADCAST ===");
+    println!(
+        "pool {} fee={:.2}bps tick={} spacing={} gas≈${:.4} (@{:.4} gwei)",
+        args.pool_address, fee_bps, state.current_tick, spacing, gas_usd, net.gas_price_gwei
+    );
+    println!(
+        "target band: [{lower}, {upper}]  desired token0={t0:.6} token1={t1:.6}  ({})",
+        if rebalancing { "rebalance" } else { "fresh mint" }
+    );
+    println!("plan:");
+    for (i, a) in actions.iter().enumerate() {
+        println!(
+            "  {}. {:<16} {}",
+            i + 1,
+            a.get("step").and_then(|v| v.as_str()).unwrap_or("-"),
+            a.get("call").and_then(|v| v.as_str()).unwrap_or("-")
+        );
+    }
+    println!("risk gates:");
+    for (n, ok, d) in &gates {
+        println!("  [{}] {:<22} {}", if *ok { "PASS" } else { "FAIL" }, n, d);
+    }
+    println!(
+        "decision: {} (this is a proposal only; full ABI calldata + on-chain eth_call simulation from a funded sender is the next step)",
+        if all_pass { "GATES PASS — would propose" } else { "REJECTED by risk gates" }
+    );
+
     Ok(())
 }
 
