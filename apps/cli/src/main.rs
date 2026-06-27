@@ -1964,22 +1964,33 @@ async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
     let mut rows = Vec::new();
 
     for item in &resolved {
-        let logs = rpc
-            .get_logs_chunked(
-                &item.pool_address,
-                from_block,
-                to_block,
-                SWAP_TOPIC,
-                args.log_chunk_blocks,
-            )
-            .await?;
-        let mut ticks: Vec<i32> = logs
-            .iter()
-            .filter_map(|log| autopool_backtest::decode_swap_obs(&log.data, 0, 0).map(|o| o.tick))
-            .collect();
-        // get_logs returns in block order; keep as the price path.
+        // Fetch swaps one chunk at a time with a sleep between chunks so the scan
+        // coexists with the background indexers on a shared free RPC endpoint.
+        let mut ticks: Vec<i32> = Vec::new();
+        let mut swap_count = 0usize;
+        let mut cursor = from_block;
+        while cursor <= to_block {
+            let end = cursor
+                .saturating_add(args.log_chunk_blocks.saturating_sub(1))
+                .min(to_block);
+            let logs = rpc
+                .get_logs(&item.pool_address, cursor, end, SWAP_TOPIC)
+                .await?;
+            swap_count += logs.len();
+            ticks.extend(
+                logs.iter()
+                    .filter_map(|log| autopool_backtest::decode_swap_obs(&log.data, 0, 0))
+                    .map(|o| o.tick),
+            );
+            if end == u64::MAX {
+                break;
+            }
+            cursor = end + 1;
+            if args.sleep_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(args.sleep_ms)).await;
+            }
+        }
         let (tick_span, tick_vol) = tick_stats(&ticks);
-        ticks.clear();
 
         let state = rpc.read_cl_pool_state(&item.pool_address).await?;
         let fee_bps = match rpc.eth_call(&item.pool_address, "0xddca3f43").await {
@@ -1990,7 +2001,7 @@ async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
         };
         let span = to_block.saturating_sub(from_block).saturating_add(1);
         let swaps_per_kblock = if span > 0 {
-            logs.len() as f64 * 1000.0 / span as f64
+            swap_count as f64 * 1000.0 / span as f64
         } else {
             0.0
         };
@@ -2005,16 +2016,12 @@ async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
             volume_usd_1d: item.candidate.volume_usd_1d,
             current_tick: state.current_tick,
             liquidity: state.liquidity,
-            swaps: logs.len(),
+            swaps: swap_count,
             swaps_per_kblock: (swaps_per_kblock * 100.0).round() / 100.0,
             tick_span,
             tick_vol: (tick_vol * 100.0).round() / 100.0,
             activity_score: (activity_score * 100.0).round() / 100.0,
         });
-
-        if args.sleep_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(args.sleep_ms)).await;
-        }
     }
 
     rows.sort_by(|a, b| b.activity_score.total_cmp(&a.activity_score));
