@@ -250,6 +250,20 @@ pub enum RangeMode {
         trend_exit_threshold: f64,
         window: usize,
     },
+    /// LP on/off gate. The meta-decision *whether to be an LP at all*: LP only wins
+    /// in ranging regimes, so when a trend is detected in *either* direction the
+    /// gate stands the position down to the money leg (conservative de-risk that
+    /// protects against the down-crash; giving up an up-trend's upside is the price
+    /// of not taking a directional bet). It resumes LPing once price ranges again.
+    /// Hysteresis: stand down at `enter_threshold`, resume below `exit_threshold`.
+    RegimeGated {
+        vol_k: f64,
+        floor_ticks: i32,
+        cap_ticks: i32,
+        enter_threshold: f64,
+        exit_threshold: f64,
+        window: usize,
+    },
 }
 
 /// Rolling regime estimate over the last `n` ticks: per-swap drift, tick-change
@@ -433,6 +447,16 @@ fn run_policy(
         } => (trend_exit_threshold, window),
         _ => (f64::INFINITY, 200),
     };
+    let gated = matches!(mode, RangeMode::RegimeGated { .. });
+    let (gate_enter, gate_exit, gate_window) = match mode {
+        RangeMode::RegimeGated {
+            enter_threshold,
+            exit_threshold,
+            window,
+            ..
+        } => (enter_threshold, exit_threshold, window),
+        _ => (f64::INFINITY, 0.0, 200),
+    };
     let hedge_fraction = match mode {
         RangeMode::HedgedRebalance { hedge_fraction, .. } => hedge_fraction,
         _ => 0.0,
@@ -517,8 +541,48 @@ fn run_policy(
             funding_usd += exec.funding_bps_per_day / 10_000.0 * short_notional_usd * dt_days;
         }
 
-        // Regime-aware adaptive policy: act on a live trend read, even in range.
-        if adaptive {
+        // LP on/off gate: stand down to the money leg on any strong trend, resume
+        // LPing when ranging. Whether to be an LP at all dominates the width choice.
+        if gated {
+            let regime = assess_regime(&tick_window, gate_window);
+            let trending = regime.trend_strength >= gate_enter;
+            let ranging = regime.trend_strength <= gate_exit;
+            if position.is_some() {
+                if trending {
+                    let (exec_sqrt, _) =
+                        price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                    let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                    let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                    let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                    gas_usd += cfg.rebalance_gas_usd;
+                    slippage_usd += slip;
+                    rebalances += 1;
+                    sidelined_token0 =
+                        (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                    position = None;
+                }
+                // else: hold the band — no churn while neither trending nor ranging.
+            } else if ranging {
+                // Resume LPing: re-form the LP ratio from the money leg.
+                let val = sidelined_token0;
+                let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                gas_usd += cfg.rebalance_gas_usd;
+                slippage_usd += slip;
+                rebalances += 1;
+                let half = next_half_width(&mode, &tick_window);
+                half_width_sum += half as f64;
+                half_width_count += 1;
+                let (nl, nu) = centered_range(swap.tick, half);
+                lower = nl;
+                upper = nu;
+                let net = (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                position = Some(Position::open_with_capital(
+                    cfg, post_sqrt, lower, upper, net,
+                ));
+                sidelined_token0 = 0.0;
+            }
+        } else if adaptive {
             let regime = assess_regime(&tick_window, adaptive_window);
             let trending = regime.trend_strength >= adaptive_threshold;
             // Risk asset is token1: the danger trend is the tick rising (drift > 0).
@@ -782,6 +846,7 @@ fn initial_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         } => *half_width_ticks,
         RangeMode::VolatilityScaled { floor_ticks, .. } => *floor_ticks.max(&1),
         RangeMode::Adaptive { floor_ticks, .. } => *floor_ticks.max(&1),
+        RangeMode::RegimeGated { floor_ticks, .. } => *floor_ticks.max(&1),
     }
 }
 
@@ -805,6 +870,16 @@ fn next_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         } => *half_width_ticks,
         RangeMode::StaticWide { half_width_ticks } => *half_width_ticks,
         RangeMode::Adaptive {
+            vol_k,
+            floor_ticks,
+            cap_ticks,
+            window: w,
+            ..
+        } => {
+            let vol = rolling_tick_vol(window, *w);
+            ((vol_k * vol).round() as i32).clamp(*floor_ticks, *cap_ticks)
+        }
+        RangeMode::RegimeGated {
             vol_k,
             floor_ticks,
             cap_ticks,
@@ -1019,6 +1094,20 @@ pub fn run_baseline_battery_with(
                 window: 200,
             },
             "adaptive_regime",
+        ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::RegimeGated {
+                vol_k,
+                floor_ticks: narrow_half_width / 2,
+                cap_ticks: wide_half_width,
+                enter_threshold: adaptive_trend_threshold,
+                exit_threshold: adaptive_trend_threshold / 2.0,
+                window: 200,
+            },
+            "regime_gated",
         ),
     ]
 }
@@ -1520,6 +1609,42 @@ mod tests {
             "walk-forward should cap OOS drawdown, got {}",
             report.oos_max_drawdown_usd
         );
+    }
+
+    #[test]
+    fn regime_gate_stands_down_in_trend() {
+        let cfg = cfg();
+        let exec = ExecConfig {
+            action_delay_blocks: 3,
+            block_seconds: 2.0,
+            funding_bps_per_day: 0.0,
+            risk_asset_is_token1: true,
+        };
+        // Calm fees, then a crash. The gate should LP through the calm part and
+        // stand down to money during the crash, beating a static narrow LP and
+        // capping drawdown.
+        let mut stream = scenario_swaps(Scenario::Calm, 80_000, 600, 6_000, 1e18, 1e24);
+        let crash = scenario_swaps(Scenario::Crash, 80_000, 900, 6_000, 1e18, 1e24);
+        stream.extend(crash);
+        for (i, s) in stream.iter_mut().enumerate() {
+            s.block = 1000 + i as u64;
+        }
+        let reports = run_baseline_battery_with(&stream, &cfg, &exec, 300, 6000, 1.5, 1.0, 2.0);
+        let pick = |name: &str| reports.iter().find(|r| r.policy == name).unwrap().clone();
+        let gated = pick("regime_gated");
+        let narrow_static = pick("narrow_static");
+        assert!(
+            gated.net_pnl_usd > narrow_static.net_pnl_usd,
+            "gate {} should beat static LP {} across calm->crash",
+            gated.net_pnl_usd,
+            narrow_static.net_pnl_usd
+        );
+        assert!(
+            gated.max_drawdown_usd < narrow_static.max_drawdown_usd,
+            "gate should cap drawdown vs static LP"
+        );
+        // It should both earn some fees (calm part) and act (stand down in crash).
+        assert!(gated.fee_income_usd > 0.0 && gated.rebalances > 0);
     }
 
     #[test]
