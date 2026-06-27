@@ -137,6 +137,48 @@ still carries). Multi-path on CTR-USDC:
 rallies, with ~10× less variance and drawdown than hold/passive-wide. On the real CTR
 crash it lost **$15 vs hold's $537** and beat hold on **85%** of paths.
 
+## The positive result: WETH-USDC 200 bps (high fee + LOW vol)
+
+Ranking the scan by `fee/vol` (a fee-alpha proxy) surfaced **WETH-USDC at 200 bps**
+with `fee/vol = 266` (4× CTR) — a high-fee but **low-volatility** major pair (the
+0x56ae…7ef pool). This is the opposite of what "find a volatile pool" suggested, and
+it is the winner. Multi-path (477 swaps, `--invert` so USDC is the numeraire,
+WETH the risk token1):
+
+| policy | demeaned mean | std | raw mean | std | fee−LVR | win% | meanDD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| narrow_static | +109 | 117 | +142 | 103 | +113 | 96–99% | 62–79 |
+| **delta_hedged** | **+91** | **20** | **+88** | **21** | +113 | 61–76% | **~1** |
+| passive_wide | +23 | 111 | +65 | 114 | +14 | 98–99% | 91–107 |
+| hold_50_50 | +11 | 110 | +54 | 117 | 0 | — | 96 |
+
+**This is the first pool with clear positive LP expectancy.** Two winners:
+
+- **`narrow_static` (+$109–142, beats hold 96–99%)** — highest mean. The 200 bps fee
+  makes fee − LVR strongly positive (+$113), and because the pair is *low-vol* the
+  narrow band rarely crosses, so there is almost no rebalance churn to eat it. It is
+  unhedged, so it carries directional variance (std ~110).
+- **`delta_hedged` (+$88–91, std $20, drawdown ~$1, beats hold 61–76%)** — the
+  risk-adjusted winner. It harvests the same +$113 fee-alpha and the dynamic hedge
+  collapses the beta: ~+$90 *regardless of drift*, with ~5× less variance and ~60×
+  less drawdown than narrow_static. A genuinely deployable, direction-robust,
+  positive-expectancy LP.
+
+### The revised, completed thesis
+
+The right target is **high fee × LOW volatility**, not high fee × high volatility.
+Churn cost *is* volatility, so a volatile pool's churn eats the alpha at any fee tier
+(CTR-USDC 100 bps). A high-fee, low-vol pool gives the opposite: fees ≫ LVR *and* the
+band rarely crosses, so a tight static or delta-hedged position keeps the alpha. The
+`fee/vol` scan metric finds exactly these pools.
+
+**Deployable conclusion:** a delta-hedged narrow band on the highest `fee/vol` active
+pool (WETH-USDC 200 bps here) is positive-expectancy (~+$90 per $10k over the window),
+direction-robust, and near-zero drawdown. The caveat is *throughput*: these high-fee
+pools are low-volume, so absolute alpha is modest and depends on the pool continuing
+to receive its (small) flow — capital capacity is limited. The mechanism, though, is
+validated end to end.
+
 **Honest read:** its *mean* edge is small (in the driftless world fee-alpha barely
 covers funding + hedge cost at this pool, ≈ 0). Its value is **risk**: it removes the
 ±$500 directional gamble that naked LP/hold carry, turning LP into a tight,

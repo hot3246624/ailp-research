@@ -94,6 +94,13 @@ the one candidate worth a dedicated test. The deployable shape that emerges is
 CTR-USDC crash it stayed ~flat (−$15) versus hold's −$537 and beat hold on 85% of
 paths with ~10× less drawdown — direction-robust, low-variance LP. Its mean edge is
 small at 100 bps (fee-alpha ≈ hedge cost); higher fee density is the remaining lever.
+Ranking the scan by `fee/vol` then found the **positive** result: **WETH-USDC at
+200 bps** (high fee, *low* vol) is the first pool with clear positive LP expectancy —
+a **delta-hedged narrow band nets ~+$90/$10k with std $20 and ~$1 drawdown regardless
+of drift** (narrow-static +$109–142 if you accept directional variance). Completed
+thesis: target **high fee × LOW volatility**, not high vol — churn cost *is*
+volatility, so a calm high-fee pool lets a tight (optionally delta-hedged) band keep
+its fee-alpha. Caveat: such pools are low-volume, so absolute alpha/capacity are modest.
 
 ## External References
 
