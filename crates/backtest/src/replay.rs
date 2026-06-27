@@ -298,6 +298,13 @@ pub enum RangeMode {
         half_width_ticks: i32,
         rehedge_band: f64,
     },
+    /// The deployable shape: a wide, never-rebalanced band (low churn, harvests
+    /// fees) plus a dynamic delta hedge (kills the inventory beta a wide band still
+    /// carries). Combines passive-wide's positive expectancy with low variance.
+    HedgedWide {
+        half_width_ticks: i32,
+        rehedge_band: f64,
+    },
 }
 
 /// Rolling regime estimate over the last `n` ticks: per-swap drift, tick-change
@@ -504,9 +511,15 @@ fn run_policy(
         _ => 0.0,
     };
     let hedged = hedge_fraction > 0.0;
-    let delta_hedged = matches!(mode, RangeMode::DeltaHedged { .. });
+    // Dynamic delta hedge applies to both DeltaHedged (narrow, rebalancing) and
+    // HedgedWide (wide, static) — only the range behaviour differs.
+    let delta_hedged = matches!(
+        mode,
+        RangeMode::DeltaHedged { .. } | RangeMode::HedgedWide { .. }
+    );
     let rehedge_band = match mode {
-        RangeMode::DeltaHedged { rehedge_band, .. } => rehedge_band,
+        RangeMode::DeltaHedged { rehedge_band, .. }
+        | RangeMode::HedgedWide { rehedge_band, .. } => rehedge_band,
         _ => f64::INFINITY,
     };
     let any_hedge = hedged || delta_hedged;
@@ -946,6 +959,9 @@ fn initial_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         RangeMode::DeltaHedged {
             half_width_ticks, ..
         } => *half_width_ticks,
+        RangeMode::HedgedWide {
+            half_width_ticks, ..
+        } => *half_width_ticks,
     }
 }
 
@@ -989,6 +1005,9 @@ fn next_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
             ((vol_k * vol).round() as i32).clamp(*floor_ticks, *cap_ticks)
         }
         RangeMode::DeltaHedged {
+            half_width_ticks, ..
+        } => *half_width_ticks,
+        RangeMode::HedgedWide {
             half_width_ticks, ..
         } => *half_width_ticks,
         RangeMode::HoldInventory => 0,
@@ -1224,6 +1243,16 @@ pub fn run_baseline_battery_with(
                 rehedge_band: 0.25,
             },
             "delta_hedged",
+        ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::HedgedWide {
+                half_width_ticks: wide_half_width,
+                rehedge_band: 0.25,
+            },
+            "hedged_wide",
         ),
     ]
 }
@@ -1940,6 +1969,40 @@ mod tests {
         assert!((inv.price_raw() * obs.price_raw() - 1.0).abs() < 1e-6);
         // Double inversion restores the original price.
         assert!((inv.inverted().price_raw() - obs.price_raw()).abs() / obs.price_raw() < 1e-9);
+    }
+
+    #[test]
+    fn hedged_wide_is_low_churn_low_variance() {
+        let cfg = cfg();
+        let exec = ExecConfig::default();
+        // Direction-balanced base so the hedge has beta variance to remove.
+        let mut base = scenario_swaps(Scenario::Pump, 80_000, 700, 4_000, 1e18, 1e24);
+        let crash = scenario_swaps(Scenario::Crash, 80_000, 700, 4_000, 1e18, 1e24);
+        base.extend(crash);
+        for (i, s) in base.iter_mut().enumerate() {
+            s.block = 1000 + i as u64;
+        }
+        let report = multi_path_eval(
+            &base, &cfg, &exec, 300, 6000, 1.5, 1.0, 6.0, 80, 50, 7, false,
+        );
+        let pick = |name: &str| {
+            report
+                .policies
+                .iter()
+                .find(|p| p.policy == name)
+                .unwrap()
+                .clone()
+        };
+        let hedged_wide = pick("hedged_wide");
+        let passive_wide = pick("passive_wide");
+        // Wrapping the wide band in a delta hedge keeps its low churn but cuts the
+        // directional variance.
+        assert!(
+            hedged_wide.std_net_usd < passive_wide.std_net_usd,
+            "hedged_wide std {} should be below passive_wide {}",
+            hedged_wide.std_net_usd,
+            passive_wide.std_net_usd
+        );
     }
 
     #[test]
