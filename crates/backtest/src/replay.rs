@@ -1047,6 +1047,53 @@ fn rolling_tick_vol(window: &[i32], n: usize) -> f64 {
     var.sqrt()
 }
 
+/// Result of simulating a single-tick v3/Slipstream swap against live pool state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SwapSim {
+    /// Expected output amount (raw units of the other token).
+    pub amount_out: f64,
+    /// |price change| of the swap, in basis points.
+    pub price_impact_bps: f64,
+    pub sqrt_x96_after: f64,
+}
+
+/// Simulate an exact-input swap against the pool's current in-range liquidity using
+/// the Uniswap-v3 closed form (assumes the swap stays within the active tick — true
+/// for swaps small relative to in-range liquidity; it under-states impact for large
+/// swaps that cross ticks). Inputs are raw units. `zero_for_one` = selling token0.
+pub fn simulate_v3_swap(
+    sqrt_x96: f64,
+    liquidity: f64,
+    fee_fraction: f64,
+    amount_in: f64,
+    zero_for_one: bool,
+) -> SwapSim {
+    let s = sqrt_x96 / TWO_POW_96;
+    if liquidity <= 0.0 || s <= 0.0 || amount_in <= 0.0 {
+        return SwapSim {
+            amount_out: 0.0,
+            price_impact_bps: 0.0,
+            sqrt_x96_after: sqrt_x96,
+        };
+    }
+    let ain = amount_in * (1.0 - fee_fraction);
+    let (s_new, amount_out) = if zero_for_one {
+        // token0 in → price falls: 1/s_new = 1/s + ain/L; token1 out.
+        let s_new = 1.0 / (1.0 / s + ain / liquidity);
+        (s_new, liquidity * (s - s_new))
+    } else {
+        // token1 in → price rises: s_new = s + ain/L; token0 out.
+        let s_new = s + ain / liquidity;
+        (s_new, liquidity * (1.0 / s - 1.0 / s_new))
+    };
+    let impact = ((s_new * s_new) / (s * s) - 1.0).abs() * 10_000.0;
+    SwapSim {
+        amount_out: amount_out.max(0.0),
+        price_impact_bps: impact,
+        sqrt_x96_after: s_new * TWO_POW_96,
+    }
+}
+
 /// Token amounts (human units) and raw liquidity for opening a concentrated
 /// position of `capital_token0` (human token0) across `[lower_tick, upper_tick]` at
 /// `current_sqrt_x96`. The same v3 math used in the replay — exposed for the
@@ -1978,6 +2025,23 @@ mod tests {
             "walk-forward should cap OOS drawdown, got {}",
             report.oos_max_drawdown_usd
         );
+    }
+
+    #[test]
+    fn v3_swap_sim_has_positive_impact_and_conserves_direction() {
+        let sqrt_x96 = sqrt_ratio_at_tick(80_000) * TWO_POW_96;
+        let liquidity = 1e24;
+        // Sell token0 → get token1 out, price falls, positive impact.
+        let sim = simulate_v3_swap(sqrt_x96, liquidity, 0.003, 1e18, true);
+        assert!(sim.amount_out > 0.0);
+        assert!(sim.price_impact_bps > 0.0);
+        assert!(sim.sqrt_x96_after < sqrt_x96, "selling token0 lowers price");
+        // A 10× larger swap moves price more (more impact).
+        let big = simulate_v3_swap(sqrt_x96, liquidity, 0.003, 1e19, true);
+        assert!(big.price_impact_bps > sim.price_impact_bps);
+        // Thin liquidity ⇒ much larger impact for the same size.
+        let thin = simulate_v3_swap(sqrt_x96, 1e22, 0.003, 1e18, true);
+        assert!(thin.price_impact_bps > sim.price_impact_bps);
     }
 
     #[test]

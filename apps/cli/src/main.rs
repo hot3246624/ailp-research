@@ -2280,23 +2280,42 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         );
     }
 
-    // Swap to reach the target ratio.
+    // Swap to reach the target ratio, simulated against the pool's real in-range
+    // liquidity (so expected_out and price impact reflect actual depth, not just mid).
     let d0 = t0 - c0;
     let d1 = t1 - c1;
+    let pool_liquidity = state.liquidity.parse::<f64>().unwrap_or(0.0);
+    let fee_fraction = fee_bps / 10_000.0;
+    let mut swap_impact_bps = 0.0_f64;
     if d0 < -1e-12 {
-        // excess token0 -> sell for token1
+        // excess token0 -> sell for token1 (zero_for_one)
         let amount_in = -d0;
-        let expected_out = amount_in * price_human;
-        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token0->token1)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip)}));
+        let amount_in_raw = amount_in * 10f64.powi(args.decimals0 as i32);
+        let sim = autopool_backtest::simulate_v3_swap(
+            sqrt_x96,
+            pool_liquidity,
+            fee_fraction,
+            amount_in_raw,
+            true,
+        );
+        let expected_out = sim.amount_out / 10f64.powi(args.decimals1 as i32);
+        swap_impact_bps = sim.price_impact_bps;
+        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token0->token1)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip),"price_impact_bps":sim.price_impact_bps}));
     } else if d1 < -1e-12 {
         let amount_in = -d1;
-        let expected_out = if price_human > 0.0 {
-            amount_in / price_human
-        } else {
-            0.0
-        };
-        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token1->token0)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip)}));
+        let amount_in_raw = amount_in * 10f64.powi(args.decimals1 as i32);
+        let sim = autopool_backtest::simulate_v3_swap(
+            sqrt_x96,
+            pool_liquidity,
+            fee_fraction,
+            amount_in_raw,
+            false,
+        );
+        let expected_out = sim.amount_out / 10f64.powi(args.decimals0 as i32);
+        swap_impact_bps = sim.price_impact_bps;
+        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token1->token0)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip),"price_impact_bps":sim.price_impact_bps}));
     }
+    let _ = price_human;
 
     actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(token0,token1,tickSpacing,tickLower,tickUpper,amount0Desired,amount1Desired,amount0Min,amount1Min,recipient,deadline)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip)}));
     if args.staked {
@@ -2339,6 +2358,14 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         "slippage_bounded".into(),
         args.slippage_bps <= 100.0,
         format!("max slippage {:.0} bps", args.slippage_bps),
+    ));
+    gates.push((
+        "swap_price_impact".into(),
+        swap_impact_bps <= args.slippage_bps,
+        format!(
+            "rebalance swap impact {:.1} bps <= slippage {:.0} bps",
+            swap_impact_bps, args.slippage_bps
+        ),
     ));
     let all_pass = gates.iter().all(|(_, ok, _)| *ok);
 

@@ -8,9 +8,9 @@ pub mod replay;
 
 pub use replay::{
     ExecConfig, FoldResult, MultiPathReport, PolicyDistribution, PolicyReport, RangeMode,
-    ReplayConfig, Scenario, SwapObs, WalkForwardConfig, WalkForwardReport, cl_mint_amounts,
-    decode_swap_obs, multi_path_eval, run_baseline_battery, run_baseline_battery_with,
-    run_single_policy, scenario_swaps, walk_forward,
+    ReplayConfig, Scenario, SwapObs, SwapSim, WalkForwardConfig, WalkForwardReport,
+    cl_mint_amounts, decode_swap_obs, multi_path_eval, run_baseline_battery,
+    run_baseline_battery_with, run_single_policy, scenario_swaps, simulate_v3_swap, walk_forward,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
