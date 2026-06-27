@@ -51,6 +51,7 @@ cargo run -p autopool-cli -- summarize-slipstream-events --data-dir data/base/ae
 cargo run -p autopool-cli -- replay-events --symbol WETH-AERO --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 100
 cargo run -p autopool-cli -- replay-scenario --scenario crash --move-ticks 6000 --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 300 --action-delay-blocks 3 --funding-bps-per-day 10
 cargo run -p autopool-cli -- walk-forward --symbol WETH-AERO --fee-bps 21.25 --token0-usd 1574 --train-swaps 1000 --test-swaps 500 --action-delay-blocks 3
+BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- scan-pool-activity --min-tvl-usd 300000 --limit 8 --lookback-blocks 1000
 ```
 
 The `replay-events` command turns collected swap events into LP profit-and-loss
@@ -69,7 +70,10 @@ hedging stress tests (one-way hard-exit and a short hedge cap the down-tail;
 mechanical rebalancing is ruinous in crash and chop); and `docs/walk-forward.md`
 for out-of-sample calibration of the adaptive policy (per-fold calibration beats
 fixed-parameter and static, but only ties hold on the current calm window — i.e.
-do not LP this pool in this regime).
+do not LP this pool in this regime); and `docs/pool-discovery.md` for ranking pools
+by realized on-chain tick volatility (`scan-pool-activity`) to find liquid pairs
+that actually move — USDC-AERO is the most active liquid Slipstream pool and a clean
+USD-numeraire research target.
 
 ## External References
 
