@@ -323,6 +323,11 @@ enum Command {
         block_len: usize,
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Remove the source's mean drift so paths are driftless (martingale) — the
+        /// regime under which LP net ≈ fee − LVR in expectation; isolates LP economics
+        /// from the directional bet inherited from a one-way source window.
+        #[arg(long, default_value_t = false)]
+        demean: bool,
         #[command(flatten)]
         params: ReplayParams,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -656,6 +661,7 @@ async fn main() -> Result<()> {
             paths,
             block_len,
             seed,
+            demean,
             params,
             format,
         } => multi_path_cmd(
@@ -665,6 +671,7 @@ async fn main() -> Result<()> {
             paths,
             block_len,
             seed,
+            demean,
             &params,
             format,
         )?,
@@ -2001,6 +2008,7 @@ fn multi_path_cmd(
     paths: usize,
     block_len: usize,
     seed: u64,
+    demean: bool,
     params: &ReplayParams,
     format: OutputFormat,
 ) -> Result<()> {
@@ -2026,6 +2034,7 @@ fn multi_path_cmd(
         paths,
         block_len,
         seed,
+        demean,
     );
 
     if format == OutputFormat::Json {

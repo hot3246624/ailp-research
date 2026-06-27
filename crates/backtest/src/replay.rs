@@ -1517,11 +1517,17 @@ pub struct MultiPathReport {
 /// (tick-increment, amounts, liquidity, block-gap), accumulate into a new tick
 /// path, and rebuild swaps. Preserves local volatility/microstructure and the
 /// direction-size coupling while randomizing the overall realized direction.
-fn bootstrap_path(src: &[SwapObs], n: usize, block_len: usize, rng: &mut u64) -> Vec<SwapObs> {
+fn bootstrap_path(
+    src: &[SwapObs],
+    n: usize,
+    block_len: usize,
+    drift_adjust: f64,
+    rng: &mut u64,
+) -> Vec<SwapObs> {
     let m = src.len();
     let block_len = block_len.max(1);
     let mut out: Vec<SwapObs> = Vec::with_capacity(n);
-    let mut cur_tick = src[0].tick;
+    let mut cur_tick_f = src[0].tick as f64;
     let mut cur_block = src[0].block;
     while out.len() < n {
         *rng = rng
@@ -1544,9 +1550,13 @@ fn bootstrap_path(src: &[SwapObs], n: usize, block_len: usize, rng: &mut u64) ->
             } else {
                 src[idx].block.saturating_sub(src[idx - 1].block)
             };
-            cur_tick += dtick;
+            // `drift_adjust` removes the source's mean per-swap drift so paths are
+            // martingale (zero net direction) — the regime under which LP_net ≈
+            // fee − LVR in expectation.
+            cur_tick_f += dtick as f64 - drift_adjust;
             cur_block += dblock;
-            let sqrt = sqrt_ratio_at_tick(cur_tick);
+            let tick = cur_tick_f.round() as i32;
+            let sqrt = sqrt_ratio_at_tick(tick);
             out.push(SwapObs {
                 block: cur_block,
                 log_index: 0,
@@ -1554,7 +1564,7 @@ fn bootstrap_path(src: &[SwapObs], n: usize, block_len: usize, rng: &mut u64) ->
                 amount1: s.amount1,
                 sqrt_price_x96: sqrt * TWO_POW_96,
                 liquidity: s.liquidity,
-                tick: cur_tick,
+                tick,
             });
             if out.len() >= n {
                 break;
@@ -1589,9 +1599,17 @@ pub fn multi_path_eval(
     n_paths: usize,
     block_len: usize,
     seed: u64,
+    demean: bool,
 ) -> MultiPathReport {
     let n = swaps.len();
     let mut rng = seed | 1;
+    // Mean per-swap tick drift of the source; removed when `demean` so paths are
+    // driftless (martingale) and isolate the LP economics from the directional bet.
+    let drift_adjust = if demean && n > 1 {
+        (swaps[n - 1].tick - swaps[0].tick) as f64 / (n - 1) as f64
+    } else {
+        0.0
+    };
 
     let mut names: Vec<String> = Vec::new();
     let mut nets: Vec<Vec<f64>> = Vec::new();
@@ -1600,7 +1618,7 @@ pub fn multi_path_eval(
     let mut wins: Vec<u64> = Vec::new();
 
     for _ in 0..n_paths {
-        let path = bootstrap_path(swaps, n, block_len, &mut rng);
+        let path = bootstrap_path(swaps, n, block_len, drift_adjust, &mut rng);
         let reports = run_baseline_battery_with(
             &path,
             cfg,
@@ -1897,7 +1915,9 @@ mod tests {
         for (i, s) in base.iter_mut().enumerate() {
             s.block = 1000 + i as u64;
         }
-        let report = multi_path_eval(&base, &cfg, &exec, 300, 6000, 1.5, 1.0, 6.0, 80, 50, 42);
+        let report = multi_path_eval(
+            &base, &cfg, &exec, 300, 6000, 1.5, 1.0, 6.0, 80, 50, 42, false,
+        );
         let pick = |name: &str| {
             report
                 .policies
