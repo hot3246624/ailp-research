@@ -76,7 +76,11 @@ that actually move — USDC-AERO is the most active liquid Slipstream pool and a
 USD-numeraire research target; and `docs/real-regime-replay.md` for the first replay
 on real *trending* data (collected fast via the public `mainnet.base.org` endpoint,
 which allows large `getLogs`): every LP policy loses to hold in a trend, so LP is a
-ranging-regime strategy and the meta-decision is whether to be an LP at all.
+ranging-regime strategy and the meta-decision is whether to be an LP at all; and
+`docs/lvr-attribution.md` for LVR + reward attribution — the pool has real LP
+fee-alpha (fee − LVR > 0 in every regime), but it only converts to net
+outperformance in calm because inventory beta drags trends, which is the strongest
+argument for a dynamic delta hedge.
 
 ## External References
 
