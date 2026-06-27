@@ -157,6 +157,15 @@ enum Command {
         poll_seconds: u64,
         #[arg(long, default_value_t = 1)]
         iterations: u64,
+        /// Backfill a fixed historical window starting here instead of chasing the
+        /// chain head (overrides --lookback-blocks). Use a separate --data-dir to
+        /// keep checkpoints isolated from live backfills.
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Upper bound of the historical window; the run stops once every pool has
+        /// passed it (even with --iterations 0). Defaults to the chain head.
+        #[arg(long)]
+        to_block: Option<u64>,
         #[arg(long, default_value_t = 100_000.0)]
         min_tvl_usd: f64,
         #[arg(long, default_value_t = 0.0)]
@@ -482,6 +491,8 @@ async fn main() -> Result<()> {
             sleep_ms,
             poll_seconds,
             iterations,
+            from_block,
+            to_block,
             min_tvl_usd,
             min_volume_usd_1d,
             max_reward_share,
@@ -501,6 +512,8 @@ async fn main() -> Result<()> {
                 sleep_ms,
                 poll_seconds,
                 iterations,
+                from_block,
+                to_block,
                 min_tvl_usd,
                 min_volume_usd_1d,
                 max_reward_share,
@@ -1049,6 +1062,8 @@ struct BackfillConfig {
     sleep_ms: u64,
     poll_seconds: u64,
     iterations: u64,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
@@ -1138,24 +1153,31 @@ async fn backfill_slipstream_events(config: BackfillConfig) -> Result<()> {
     fs::create_dir_all(config.data_dir.join("events"))?;
     fs::create_dir_all(config.data_dir.join("checkpoints"))?;
 
+    let historical = config.to_block.is_some() || config.from_block.is_some();
     let mut iteration = 0_u64;
     loop {
         iteration += 1;
         let latest = rpc.latest_block_number().await?;
+        // Upper bound to collect to: a fixed window end, or the chain head.
+        let target_end = config.to_block.unwrap_or(latest).min(latest);
         let mut total_written = 0_usize;
+        let mut all_done = true;
 
         for item in &resolved {
             let checkpoint_path = checkpoint_path(&config.data_dir, &item.pool_address);
-            let default_start = latest.saturating_sub(config.lookback_blocks.saturating_sub(1));
+            let default_start = config
+                .from_block
+                .unwrap_or_else(|| latest.saturating_sub(config.lookback_blocks.saturating_sub(1)));
             let start = read_next_block(&checkpoint_path)?.unwrap_or(default_start);
 
-            if start > latest {
+            if start > target_end {
                 continue;
             }
+            all_done = false;
 
             let to_block = start
                 .saturating_add(config.max_blocks_per_run.saturating_sub(1))
-                .min(latest);
+                .min(target_end);
             let written = backfill_candidate_window(&rpc, &config, item, start, to_block).await?;
             write_checkpoint(&checkpoint_path, item, to_block + 1)?;
             total_written += written;
@@ -1173,8 +1195,15 @@ async fn backfill_slipstream_events(config: BackfillConfig) -> Result<()> {
             );
         }
 
-        eprintln!("iteration={iteration} latest={latest} total_events_written={total_written}");
+        eprintln!(
+            "iteration={iteration} latest={latest} target_end={target_end} total_events_written={total_written}"
+        );
 
+        // A bounded historical window finishes once every pool has passed its end.
+        if historical && all_done {
+            eprintln!("historical window complete up to {target_end}");
+            break;
+        }
         if config.iterations != 0 && iteration >= config.iterations {
             break;
         }
