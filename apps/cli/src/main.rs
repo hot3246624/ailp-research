@@ -257,6 +257,40 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Discover liquid AND volatile pools: resolve the candidate universe on-chain,
+    /// measure realized tick volatility from recent swaps, and rank. Finds pairs
+    /// where active range management actually has something to manage.
+    ScanPoolActivity {
+        #[arg(long, env = "BASE_RPC_URL")]
+        rpc_url: String,
+        #[arg(long, default_value_t = 300_000.0)]
+        min_tvl_usd: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_volume_usd_1d: f64,
+        #[arg(long, default_value_t = 1.0)]
+        max_reward_share: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_apy: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_fee_bps: f64,
+        #[arg(long, value_enum, default_value_t = CandidateProfile::Opportunistic)]
+        profile: CandidateProfile,
+        #[arg(long = "include-symbol")]
+        include_symbols: Vec<String>,
+        /// How many resolved pools to probe on-chain.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Recent block window to sample swaps over.
+        #[arg(long, default_value_t = 1_000)]
+        lookback_blocks: u64,
+        /// eth_getLogs chunk size (free Alchemy caps at 10).
+        #[arg(long, default_value_t = 10)]
+        log_chunk_blocks: u64,
+        #[arg(long, default_value_t = 120)]
+        sleep_ms: u64,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
 }
 
 /// Shared economic + execution parameters for the replay commands.
@@ -531,6 +565,38 @@ async fn main() -> Result<()> {
             params,
             format,
         })?,
+        Command::ScanPoolActivity {
+            rpc_url,
+            min_tvl_usd,
+            min_volume_usd_1d,
+            max_reward_share,
+            min_apy,
+            min_fee_bps,
+            profile,
+            include_symbols,
+            limit,
+            lookback_blocks,
+            log_chunk_blocks,
+            sleep_ms,
+            format,
+        } => {
+            scan_pool_activity(ScanActivityArgs {
+                rpc_url,
+                min_tvl_usd,
+                min_volume_usd_1d,
+                max_reward_share,
+                min_apy,
+                min_fee_bps,
+                profile,
+                include_symbols,
+                limit,
+                lookback_blocks,
+                log_chunk_blocks,
+                sleep_ms,
+                format,
+            })
+            .await?
+        }
     }
 
     Ok(())
@@ -1838,6 +1904,171 @@ fn walk_forward_cmd(args: WalkForwardArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+struct ScanActivityArgs {
+    rpc_url: String,
+    min_tvl_usd: f64,
+    min_volume_usd_1d: f64,
+    max_reward_share: f64,
+    min_apy: f64,
+    min_fee_bps: f64,
+    profile: CandidateProfile,
+    include_symbols: Vec<String>,
+    limit: usize,
+    lookback_blocks: u64,
+    log_chunk_blocks: u64,
+    sleep_ms: u64,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct PoolActivity {
+    symbol: String,
+    pool_address: String,
+    deployment: String,
+    fee_bps: f64,
+    tvl_usd: f64,
+    volume_usd_1d: f64,
+    current_tick: i32,
+    liquidity: String,
+    swaps: usize,
+    swaps_per_kblock: f64,
+    tick_span: i32,
+    /// Stdev of consecutive swap-to-swap tick changes — realized price volatility.
+    tick_vol: f64,
+    /// Composite: realized vol scaled by activity. Higher = more for an active LP to do.
+    activity_score: f64,
+}
+
+async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
+    let resolved = resolve_pilot_candidates(
+        &args.rpc_url,
+        args.min_tvl_usd,
+        args.min_volume_usd_1d,
+        args.max_reward_share,
+        args.min_apy,
+        args.min_fee_bps,
+        args.profile,
+        args.include_symbols.clone(),
+        args.limit,
+    )
+    .await?;
+    if resolved.is_empty() {
+        anyhow::bail!("no candidate pools resolved");
+    }
+
+    let rpc = JsonRpcClient::new(args.rpc_url.clone());
+    let to_block = rpc.latest_block_number().await?;
+    let from_block = to_block.saturating_sub(args.lookback_blocks.saturating_sub(1));
+    let mut rows = Vec::new();
+
+    for item in &resolved {
+        let logs = rpc
+            .get_logs_chunked(
+                &item.pool_address,
+                from_block,
+                to_block,
+                SWAP_TOPIC,
+                args.log_chunk_blocks,
+            )
+            .await?;
+        let mut ticks: Vec<i32> = logs
+            .iter()
+            .filter_map(|log| autopool_backtest::decode_swap_obs(&log.data, 0, 0).map(|o| o.tick))
+            .collect();
+        // get_logs returns in block order; keep as the price path.
+        let (tick_span, tick_vol) = tick_stats(&ticks);
+        ticks.clear();
+
+        let state = rpc.read_cl_pool_state(&item.pool_address).await?;
+        let fee_bps = match rpc.eth_call(&item.pool_address, "0xddca3f43").await {
+            Ok(hex) => parse_hex_u64_lossy(&hex)
+                .map(|v| v as f64 / 100.0)
+                .unwrap_or(0.0),
+            Err(_) => 0.0,
+        };
+        let span = to_block.saturating_sub(from_block).saturating_add(1);
+        let swaps_per_kblock = if span > 0 {
+            logs.len() as f64 * 1000.0 / span as f64
+        } else {
+            0.0
+        };
+        let activity_score = tick_vol * swaps_per_kblock.sqrt();
+
+        rows.push(PoolActivity {
+            symbol: item.candidate.symbol.clone(),
+            pool_address: item.pool_address.clone(),
+            deployment: format!("{:?}", item.deployment),
+            fee_bps,
+            tvl_usd: item.candidate.tvl_usd,
+            volume_usd_1d: item.candidate.volume_usd_1d,
+            current_tick: state.current_tick,
+            liquidity: state.liquidity,
+            swaps: logs.len(),
+            swaps_per_kblock: (swaps_per_kblock * 100.0).round() / 100.0,
+            tick_span,
+            tick_vol: (tick_vol * 100.0).round() / 100.0,
+            activity_score: (activity_score * 100.0).round() / 100.0,
+        });
+
+        if args.sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(args.sleep_ms)).await;
+        }
+    }
+
+    rows.sort_by(|a, b| b.activity_score.total_cmp(&a.activity_score));
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "pool activity scan  window={from_block}..{to_block} ({} blocks)",
+        args.lookback_blocks
+    );
+    println!(
+        "{:<16} {:>8} {:>11} {:>11} {:>7} {:>9} {:>9} {:>10} {:>8}",
+        "symbol",
+        "fee_bps",
+        "tvl_usd",
+        "vol_1d",
+        "swaps",
+        "swp/kblk",
+        "tick_span",
+        "tick_vol",
+        "score"
+    );
+    for row in &rows {
+        println!(
+            "{:<16} {:>8.2} {:>11.0} {:>11.0} {:>7} {:>9.1} {:>9} {:>10.2} {:>8.2}",
+            row.symbol,
+            row.fee_bps,
+            row.tvl_usd,
+            row.volume_usd_1d,
+            row.swaps,
+            row.swaps_per_kblock,
+            row.tick_span,
+            row.tick_vol,
+            row.activity_score,
+        );
+    }
+
+    Ok(())
+}
+
+/// Tick span (max-min) and realized volatility (stdev of consecutive tick changes).
+fn tick_stats(ticks: &[i32]) -> (i32, f64) {
+    if ticks.len() < 2 {
+        return (0, 0.0);
+    }
+    let max = *ticks.iter().max().unwrap();
+    let min = *ticks.iter().min().unwrap();
+    let diffs: Vec<f64> = ticks.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
+    let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
+    let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / diffs.len() as f64;
+    (max - min, var.sqrt())
 }
 
 /// Find the events.jsonl to replay: by explicit pool address, by symbol match, or
