@@ -2125,6 +2125,9 @@ struct PoolActivity {
     tick_vol: f64,
     /// Composite: realized vol scaled by activity. Higher = more for an active LP to do.
     activity_score: f64,
+    /// fee_bps / tick_vol — proxy for per-swap fee-vs-LVR. Higher ⇒ fee-alpha more
+    /// likely positive (CTR-USDC ~22 had measured fee−LVR > 0; USDC-AERO ~2 had < 0).
+    fee_vol_ratio: f64,
 }
 
 async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
@@ -2192,6 +2195,11 @@ async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
             0.0
         };
         let activity_score = tick_vol * swaps_per_kblock.sqrt();
+        let fee_vol_ratio = if tick_vol > 0.1 {
+            fee_bps / tick_vol
+        } else {
+            0.0
+        };
 
         rows.push(PoolActivity {
             symbol: item.candidate.symbol.clone(),
@@ -2207,10 +2215,15 @@ async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
             tick_span,
             tick_vol: (tick_vol * 100.0).round() / 100.0,
             activity_score: (activity_score * 100.0).round() / 100.0,
+            fee_vol_ratio: (fee_vol_ratio * 100.0).round() / 100.0,
         });
     }
 
-    rows.sort_by(|a, b| b.activity_score.total_cmp(&a.activity_score));
+    // Rank by fee-alpha potential (fee/vol) among pools that actually trade.
+    rows.sort_by(|a, b| {
+        let key = |r: &PoolActivity| if r.swaps >= 5 { r.fee_vol_ratio } else { -1.0 };
+        key(b).total_cmp(&key(a))
+    });
 
     if args.format == OutputFormat::Json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -2222,31 +2235,25 @@ async fn scan_pool_activity(args: ScanActivityArgs) -> Result<()> {
         args.lookback_blocks
     );
     println!(
-        "{:<16} {:>8} {:>11} {:>11} {:>7} {:>9} {:>9} {:>10} {:>8}",
-        "symbol",
-        "fee_bps",
-        "tvl_usd",
-        "vol_1d",
-        "swaps",
-        "swp/kblk",
-        "tick_span",
-        "tick_vol",
-        "score"
+        "{:<16} {:>8} {:>11} {:>7} {:>9} {:>9} {:>10} {:>9}",
+        "symbol", "fee_bps", "tvl_usd", "swaps", "swp/kblk", "tick_vol", "fee/vol", "score"
     );
     for row in &rows {
         println!(
-            "{:<16} {:>8.2} {:>11.0} {:>11.0} {:>7} {:>9.1} {:>9} {:>10.2} {:>8.2}",
+            "{:<16} {:>8.2} {:>11.0} {:>7} {:>9.1} {:>9.2} {:>10.2} {:>9.2}",
             row.symbol,
             row.fee_bps,
             row.tvl_usd,
-            row.volume_usd_1d,
             row.swaps,
             row.swaps_per_kblock,
-            row.tick_span,
             row.tick_vol,
+            row.fee_vol_ratio,
             row.activity_score,
         );
     }
+    println!(
+        "(ranked by fee/vol = fee_bps/tick_vol, a fee-alpha proxy; CTR-USDC ~22 had measured fee−LVR > 0)"
+    );
 
     Ok(())
 }
