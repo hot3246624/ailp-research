@@ -269,6 +269,9 @@ struct ReplayParams {
     /// Short-hedge size as a fraction of entry risk-asset exposure.
     #[arg(long, default_value_t = 1.0)]
     hedge_fraction: f64,
+    /// Trend strength above which the adaptive policy exits (≈ sigmas of drift).
+    #[arg(long, default_value_t = 2.0)]
+    trend_exit_threshold: f64,
 }
 
 impl ReplayParams {
@@ -1531,6 +1534,7 @@ fn params_json(params: &ReplayParams) -> serde_json::Value {
         "action_delay_blocks": params.action_delay_blocks,
         "funding_bps_per_day": params.funding_bps_per_day,
         "hedge_fraction": params.hedge_fraction,
+        "trend_exit_threshold": params.trend_exit_threshold,
     })
 }
 
@@ -1546,6 +1550,7 @@ fn run_battery(
         params.wide_half_width,
         params.vol_k,
         params.hedge_fraction,
+        params.trend_exit_threshold,
     )
 }
 

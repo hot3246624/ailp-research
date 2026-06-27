@@ -236,6 +236,57 @@ pub enum RangeMode {
         half_width_ticks: i32,
         hedge_fraction: f64,
     },
+    /// Regime-aware policy. Reads recent tick history each swap and:
+    /// - ranging (low trend strength): hold a vol-scaled band, recenter only on
+    ///   exit (tight when calm, wider when choppy — avoids the churn death spiral);
+    /// - trending into the risk asset: exit to the money leg preemptively and stand
+    ///   aside until the trend dies. Synthesizes static / vol-scaled / hard-exit.
+    Adaptive {
+        vol_k: f64,
+        floor_ticks: i32,
+        cap_ticks: i32,
+        /// Trend strength (|net tick move| / (vol·√window)) above which the regime
+        /// is judged trending. ~2 ≈ a 2-sigma directional move.
+        trend_exit_threshold: f64,
+        window: usize,
+    },
+}
+
+/// Rolling regime estimate over the last `n` ticks: per-swap drift, tick-change
+/// volatility, and a t-stat-like trend strength `|displacement| / (vol·√n)`.
+struct Regime {
+    drift_per_swap: f64,
+    trend_strength: f64,
+}
+
+fn assess_regime(window: &[i32], n: usize) -> Regime {
+    let n = n.max(2);
+    let slice = if window.len() > n {
+        &window[window.len() - n..]
+    } else {
+        window
+    };
+    if slice.len() < 2 {
+        return Regime {
+            drift_per_swap: 0.0,
+            trend_strength: 0.0,
+        };
+    }
+    let vol = rolling_tick_vol(slice, slice.len());
+    let displacement = (slice[slice.len() - 1] - slice[0]) as f64;
+    let drift_per_swap = displacement / slice.len() as f64;
+    let denom = vol * (slice.len() as f64).sqrt();
+    let trend_strength = if denom > 1e-9 {
+        displacement.abs() / denom
+    } else if displacement.abs() > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    Regime {
+        drift_per_swap,
+        trend_strength,
+    }
 }
 
 /// A concrete position: liquidity, range, entry price, and entry inventory.
@@ -373,6 +424,15 @@ fn run_policy(
 
     let rebalance = should_rebalance(&mode);
     let hard_exit = matches!(mode, RangeMode::HardExitStop { .. });
+    let adaptive = matches!(mode, RangeMode::Adaptive { .. });
+    let (adaptive_threshold, adaptive_window) = match mode {
+        RangeMode::Adaptive {
+            trend_exit_threshold,
+            window,
+            ..
+        } => (trend_exit_threshold, window),
+        _ => (f64::INFINITY, 200),
+    };
     let hedge_fraction = match mode {
         RangeMode::HedgedRebalance { hedge_fraction, .. } => hedge_fraction,
         _ => 0.0,
@@ -457,8 +517,72 @@ fn run_policy(
             funding_usd += exec.funding_bps_per_day / 10_000.0 * short_notional_usd * dt_days;
         }
 
-        // Position actions on a range breach.
-        if position.is_some() {
+        // Regime-aware adaptive policy: act on a live trend read, even in range.
+        if adaptive {
+            let regime = assess_regime(&tick_window, adaptive_window);
+            let trending = regime.trend_strength >= adaptive_threshold;
+            // Risk asset is token1: the danger trend is the tick rising (drift > 0).
+            let trending_danger = trending && regime.drift_per_swap > 0.0;
+            // Benign trend = price drifting to the money side; safe to follow.
+            let trending_benign = trending && regime.drift_per_swap < 0.0;
+            if position.is_some() {
+                let in_range = position.as_ref().unwrap().in_range(post_sqrt);
+                if trending_danger {
+                    // Preemptive exit to the money leg at the delayed price.
+                    let (exec_sqrt, _) =
+                        price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                    let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                    let notional_usd = cfg.token0_to_usd(val);
+                    let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                    gas_usd += cfg.rebalance_gas_usd;
+                    slippage_usd += slip;
+                    rebalances += 1;
+                    sidelined_token0 =
+                        (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                    position = None;
+                } else if trending_benign && !in_range {
+                    // Follow a benign trend only; in a non-trending (chop) regime we
+                    // HOLD and let the band mean-revert instead of chasing wiggles.
+                    let (exec_sqrt, exec_tick) =
+                        price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                    let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                    let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                    let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                    gas_usd += cfg.rebalance_gas_usd;
+                    slippage_usd += slip;
+                    rebalances += 1;
+                    let half = next_half_width(&mode, &tick_window);
+                    half_width_sum += half as f64;
+                    half_width_count += 1;
+                    let (nl, nu) = centered_range(exec_tick, half);
+                    lower = nl;
+                    upper = nu;
+                    let net = (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                    position = Some(Position::open_with_capital(
+                        cfg, exec_sqrt, lower, upper, net,
+                    ));
+                }
+            } else if !trending_danger {
+                // Sidelined: re-enter once the danger trend dies.
+                let half = next_half_width(&mode, &tick_window);
+                half_width_sum += half as f64;
+                half_width_count += 1;
+                let (nl, nu) = centered_range(swap.tick, half);
+                lower = nl;
+                upper = nu;
+                gas_usd += cfg.rebalance_gas_usd;
+                rebalances += 1;
+                position = Some(Position::open_with_capital(
+                    cfg,
+                    post_sqrt,
+                    lower,
+                    upper,
+                    sidelined_token0,
+                ));
+                sidelined_token0 = 0.0;
+            }
+        } else if position.is_some() {
+            // Position actions on a range breach.
             let (in_range, danger) = {
                 let pos = position.as_ref().unwrap();
                 (pos.in_range(post_sqrt), post_sqrt > pos.sqrt_upper)
@@ -657,6 +781,7 @@ fn initial_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
             half_width_ticks, ..
         } => *half_width_ticks,
         RangeMode::VolatilityScaled { floor_ticks, .. } => *floor_ticks.max(&1),
+        RangeMode::Adaptive { floor_ticks, .. } => *floor_ticks.max(&1),
     }
 }
 
@@ -679,6 +804,16 @@ fn next_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
             half_width_ticks, ..
         } => *half_width_ticks,
         RangeMode::StaticWide { half_width_ticks } => *half_width_ticks,
+        RangeMode::Adaptive {
+            vol_k,
+            floor_ticks,
+            cap_ticks,
+            window: w,
+            ..
+        } => {
+            let vol = rolling_tick_vol(window, *w);
+            ((vol_k * vol).round() as i32).clamp(*floor_ticks, *cap_ticks)
+        }
         RangeMode::HoldInventory => 0,
     }
 }
@@ -790,11 +925,12 @@ fn hold_net_pnl(swaps: &[SwapObs], cfg: &ReplayConfig, entry_sqrt: f64) -> f64 {
 
 /// Run the standard baseline battery over a swap stream (default execution model).
 pub fn run_baseline_battery(swaps: &[SwapObs], cfg: &ReplayConfig) -> Vec<PolicyReport> {
-    run_baseline_battery_with(swaps, cfg, &ExecConfig::default(), 600, 6000, 1.5, 1.0)
+    run_baseline_battery_with(swaps, cfg, &ExecConfig::default(), 600, 6000, 1.5, 1.0, 2.0)
 }
 
 /// Run baselines with explicit execution model, narrow/wide half-widths, a vol
-/// multiplier, and a hedge fraction.
+/// multiplier, a hedge fraction, and the adaptive trend-exit threshold.
+#[allow(clippy::too_many_arguments)]
 pub fn run_baseline_battery_with(
     swaps: &[SwapObs],
     cfg: &ReplayConfig,
@@ -803,6 +939,7 @@ pub fn run_baseline_battery_with(
     wide_half_width: i32,
     vol_k: f64,
     hedge_fraction: f64,
+    adaptive_trend_threshold: f64,
 ) -> Vec<PolicyReport> {
     if swaps.is_empty() {
         return Vec::new();
@@ -868,6 +1005,19 @@ pub fn run_baseline_battery_with(
                 hedge_fraction,
             },
             "hedged_narrow",
+        ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::Adaptive {
+                vol_k,
+                floor_ticks: narrow_half_width / 2,
+                cap_ticks: wide_half_width,
+                trend_exit_threshold: adaptive_trend_threshold,
+                window: 200,
+            },
+            "adaptive_regime",
         ),
     ]
 }
@@ -1062,8 +1212,16 @@ mod tests {
                 }
             })
             .collect();
-        let reports =
-            run_baseline_battery_with(&swaps, &cfg, &ExecConfig::default(), 100, 6000, 1.5, 1.0);
+        let reports = run_baseline_battery_with(
+            &swaps,
+            &cfg,
+            &ExecConfig::default(),
+            100,
+            6000,
+            1.5,
+            1.0,
+            2.0,
+        );
         let reb = reports
             .iter()
             .find(|r| r.policy == "narrow_rebalance")
@@ -1085,7 +1243,7 @@ mod tests {
         };
         // AERO crashes: tick rises ~6000 (≈ +82% pool price, AERO ≈ -45%).
         let swaps = scenario_swaps(Scenario::Crash, 80_000, 1_500, 6_000, 1e18, 1e24);
-        let reports = run_baseline_battery_with(&swaps, &cfg, &exec, 300, 6000, 1.5, 1.0);
+        let reports = run_baseline_battery_with(&swaps, &cfg, &exec, 300, 6000, 1.5, 1.0, 2.0);
         let get = |name: &str| reports.iter().find(|r| r.policy == name).unwrap().clone();
 
         let narrow_static = get("narrow_static");
@@ -1122,5 +1280,47 @@ mod tests {
 
     fn hedge_pnl(r: &PolicyReport) -> f64 {
         r.hedge_pnl_usd
+    }
+
+    #[test]
+    fn adaptive_survives_crash_and_chop() {
+        let cfg = cfg();
+        let exec = ExecConfig {
+            action_delay_blocks: 3,
+            block_seconds: 2.0,
+            funding_bps_per_day: 0.0,
+            risk_asset_is_token1: true,
+        };
+        let pick = |reports: &[PolicyReport], name: &str| {
+            reports.iter().find(|r| r.policy == name).unwrap().clone()
+        };
+
+        // Crash: adaptive should exit on the trend and beat patient narrow_static.
+        let crash = scenario_swaps(Scenario::Crash, 80_000, 1_500, 6_000, 1e18, 1e24);
+        let cr = run_baseline_battery_with(&crash, &cfg, &exec, 300, 6000, 1.5, 1.0, 2.0);
+        let adaptive = pick(&cr, "adaptive_regime");
+        let narrow_static = pick(&cr, "narrow_static");
+        assert!(
+            adaptive.net_pnl_usd > narrow_static.net_pnl_usd,
+            "adaptive {} should beat narrow_static {} in a crash",
+            adaptive.net_pnl_usd,
+            narrow_static.net_pnl_usd
+        );
+        assert!(
+            adaptive.max_drawdown_usd < narrow_static.max_drawdown_usd,
+            "adaptive should cap drawdown in a crash"
+        );
+
+        // Chop: adaptive should not death-spiral like mechanical rebalancing.
+        let chop = scenario_swaps(Scenario::Chop, 80_000, 1_500, 6_000, 1e18, 1e24);
+        let ch = run_baseline_battery_with(&chop, &cfg, &exec, 300, 6000, 1.5, 1.0, 2.0);
+        let adaptive_chop = pick(&ch, "adaptive_regime");
+        let narrow_rebalance_chop = pick(&ch, "narrow_rebalance");
+        assert!(
+            adaptive_chop.net_pnl_usd > narrow_rebalance_chop.net_pnl_usd,
+            "adaptive {} should avoid the chop death spiral vs narrow_rebalance {}",
+            adaptive_chop.net_pnl_usd,
+            narrow_rebalance_chop.net_pnl_usd
+        );
     }
 }

@@ -80,6 +80,37 @@ a short hedge to convert the down-tail from "falling knife" into "offset by perp
 This is the empirical backing for the earlier claim that high-fee pump/dump pools
 should not be LP'd unhedged.
 
+## The adaptive policy (`adaptive_regime`)
+
+`RangeMode::Adaptive` operationalizes the matrix into one policy. Each swap it reads
+a rolling regime from the tick path — trend strength = `|net move| / (vol·√window)`
+— and acts:
+
+- **trending into the risk asset** (tick rising, strength ≥ threshold): exit to the
+  money leg and stand aside until the trend dies (the crash response);
+- **trending to the money side**: follow with a vol-scaled recenter;
+- **ranging** (low trend strength, incl. chop): **hold** — never chase wiggles.
+
+Net PnL across the three synthetic regimes (±300 narrow floor, 3-block latency):
+
+| policy | calm | crash | chop |
+| --- | ---: | ---: | ---: |
+| narrow_static | +29 | **-4,469** | +77 |
+| narrow_rebalance | +29 | -3,758 | **-10,099** |
+| **adaptive_regime** | **+56** | **-37** | -4,042 |
+
+- **Calm: best** (+$56) — vol-scaled tight band captures more density than fixed ±300.
+- **Crash: near-perfect** (-$37, +$2,219 vs hold) — detects the up-trend and exits
+  early, even better than `hard_exit_stop` which waits for the range to break.
+- **Chop: graceful** (-$4,042) — far better than mechanical rebalancing (-$10k)
+  because it mostly holds; still trails pure static on this *pathological* synthetic
+  (±6000 ticks every ~21 swaps), where occasional half-cycle misfires cost it. A
+  longer window or higher threshold tames this; realistic chop is much milder.
+
+The adaptive policy is the synthesis: it wins the two realistic regimes (calm,
+crash) outright and degrades gracefully — not catastrophically — in extreme chop.
+It is still unhedged; pairing it with the short hedge is the next obvious step.
+
 ## Caveats
 
 - Scenario magnitudes are **stylized stress tests**, not calibrated to AERO's real
