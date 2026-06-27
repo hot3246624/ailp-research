@@ -350,6 +350,13 @@ struct ReplayParams {
     /// 6.0 is calibrated on real noisy tick data; ~2.0 over-triggers on real flow.
     #[arg(long, default_value_t = 6.0)]
     trend_exit_threshold: f64,
+    /// Annual reward (gauge emission) APR earned while in range, as a fraction
+    /// (e.g. 0.2249 for WETH-AERO). 0 disables reward income.
+    #[arg(long, default_value_t = 0.0)]
+    reward_apr: f64,
+    /// Haircut on reward income for liquidation cost (0.1 keeps 90%).
+    #[arg(long, default_value_t = 0.0)]
+    reward_haircut: f64,
 }
 
 impl ReplayParams {
@@ -363,6 +370,8 @@ impl ReplayParams {
             rebalance_gas_usd: self.rebalance_gas_usd,
             rebalance_slippage_bps: self.rebalance_slippage_bps,
             rebalance_swap_fraction: 0.5,
+            reward_apr: self.reward_apr,
+            reward_haircut: self.reward_haircut,
         }
     }
 
@@ -1696,6 +1705,8 @@ fn params_json(params: &ReplayParams) -> serde_json::Value {
         "funding_bps_per_day": params.funding_bps_per_day,
         "hedge_fraction": params.hedge_fraction,
         "trend_exit_threshold": params.trend_exit_threshold,
+        "reward_apr": params.reward_apr,
+        "reward_haircut": params.reward_haircut,
     })
 }
 
@@ -1747,28 +1758,20 @@ fn emit_replay_report(
         params.wide_half_width,
     );
     println!(
-        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
-        "policy",
-        "net_pnl",
-        "vs_hold",
-        "fees",
-        "maxDD",
-        "hedge",
-        "1side_blk",
-        "in_range%",
-        "rebals"
+        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>9} {:>10} {:>9} {:>8}",
+        "policy", "net_pnl", "vs_hold", "fees", "reward", "LVR", "fee-LVR", "maxDD", "rebals"
     );
     for policy in &report.policies {
         println!(
-            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>9.2} {:>9} {:>8.1}% {:>8}",
+            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>9.2} {:>10.2} {:>9.2} {:>8}",
             policy.policy,
             policy.net_pnl_usd,
             policy.net_vs_hold_usd,
             policy.fee_income_usd,
+            policy.reward_income_usd,
+            policy.lvr_usd,
+            policy.fee_minus_lvr_usd,
             policy.max_drawdown_usd,
-            policy.hedge_pnl_usd,
-            policy.max_one_sided_risk_blocks,
-            policy.time_in_range_pct,
             policy.rebalances,
         );
     }

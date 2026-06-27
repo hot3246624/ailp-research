@@ -151,7 +151,14 @@ pub struct ReplayConfig {
     pub rebalance_slippage_bps: f64,
     /// Fraction of position value assumed to be swapped to re-center inventory.
     pub rebalance_swap_fraction: f64,
+    /// Annual reward (gauge emission) APR earned on staked value while in range,
+    /// as a fraction (e.g. 0.2249 for 22.49%). 0 disables reward income.
+    pub reward_apr: f64,
+    /// Haircut on reward income for liquidation cost / token risk (0.1 = keep 90%).
+    pub reward_haircut: f64,
 }
+
+const SECONDS_PER_YEAR: f64 = 31_557_600.0;
 
 impl ReplayConfig {
     fn scale0(&self) -> f64 {
@@ -389,6 +396,14 @@ pub struct PolicyReport {
     pub hedge_pnl_usd: f64,
     /// Funding paid on the hedge notional.
     pub funding_cost_usd: f64,
+    /// Loss-versus-rebalancing: value bled to arbitrageurs (≥0), the path-robust
+    /// adverse-selection cost. Unlike IL-vs-hold it excludes price beta.
+    pub lvr_usd: f64,
+    /// Fee income minus LVR — the LP's pure edge (alpha) net of adverse selection.
+    /// Positive means fees more than pay for the arbitrage bleed.
+    pub fee_minus_lvr_usd: f64,
+    /// Reward (gauge emission) income earned while staked in range, after haircut.
+    pub reward_income_usd: f64,
 }
 
 /// Find the execution price `delay` blocks after a trigger at `from_idx` — the
@@ -484,6 +499,8 @@ fn run_policy(
 
     let mut fees_token0 = 0.0_f64;
     let mut toxic_fee_token0 = 0.0_f64;
+    let mut lvr_token0 = 0.0_f64;
+    let mut reward_token0 = 0.0_f64;
     let mut gas_usd = 0.0_f64;
     let mut slippage_usd = 0.0_f64;
     let mut funding_usd = 0.0_f64;
@@ -526,11 +543,26 @@ fn run_policy(
                         toxic_fee_token0 += fee_t0;
                     }
                 }
+                // Gauge emissions accrue per unit time on staked value while in range.
+                if cfg.reward_apr > 0.0 {
+                    let dt_secs = swap.block.saturating_sub(prev_block) as f64 * exec.block_seconds;
+                    let staked_value = pos.value_token0(cfg, pre_sqrt);
+                    reward_token0 += staked_value * cfg.reward_apr / SECONDS_PER_YEAR * dt_secs;
+                }
             }
         }
 
         let post_sqrt = swap.sqrt_price_x96 / TWO_POW_96;
         tick_window.push(swap.tick);
+
+        // Loss-versus-rebalancing: the active position's old holdings marked at the
+        // new price minus the LP's actual new value = what it bled to arbitrageurs.
+        if let Some(pos) = &position {
+            let (x0, y0) = pos.amounts_at(pre_sqrt);
+            let old_at_new = cfg.value_token0(x0, y0, post_sqrt * post_sqrt);
+            let lp_at_new = pos.value_token0(cfg, post_sqrt);
+            lvr_token0 += (old_at_new - lp_at_new).max(0.0);
+        }
 
         // Funding accrual on the short hedge notional.
         if hedged {
@@ -725,7 +757,8 @@ fn run_policy(
         };
         let hedge_pnl_t0 =
             short_risk_human * (entry_risk_price - risk_price_token0(cfg, post_sqrt));
-        let equity_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0)
+        let reward_kept = reward_token0 * (1.0 - cfg.reward_haircut);
+        let equity_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0 + reward_kept)
             - gas_usd
             - slippage_usd
             - funding_usd;
@@ -747,7 +780,10 @@ fn run_policy(
     let hedge_pnl_t0 = short_risk_human * (entry_risk_price - risk_price_token0(cfg, final_sqrt));
     let hedge_pnl_usd = cfg.token0_to_usd(hedge_pnl_t0);
     let fee_income_usd = cfg.token0_to_usd(fees_token0);
-    let final_value_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0);
+    let reward_kept = reward_token0 * (1.0 - cfg.reward_haircut);
+    let reward_income_usd = cfg.token0_to_usd(reward_kept);
+    let lvr_usd = cfg.token0_to_usd(lvr_token0);
+    let final_value_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0 + reward_kept);
 
     let inventory_il_usd = match &position {
         Some(pos) => {
@@ -794,6 +830,9 @@ fn run_policy(
         toxic_fee_usd: cfg.token0_to_usd(toxic_fee_token0),
         hedge_pnl_usd,
         funding_cost_usd: funding_usd,
+        lvr_usd,
+        fee_minus_lvr_usd: fee_income_usd - lvr_usd,
+        reward_income_usd,
     }
 }
 
@@ -972,6 +1011,9 @@ fn hold_report(
         toxic_fee_usd: 0.0,
         hedge_pnl_usd: 0.0,
         funding_cost_usd: 0.0,
+        lvr_usd: 0.0,
+        fee_minus_lvr_usd: 0.0,
+        reward_income_usd: 0.0,
     }
 }
 
@@ -1407,6 +1449,8 @@ mod tests {
             rebalance_gas_usd: 0.05,
             rebalance_slippage_bps: 5.0,
             rebalance_swap_fraction: 0.5,
+            reward_apr: 0.0,
+            reward_haircut: 0.0,
         }
     }
 
@@ -1609,6 +1653,76 @@ mod tests {
             "walk-forward should cap OOS drawdown, got {}",
             report.oos_max_drawdown_usd
         );
+    }
+
+    #[test]
+    fn lvr_and_rewards_attribution() {
+        let mut cfg = cfg();
+        cfg.reward_apr = 0.20; // 20% reward APR
+        let exec = ExecConfig::default();
+
+        // Flat price: no arbitrage moves -> ~zero LVR, fee_minus_lvr ~ fees.
+        let sqrt = sqrt_ratio_at_tick(80_000) * TWO_POW_96;
+        let flat: Vec<SwapObs> = (0..500)
+            .map(|i| SwapObs {
+                block: 1000 + i * 12, // ~24s apart at 2s/block
+                log_index: 0,
+                amount0: 1e18,
+                amount1: -3000e18,
+                sqrt_price_x96: sqrt,
+                liquidity: 1e24,
+                tick: 80_000,
+            })
+            .collect();
+        let r = run_policy(
+            &flat,
+            &cfg,
+            &exec,
+            RangeMode::CenteredRebalance {
+                half_width_ticks: 600,
+                rebalance: false,
+            },
+            "narrow",
+        );
+        assert!(
+            r.lvr_usd < 1.0,
+            "flat price -> ~zero LVR, got {}",
+            r.lvr_usd
+        );
+        assert!(
+            (r.fee_minus_lvr_usd - r.fee_income_usd).abs() < 1.0,
+            "flat: fee-LVR ~= fees"
+        );
+        assert!(
+            r.reward_income_usd > 0.0,
+            "reward APR should accrue in range"
+        );
+
+        // Trending price: real arbitrage -> positive LVR below fee income shape.
+        let trend: Vec<SwapObs> = (0..500)
+            .map(|i| {
+                let tick = 80_000 + (i as i32) * 3;
+                SwapObs {
+                    block: 1000 + i * 12,
+                    log_index: 0,
+                    amount0: 1e18,
+                    amount1: -3000e18,
+                    sqrt_price_x96: sqrt_ratio_at_tick(tick) * TWO_POW_96,
+                    liquidity: 1e24,
+                    tick,
+                }
+            })
+            .collect();
+        let rt = run_policy(
+            &trend,
+            &cfg,
+            &exec,
+            RangeMode::StaticWide {
+                half_width_ticks: 6000,
+            },
+            "wide",
+        );
+        assert!(rt.lvr_usd > 0.0, "trending price should bleed LVR");
     }
 
     #[test]
