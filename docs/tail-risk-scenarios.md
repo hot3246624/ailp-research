@@ -111,6 +111,29 @@ The adaptive policy is the synthesis: it wins the two realistic regimes (calm,
 crash) outright and degrades gracefully — not catastrophically — in extreme chop.
 It is still unhedged; pairing it with the short hedge is the next obvious step.
 
+### Reality check: the detector needs real-data calibration
+
+Tuned on clean synthetics (`trend_exit_threshold = 2`), the adaptive policy
+**overfits**: on the real WETH-AERO window (calm with mild drift + microstructure
+noise) it misfired 43 times and finished **-$110, the worst policy** — exactly the
+"strategy overfits one regime" trap. Sweeping the threshold on real data:
+
+| threshold | real calm net | rebalances | max DD | crash net (vs hold) |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | -110 | 43 | 241 | -37 (+2,219) |
+| 4 | -39 | 13 | 247 | — |
+| **6** | **+216** | **4** | **176** | **-382 (+1,873)** |
+| 8 | +217 | 8 | 124 | — |
+
+At **threshold 6** the policy is a clean Pareto improvement on real data: ~the same
+calm return as `narrow_static` (+$216 vs +$285) with **~40% less drawdown**, while
+still capping the crash to -$382 (vs -$4,469 for static). The default is now 6.0.
+
+**Lesson:** regime detectors must be calibrated on real microstructure, not on
+smooth synthetic paths. Synthetics validate the *mechanism*; only real data sets the
+*thresholds*. Next: walk-forward calibration of (threshold, window) on rolling real
+windows so the parameters adapt instead of being hand-picked.
+
 ## Caveats
 
 - Scenario magnitudes are **stylized stress tests**, not calibrated to AERO's real

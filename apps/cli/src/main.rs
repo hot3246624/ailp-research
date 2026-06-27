@@ -270,7 +270,8 @@ struct ReplayParams {
     #[arg(long, default_value_t = 1.0)]
     hedge_fraction: f64,
     /// Trend strength above which the adaptive policy exits (≈ sigmas of drift).
-    #[arg(long, default_value_t = 2.0)]
+    /// 6.0 is calibrated on real noisy tick data; ~2.0 over-triggers on real flow.
+    #[arg(long, default_value_t = 6.0)]
     trend_exit_threshold: f64,
 }
 

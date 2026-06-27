@@ -925,7 +925,8 @@ fn hold_net_pnl(swaps: &[SwapObs], cfg: &ReplayConfig, entry_sqrt: f64) -> f64 {
 
 /// Run the standard baseline battery over a swap stream (default execution model).
 pub fn run_baseline_battery(swaps: &[SwapObs], cfg: &ReplayConfig) -> Vec<PolicyReport> {
-    run_baseline_battery_with(swaps, cfg, &ExecConfig::default(), 600, 6000, 1.5, 1.0, 2.0)
+    // Threshold 6.0: calibrated on real (noisy) tick data, where 2.0 over-triggers.
+    run_baseline_battery_with(swaps, cfg, &ExecConfig::default(), 600, 6000, 1.5, 1.0, 6.0)
 }
 
 /// Run baselines with explicit execution model, narrow/wide half-widths, a vol
