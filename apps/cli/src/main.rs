@@ -227,6 +227,36 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Walk-forward calibration of the adaptive policy: roll a train window, pick
+    /// (trend-threshold, width) by a risk-adjusted score on past swaps, apply
+    /// out-of-sample, and compare to fixed-param / static / hold baselines.
+    WalkForward {
+        #[arg(long, default_value = "data/base/aerodrome-opportunistic")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        pool_address: Option<String>,
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Training window length, in swaps.
+        #[arg(long, default_value_t = 1_000)]
+        train_swaps: usize,
+        /// Test/step window length, in swaps.
+        #[arg(long, default_value_t = 500)]
+        test_swaps: usize,
+        /// Trend-exit thresholds to search (repeatable).
+        #[arg(long = "threshold", default_values_t = [2.0, 4.0, 6.0, 8.0, 10.0])]
+        thresholds: Vec<f64>,
+        /// Narrow half-widths to search (repeatable).
+        #[arg(long = "half-width", default_values_t = [100, 300])]
+        half_widths: Vec<i32>,
+        /// Drawdown penalty in the train objective `net - penalty * maxDD`.
+        #[arg(long, default_value_t = 0.5)]
+        drawdown_penalty: f64,
+        #[command(flatten)]
+        params: ReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
 }
 
 /// Shared economic + execution parameters for the replay commands.
@@ -478,6 +508,29 @@ async fn main() -> Result<()> {
             &params,
             format,
         )?,
+        Command::WalkForward {
+            data_dir,
+            pool_address,
+            symbol,
+            train_swaps,
+            test_swaps,
+            thresholds,
+            half_widths,
+            drawdown_penalty,
+            params,
+            format,
+        } => walk_forward_cmd(WalkForwardArgs {
+            data_dir,
+            pool_address,
+            symbol,
+            train_swaps,
+            test_swaps,
+            thresholds,
+            half_widths,
+            drawdown_penalty,
+            params,
+            format,
+        })?,
     }
 
     Ok(())
@@ -1691,6 +1744,100 @@ fn replay_scenario(
         policies,
     };
     emit_replay_report(report, params, format)
+}
+
+struct WalkForwardArgs {
+    data_dir: PathBuf,
+    pool_address: Option<String>,
+    symbol: Option<String>,
+    train_swaps: usize,
+    test_swaps: usize,
+    thresholds: Vec<f64>,
+    half_widths: Vec<i32>,
+    drawdown_penalty: f64,
+    params: ReplayParams,
+    format: OutputFormat,
+}
+
+fn walk_forward_cmd(args: WalkForwardArgs) -> Result<()> {
+    let events_dir = args.data_dir.join("events");
+    if !events_dir.exists() {
+        anyhow::bail!("event directory does not exist: {}", events_dir.display());
+    }
+    let target = select_replay_target(
+        &events_dir,
+        args.pool_address.as_deref(),
+        args.symbol.as_deref(),
+    )?;
+    let (symbol, swaps) = load_swaps(&target)?;
+    if swaps.is_empty() {
+        anyhow::bail!("no decodable swap events found in {}", target.display());
+    }
+
+    let wf = autopool_backtest::WalkForwardConfig {
+        train_swaps: args.train_swaps,
+        test_swaps: args.test_swaps,
+        thresholds: args.thresholds.clone(),
+        half_widths: args.half_widths.clone(),
+        vol_k: args.params.vol_k,
+        cap_ticks: args.params.wide_half_width,
+        window: 200,
+        drawdown_penalty: args.drawdown_penalty,
+    };
+    let report = autopool_backtest::walk_forward(
+        &swaps,
+        &args.params.replay_config(),
+        &args.params.exec_config(),
+        &wf,
+    );
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "walk-forward {symbol} ({}) swaps={} folds={} train={} test={} grid: thr={:?} hw={:?} penalty={}",
+        target
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        swaps.len(),
+        report.folds.len(),
+        args.train_swaps,
+        args.test_swaps,
+        args.thresholds,
+        args.half_widths,
+        args.drawdown_penalty,
+    );
+    println!(
+        "{:>4} {:>10} {:>9} {:>7} {:>10} {:>9} {:>7} {:>10}",
+        "fold", "test_blk", "chosen_T", "hw", "test_net", "test_DD", "rebals", "tick_span"
+    );
+    for fold in &report.folds {
+        println!(
+            "{:>4} {:>10} {:>9.1} {:>7} {:>10.2} {:>9.2} {:>7} {:>10}",
+            fold.fold,
+            format!("{}..{}", fold.train_end, fold.test_end),
+            fold.chosen_threshold,
+            fold.chosen_half_width,
+            fold.test_net_usd,
+            fold.test_max_drawdown_usd,
+            fold.test_rebalances,
+            fold.test_tick_span,
+        );
+    }
+    println!(
+        "OOS net (walk-forward adaptive): {:>10.2}   maxDD: {:.2}   (test swaps {})",
+        report.oos_net_usd, report.oos_max_drawdown_usd, report.test_swaps_total
+    );
+    println!(
+        "OOS net baselines  fixed_adaptive: {:>10.2}   static: {:>10.2}   hold: {:>10.2}",
+        report.fixed_adaptive_net_usd, report.static_net_usd, report.hold_net_usd
+    );
+
+    Ok(())
 }
 
 /// Find the events.jsonl to replay: by explicit pool address, by symbol match, or

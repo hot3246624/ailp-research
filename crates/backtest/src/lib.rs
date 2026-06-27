@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 pub mod replay;
 
 pub use replay::{
-    ExecConfig, PolicyReport, RangeMode, ReplayConfig, Scenario, SwapObs, decode_swap_obs,
-    run_baseline_battery, run_baseline_battery_with, scenario_swaps,
+    ExecConfig, FoldResult, PolicyReport, RangeMode, ReplayConfig, Scenario, SwapObs,
+    WalkForwardConfig, WalkForwardReport, decode_swap_obs, run_baseline_battery,
+    run_baseline_battery_with, run_single_policy, scenario_swaps, walk_forward,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

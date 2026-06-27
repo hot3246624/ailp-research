@@ -1108,6 +1108,202 @@ pub fn scenario_swaps(
         .collect()
 }
 
+/// Run a single policy over a swap stream, returning `None` for an empty stream.
+pub fn run_single_policy(
+    swaps: &[SwapObs],
+    cfg: &ReplayConfig,
+    exec: &ExecConfig,
+    mode: RangeMode,
+    name: &str,
+) -> Option<PolicyReport> {
+    if swaps.is_empty() {
+        return None;
+    }
+    Some(run_policy(swaps, cfg, exec, mode, name))
+}
+
+/// Walk-forward calibration: roll a train window forward, pick the adaptive
+/// parameters that maximize a risk-adjusted score on the (past) train window, then
+/// apply them out-of-sample on the next test window. Parameters are never chosen
+/// using the data they are scored on.
+#[derive(Debug, Clone)]
+pub struct WalkForwardConfig {
+    pub train_swaps: usize,
+    pub test_swaps: usize,
+    pub thresholds: Vec<f64>,
+    pub half_widths: Vec<i32>,
+    pub vol_k: f64,
+    pub cap_ticks: i32,
+    pub window: usize,
+    /// Objective on the train window is `net - drawdown_penalty * max_drawdown`.
+    pub drawdown_penalty: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FoldResult {
+    pub fold: usize,
+    pub train_start: usize,
+    pub train_end: usize,
+    pub test_end: usize,
+    pub chosen_threshold: f64,
+    pub chosen_half_width: i32,
+    pub test_net_usd: f64,
+    pub test_max_drawdown_usd: f64,
+    pub test_rebalances: u32,
+    pub test_tick_span: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkForwardReport {
+    pub folds: Vec<FoldResult>,
+    pub test_swaps_total: usize,
+    /// Out-of-sample net of the walk-forward (per-fold calibrated) adaptive policy.
+    pub oos_net_usd: f64,
+    pub oos_max_drawdown_usd: f64,
+    /// Same test segments, adaptive with a single fixed (median-grid) threshold.
+    pub fixed_adaptive_net_usd: f64,
+    /// Same test segments, a fixed narrow static band (median-grid width).
+    pub static_net_usd: f64,
+    /// Same test segments, hold 50/50.
+    pub hold_net_usd: f64,
+}
+
+fn adaptive_mode(wf: &WalkForwardConfig, threshold: f64, half_width: i32) -> RangeMode {
+    RangeMode::Adaptive {
+        vol_k: wf.vol_k,
+        floor_ticks: (half_width / 2).max(1),
+        cap_ticks: wf.cap_ticks,
+        trend_exit_threshold: threshold,
+        window: wf.window,
+    }
+}
+
+fn median<T: Copy + PartialOrd>(values: &[T]) -> T {
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+pub fn walk_forward(
+    swaps: &[SwapObs],
+    cfg: &ReplayConfig,
+    exec: &ExecConfig,
+    wf: &WalkForwardConfig,
+) -> WalkForwardReport {
+    let n = swaps.len();
+    let fixed_threshold = if wf.thresholds.is_empty() {
+        6.0
+    } else {
+        median(&wf.thresholds)
+    };
+    let fixed_half_width = if wf.half_widths.is_empty() {
+        300
+    } else {
+        median(&wf.half_widths)
+    };
+
+    let mut folds = Vec::new();
+    let mut oos_net = 0.0;
+    let mut oos_dd = 0.0_f64;
+    let mut fixed_net = 0.0;
+    let mut static_net = 0.0;
+    let mut hold_net = 0.0;
+    let mut test_total = 0usize;
+
+    let mut start = 0usize;
+    let mut fold_idx = 0usize;
+    while start + wf.train_swaps < n {
+        let train_end = start + wf.train_swaps;
+        let test_end = (train_end + wf.test_swaps).min(n);
+        if test_end <= train_end {
+            break;
+        }
+        let train = &swaps[start..train_end];
+        let test = &swaps[train_end..test_end];
+
+        // Calibrate on the train window only.
+        let mut best: Option<(f64, f64, i32)> = None;
+        for &thr in &wf.thresholds {
+            for &hw in &wf.half_widths {
+                if let Some(report) =
+                    run_single_policy(train, cfg, exec, adaptive_mode(wf, thr, hw), "cal")
+                {
+                    let score = report.net_pnl_usd - wf.drawdown_penalty * report.max_drawdown_usd;
+                    if best.map_or(true, |(s, _, _)| score > s) {
+                        best = Some((score, thr, hw));
+                    }
+                }
+            }
+        }
+        let (_, thr, hw) = best.unwrap_or((0.0, fixed_threshold, fixed_half_width));
+
+        // Apply out-of-sample on the test window.
+        let test_report =
+            run_single_policy(test, cfg, exec, adaptive_mode(wf, thr, hw), "wf").unwrap();
+        let fixed_report = run_single_policy(
+            test,
+            cfg,
+            exec,
+            adaptive_mode(wf, fixed_threshold, fixed_half_width),
+            "fixed",
+        )
+        .unwrap();
+        let static_report = run_single_policy(
+            test,
+            cfg,
+            exec,
+            RangeMode::CenteredRebalance {
+                half_width_ticks: fixed_half_width,
+                rebalance: false,
+            },
+            "static",
+        )
+        .unwrap();
+        let hold_report =
+            run_single_policy(test, cfg, exec, RangeMode::HoldInventory, "hold").unwrap();
+
+        let tick_span = {
+            let ticks = test.iter().map(|s| s.tick);
+            let max = ticks.clone().max().unwrap_or(0);
+            let min = ticks.min().unwrap_or(0);
+            max - min
+        };
+
+        oos_net += test_report.net_pnl_usd;
+        oos_dd = oos_dd.max(test_report.max_drawdown_usd);
+        fixed_net += fixed_report.net_pnl_usd;
+        static_net += static_report.net_pnl_usd;
+        hold_net += hold_report.net_pnl_usd;
+        test_total += test.len();
+
+        folds.push(FoldResult {
+            fold: fold_idx,
+            train_start: start,
+            train_end,
+            test_end,
+            chosen_threshold: thr,
+            chosen_half_width: hw,
+            test_net_usd: test_report.net_pnl_usd,
+            test_max_drawdown_usd: test_report.max_drawdown_usd,
+            test_rebalances: test_report.rebalances,
+            test_tick_span: tick_span,
+        });
+
+        fold_idx += 1;
+        start += wf.test_swaps;
+    }
+
+    WalkForwardReport {
+        folds,
+        test_swaps_total: test_total,
+        oos_net_usd: oos_net,
+        oos_max_drawdown_usd: oos_dd,
+        fixed_adaptive_net_usd: fixed_net,
+        static_net_usd: static_net,
+        hold_net_usd: hold_net,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,6 +1477,49 @@ mod tests {
 
     fn hedge_pnl(r: &PolicyReport) -> f64 {
         r.hedge_pnl_usd
+    }
+
+    #[test]
+    fn walk_forward_beats_static_across_regime_shift() {
+        let cfg = cfg();
+        let exec = ExecConfig {
+            action_delay_blocks: 3,
+            block_seconds: 2.0,
+            funding_bps_per_day: 0.0,
+            risk_asset_is_token1: true,
+        };
+        // Calm period followed by a crash — parameters calibrated on the calm train
+        // must still protect the out-of-sample crash test folds.
+        let mut stream = scenario_swaps(Scenario::Calm, 80_000, 1_000, 6_000, 1e18, 1e24);
+        let crash = scenario_swaps(Scenario::Crash, 80_000, 1_000, 6_000, 1e18, 1e24);
+        stream.extend(crash);
+        for (i, s) in stream.iter_mut().enumerate() {
+            s.block = 1000 + i as u64;
+        }
+
+        let wf = WalkForwardConfig {
+            train_swaps: 400,
+            test_swaps: 200,
+            thresholds: vec![2.0, 6.0, 10.0],
+            half_widths: vec![300],
+            vol_k: 1.5,
+            cap_ticks: 6000,
+            window: 200,
+            drawdown_penalty: 0.5,
+        };
+        let report = walk_forward(&stream, &cfg, &exec, &wf);
+        assert!(!report.folds.is_empty(), "should produce folds");
+        assert!(
+            report.oos_net_usd > report.static_net_usd,
+            "walk-forward OOS {} should beat static {} across a regime shift",
+            report.oos_net_usd,
+            report.static_net_usd
+        );
+        assert!(
+            report.oos_max_drawdown_usd < 2000.0,
+            "walk-forward should cap OOS drawdown, got {}",
+            report.oos_max_drawdown_usd
+        );
     }
 
     #[test]
