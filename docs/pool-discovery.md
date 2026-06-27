@@ -57,12 +57,47 @@ Started a backfill of **USDC-AERO `0xa4fdd479eda160671636e2ecf8f993cbf86258a8`**
 `data/base/aerodrome-opportunistic`. Replay it with `--token0-usd 1 --decimals0 6
 --decimals1 18 --fee-bps 5` — no price-anchor assumption needed.
 
+## Finding a volatile window in history
+
+`scan-pool-activity` measures *current* activity. To find a past volatile window we
+coarsely sample the pool's tick back through history (one swap per sample point) and
+look for the largest tick moves. Probing WETH-AERO over the last 400k blocks
+(~9 days):
+
+```
+block~47477149 tick=82811     ... 47527149 tick=82725 ... 47877149 tick=80953
+MOST VOLATILE SEGMENT: 47527149..47552149  dtick=-1224 (AERO +13.0% in ~14h)
+sustained: 47527149..47627159  tick 82725 -> 80649  (AERO +~21% over ~2.3 days)
+```
+
+So AERO has been **trending up with chop** — no dramatic crash in recent history,
+but a real ~13–21% trending/volatile regime, far more than the calm slice we had.
+
+## Collecting a historical window
+
+`backfill-slipstream-events` now takes `--from-block/--to-block` (fixed window,
+terminates when done) and `--swaps-only` (Swap events only, 4x cheaper — replay
+only needs swaps). Use a separate `--data-dir` so checkpoints don't collide with
+live backfills:
+
+```bash
+BASE_RPC_URL=... cargo run -p autopool-cli -- backfill-slipstream-events \
+  --data-dir data/base/aerodrome-history \
+  --pool WETH-AERO:0x4e506648d493c8870f55e870480f92f2f33ece51 \
+  --swaps-only --from-block 47530000 --to-block 47550000 \
+  --max-blocks-per-run 200 --log-chunk-blocks 10 --sleep-ms 300 --iterations 0
+```
+
+A backfill of the steepest segment (47530000..47550000, AERO ~+13%) is running into
+`data/base/aerodrome-history`; replay it to test the adaptive policy's trend
+detection and the hard-exit/hedge tail behaviour on real (not synthetic) movement.
+
 ## Next
 
-- Re-run the scan over a longer window (a few thousand blocks) for a robust vol
-  ranking once RPC budget allows, or on a paid/archive endpoint.
-- Add `--from-block/--to-block` to the backfill to collect a historical *volatile*
-  window for WETH-AERO / USDC-AERO and finally exercise the tail policies on real
-  moves.
-- Consider widening discovery beyond Aerodrome Slipstream (Base memecoin majors:
-  WETH-BRETT, WETH-DEGEN, WETH-VIRTUAL) once a non-Slipstream pool reader exists.
+- Replay the collected historical window; compare adaptive / hard-exit / hedged on
+  real trending data, and re-run walk-forward across the calm→trend boundary.
+- Re-run `scan-pool-activity` over a longer window for a robust vol ranking once RPC
+  budget allows, or on a paid/archive endpoint.
+- Widen discovery beyond Aerodrome Slipstream (Base majors: WETH-BRETT, WETH-DEGEN,
+  WETH-VIRTUAL — see https://defillama.com/yields?chain=Base) once a non-Slipstream
+  pool reader exists.
