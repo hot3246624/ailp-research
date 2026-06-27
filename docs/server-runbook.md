@@ -86,4 +86,25 @@ cargo run -q -p autopool-cli -- replay-events \
   --symbol WETH-AERO --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 100
 ```
 
+## RPC endpoints
+
+The Alchemy free tier hard-caps `eth_getLogs` at a 10-block range, which makes
+historical backfills and long scans crawl. For historical/scan-heavy work use a
+public endpoint that allows large ranges (verified to accept 10,000-block getLogs):
+
+- `https://mainnet.base.org` (official)
+- `https://base.drpc.org`
+
+Example fast historical collection (swaps-only, 2000-block chunks):
+
+```bash
+BASE_RPC_URL=https://mainnet.base.org cargo run -q -p autopool-cli -- backfill-slipstream-events \
+  --data-dir data/base/aerodrome-trend \
+  --pool WETH-AERO:0x4e506648d493c8870f55e870480f92f2f33ece51 \
+  --swaps-only --from-block 47527000 --to-block 47627000 \
+  --max-blocks-per-run 2000 --log-chunk-blocks 2000 --sleep-ms 120 --iterations 0
+```
+
+Keep the Alchemy key for the live indexers; use the public endpoint for bulk reads.
+
 Do not put private keys or seed phrases on the server for the current research phase. Only read-only RPC access is required.

@@ -73,7 +73,10 @@ fixed-parameter and static, but only ties hold on the current calm window — i.
 do not LP this pool in this regime); and `docs/pool-discovery.md` for ranking pools
 by realized on-chain tick volatility (`scan-pool-activity`) to find liquid pairs
 that actually move — USDC-AERO is the most active liquid Slipstream pool and a clean
-USD-numeraire research target.
+USD-numeraire research target; and `docs/real-regime-replay.md` for the first replay
+on real *trending* data (collected fast via the public `mainnet.base.org` endpoint,
+which allows large `getLogs`): every LP policy loses to hold in a trend, so LP is a
+ranging-regime strategy and the meta-decision is whether to be an LP at all.
 
 ## External References
 
