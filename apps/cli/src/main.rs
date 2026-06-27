@@ -166,6 +166,10 @@ enum Command {
         /// passed it (even with --iterations 0). Defaults to the chain head.
         #[arg(long)]
         to_block: Option<u64>,
+        /// Collect only Swap events (skip mint/burn/collect) — 4x cheaper on RPC,
+        /// sufficient for replay.
+        #[arg(long, default_value_t = false)]
+        swaps_only: bool,
         #[arg(long, default_value_t = 100_000.0)]
         min_tvl_usd: f64,
         #[arg(long, default_value_t = 0.0)]
@@ -493,6 +497,7 @@ async fn main() -> Result<()> {
             iterations,
             from_block,
             to_block,
+            swaps_only,
             min_tvl_usd,
             min_volume_usd_1d,
             max_reward_share,
@@ -514,6 +519,7 @@ async fn main() -> Result<()> {
                 iterations,
                 from_block,
                 to_block,
+                swaps_only,
                 min_tvl_usd,
                 min_volume_usd_1d,
                 max_reward_share,
@@ -1064,6 +1070,7 @@ struct BackfillConfig {
     iterations: u64,
     from_block: Option<u64>,
     to_block: Option<u64>,
+    swaps_only: bool,
     min_tvl_usd: f64,
     min_volume_usd_1d: f64,
     max_reward_share: f64,
@@ -1305,13 +1312,18 @@ async fn backfill_candidate_window(
 ) -> Result<usize> {
     let mut written = 0_usize;
     let mut cursor = from_block;
+    let topics: &[EventTopic] = if config.swaps_only {
+        &EVENT_TOPICS[..1]
+    } else {
+        &EVENT_TOPICS[..]
+    };
 
     while cursor <= to_block {
         let chunk_end = cursor
             .saturating_add(config.log_chunk_blocks.saturating_sub(1))
             .min(to_block);
 
-        for event_topic in EVENT_TOPICS {
+        for event_topic in topics {
             let logs = rpc
                 .get_logs(&item.pool_address, cursor, chunk_end, event_topic.topic)
                 .await?;
