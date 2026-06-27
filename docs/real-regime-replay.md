@@ -69,10 +69,65 @@ says it should instead **stand down to hold** in *either* strong trend. That is 
 next refinement: a "LP-on/off" gate driven by trend strength, sitting above the
 range policy.
 
+## The LP on/off gate (`regime_gated`) on real data
+
+`RangeMode::RegimeGated` operationalizes "LP only in ranging regimes": on any strong
+trend it stands the position down to the money leg, and resumes LPing when price
+ranges again (enter/exit hysteresis). On synthetics it cleanly beats static LP over
+a calm→crash path (earns fees in calm, de-risks in the crash, caps drawdown), and
+matches the adaptive policy in calm/crash.
+
+But the **full ~13k-swap real trend window** (hold +$1,145) is humbling for *all*
+reactive policies:
+
+| policy | net | vs hold | rebals |
+| --- | ---: | ---: | ---: |
+| hold_50_50 | +1,145 | 0 | 0 |
+| passive_wide | +967 | -178 | 0 |
+| narrow_rebalance | +416 | -729 | 66 |
+| adaptive_regime | +228 | -917 | 11 |
+| regime_gated | +197 | -948 | 8 |
+| narrow_static (±100, held) | +62 | -1,083 | 0 |
+
+And walk-forward (per-fold calibration, OOS) makes it starker:
+
+```
+OOS net  walk-forward adaptive: +487   fixed_adaptive: +604
+         static(±300, recentered/fold): +866   hold: +809
+```
+
+## The honest, crystallized conclusion
+
+Across everything collected, active LP edge for WETH-AERO is **marginal and entirely
+regime-dependent**:
+
+1. **Calm/ranging** → narrow LP beats hold (fee density wins). This is the only
+   regime where active LP has clear edge.
+2. **Steady trend** → *nothing beats hold*, and **reactive trend policies whipsaw
+   and underperform even a simple periodically-recentered static band**. Standing
+   down / re-entering against a smooth trend churns; a band that just rides each
+   segment does better. The gate's conservative de-risk also forgoes the up-move.
+3. **Sharp crash** (synthetic, not yet real) → reactive de-risk (hard-exit / gate)
+   and a short hedge are decisively better than naive LP; this is where the tail
+   machinery earns its keep.
+
+So the gate is the right tool for the **crash tail and mixed paths**, but it is *not*
+a win in a steady trend — there, the correct action is simply *hold* (or a wide,
+rarely-touched band), not active management. The dominant lever remains the LP
+on/off decision by regime; the second lesson is **don't over-react in a steady
+trend** (re-entry whipsaw is a real cost, confirmed on real flow).
+
+This tempers any enthusiasm for active range management on this pool: at 21.25 bps,
+WETH-AERO's fee density only pays in calm markets. Higher-fee / higher-churn pools
+(or pools with a real ranging-heavy price process) are where active LP is more
+likely to clear the bar — which is what `scan-pool-activity` is for.
+
 ## Caveats
 
-- One ~11h trending slice; not yet the full 100k-block window (collection resumes
-  from the checkpoint at block 47547000).
-- The "hold" baseline here is hold-50/50; "hold 100% AERO" would have done even
-  better in this up-move, but that is a pure directional bet, not an LP strategy.
-- Fees use the static 21.25 bps tier; rewards/LVR still unmodeled.
+- The "hold" baseline is hold-50/50; "hold 100% AERO" would have done even better in
+  this up-move, but that is a pure directional bet, not an LP strategy.
+- Fees use the static 21.25 bps tier; rewards/LVR still unmodeled (rewards would
+  lift all LP rows; LVR would clarify the calm-regime edge).
+- The trend window is one sustained up-move; a real *crash* window (AERO down) has
+  not yet been found in accessible history to validate the down-tail machinery on
+  real flow.
