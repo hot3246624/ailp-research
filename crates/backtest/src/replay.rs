@@ -179,6 +179,34 @@ impl ReplayConfig {
     }
 }
 
+/// Execution-realism context: you cannot rebalance instantly, and a short hedge
+/// pays funding. `risk_asset_is_token1` says which leg is the volatile/"risk"
+/// asset (token1 = AERO for WETH-AERO); the danger side is the one that converts
+/// the position into that asset.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ExecConfig {
+    /// Blocks between a trigger firing and the action executing. In a crash the
+    /// delayed price is materially worse — this captures "you can't react instantly".
+    pub action_delay_blocks: u64,
+    /// Seconds per block (Base ~2s), used to convert block spans into funding time.
+    pub block_seconds: f64,
+    /// Funding cost (bps/day) charged on the short-hedge notional. Negative = earn.
+    pub funding_bps_per_day: f64,
+    /// Whether token1 is the volatile/risk asset (true for WETH-AERO).
+    pub risk_asset_is_token1: bool,
+}
+
+impl Default for ExecConfig {
+    fn default() -> Self {
+        Self {
+            action_delay_blocks: 0,
+            block_seconds: 2.0,
+            funding_bps_per_day: 0.0,
+            risk_asset_is_token1: true,
+        }
+    }
+}
+
 /// How a policy chooses (and maintains) its range.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RangeMode {
@@ -197,6 +225,16 @@ pub enum RangeMode {
         floor_ticks: i32,
         cap_ticks: i32,
         window: usize,
+    },
+    /// Narrow band, but one-way: recenter on the safe side, and on the danger side
+    /// (accumulating the risk asset) exit fully to the money leg and stand aside
+    /// until price retraces. Caps the left tail instead of chasing it.
+    HardExitStop { half_width_ticks: i32 },
+    /// Narrow rebalancing band plus a static short hedge on the risk asset, sized
+    /// to `hedge_fraction` of the entry risk-asset exposure.
+    HedgedRebalance {
+        half_width_ticks: i32,
+        hedge_fraction: f64,
     },
 }
 
@@ -272,17 +310,74 @@ pub struct PolicyReport {
     pub time_in_range_pct: f64,
     pub final_tick: i32,
     pub avg_half_width_ticks: f64,
+    // --- tail / execution metrics ---
+    /// Largest peak-to-trough drop in mark-to-market equity over the path.
+    pub max_drawdown_usd: f64,
+    /// Lowest equity reached over the path.
+    pub min_equity_usd: f64,
+    /// Longest contiguous block span spent out-of-range holding the risk asset.
+    pub max_one_sided_risk_blocks: u64,
+    /// Fees earned while the position was in the risk-accumulation half of its
+    /// range — "toxic" fees that come bundled with adverse selection.
+    pub toxic_fee_usd: f64,
+    /// PnL of the short hedge (positive when the risk asset fell).
+    pub hedge_pnl_usd: f64,
+    /// Funding paid on the hedge notional.
+    pub funding_cost_usd: f64,
 }
 
-/// Simulate one range policy over the swap stream.
-fn run_policy(swaps: &[SwapObs], cfg: &ReplayConfig, mode: RangeMode, name: &str) -> PolicyReport {
+/// Find the execution price `delay` blocks after a trigger at `from_idx` — the
+/// price you actually get given you cannot act instantly. Returns (sqrt, tick).
+fn price_after_delay(
+    swaps: &[SwapObs],
+    from_idx: usize,
+    from_block: u64,
+    delay: u64,
+) -> (f64, i32) {
+    if delay == 0 {
+        let s = &swaps[from_idx];
+        return (s.sqrt_price_x96 / TWO_POW_96, s.tick);
+    }
+    let target = from_block.saturating_add(delay);
+    for s in &swaps[from_idx..] {
+        if s.block >= target {
+            return (s.sqrt_price_x96 / TWO_POW_96, s.tick);
+        }
+    }
+    let last = swaps.last().unwrap();
+    (last.sqrt_price_x96 / TWO_POW_96, last.tick)
+}
+
+/// AERO (risk asset, token1) price expressed in token0 units = 1 / human price.
+fn risk_price_token0(cfg: &ReplayConfig, sqrt_raw: f64) -> f64 {
+    let p_h = cfg.price_human(sqrt_raw * sqrt_raw);
+    if p_h > 0.0 { 1.0 / p_h } else { 0.0 }
+}
+
+/// Simulate one range policy over the swap stream, tracking execution latency,
+/// an optional short hedge, one-way exits, and tail metrics.
+fn run_policy(
+    swaps: &[SwapObs],
+    cfg: &ReplayConfig,
+    exec: &ExecConfig,
+    mode: RangeMode,
+    name: &str,
+) -> PolicyReport {
     let first = swaps.first().expect("non-empty swaps");
     let entry_sqrt = first.sqrt_price_x96 / TWO_POW_96;
+    let hold_net = hold_net_pnl(swaps, cfg, entry_sqrt);
 
-    // Hold baseline: split capital 50/50 at entry and mark at the final price.
     if let RangeMode::HoldInventory = mode {
-        return hold_report(swaps, cfg, entry_sqrt, name);
+        return hold_report(swaps, cfg, entry_sqrt, name, hold_net);
     }
+
+    let rebalance = should_rebalance(&mode);
+    let hard_exit = matches!(mode, RangeMode::HardExitStop { .. });
+    let hedge_fraction = match mode {
+        RangeMode::HedgedRebalance { hedge_fraction, .. } => hedge_fraction,
+        _ => 0.0,
+    };
+    let hedged = hedge_fraction > 0.0;
 
     let mut half_width_sum = 0.0_f64;
     let mut half_width_count = 0u64;
@@ -292,90 +387,193 @@ fn run_policy(swaps: &[SwapObs], cfg: &ReplayConfig, mode: RangeMode, name: &str
     half_width_sum += initial_half as f64;
     half_width_count += 1;
     let (mut lower, mut upper) = centered_range(first.tick, initial_half);
-    let mut position = Position::open(cfg, entry_sqrt, lower, upper);
+    let mut position: Option<Position> = Some(Position::open(cfg, entry_sqrt, lower, upper));
+    let mut sidelined_token0 = 0.0_f64; // value parked in the money leg (token0)
+
+    // Static short hedge on the risk asset (token1), sized to entry exposure.
+    let entry_risk_price = risk_price_token0(cfg, entry_sqrt);
+    let short_risk_human = if hedged {
+        hedge_fraction * (position.as_ref().unwrap().amount1_entry / cfg.scale1())
+    } else {
+        0.0
+    };
 
     let mut fees_token0 = 0.0_f64;
+    let mut toxic_fee_token0 = 0.0_f64;
     let mut gas_usd = 0.0_f64;
     let mut slippage_usd = 0.0_f64;
+    let mut funding_usd = 0.0_f64;
     let mut rebalances = 0u32;
     let mut swaps_in_range = 0u64;
 
-    // Price seen entering each swap = previous swap's post-price (entry for #0).
-    let mut pre_sqrt = entry_sqrt;
+    let mut peak_equity = cfg.capital_usd;
+    let mut max_drawdown = 0.0_f64;
+    let mut min_equity = cfg.capital_usd;
+    let mut risk_run_start: Option<u64> = None;
+    let mut max_one_sided_risk_blocks = 0u64;
 
-    for swap in swaps {
-        // Fee accrual uses the price at which the position was sitting when the
-        // swap began (pre-swap price), which is where its liquidity was active.
-        if position.in_range(pre_sqrt) {
-            swaps_in_range += 1;
-            let (gross_in, input_is_token0) = swap.gross_input();
-            if gross_in > 0.0 && swap.liquidity > 0.0 {
-                let share = position.liquidity / (swap.liquidity + position.liquidity);
-                let fee_in_input_raw = share * cfg.fee_fraction * gross_in;
-                let price_raw = swap.price_raw();
-                fees_token0 += if input_is_token0 {
-                    fee_in_input_raw / cfg.scale0()
-                } else {
-                    let p_h = cfg.price_human(price_raw);
-                    if p_h > 0.0 {
-                        (fee_in_input_raw / cfg.scale1()) / p_h
+    let mut pre_sqrt = entry_sqrt;
+    let mut prev_block = first.block;
+
+    for (i, swap) in swaps.iter().enumerate() {
+        // Fee accrual at the pre-swap price (where liquidity was active).
+        if let Some(pos) = &position {
+            if pos.in_range(pre_sqrt) {
+                swaps_in_range += 1;
+                let (gross_in, input_is_token0) = swap.gross_input();
+                if gross_in > 0.0 && swap.liquidity > 0.0 {
+                    let share = pos.liquidity / (swap.liquidity + pos.liquidity);
+                    let fee_in_input_raw = share * cfg.fee_fraction * gross_in;
+                    let price_raw = swap.price_raw();
+                    let fee_t0 = if input_is_token0 {
+                        fee_in_input_raw / cfg.scale0()
                     } else {
-                        0.0
+                        let p_h = cfg.price_human(price_raw);
+                        if p_h > 0.0 {
+                            (fee_in_input_raw / cfg.scale1()) / p_h
+                        } else {
+                            0.0
+                        }
+                    };
+                    fees_token0 += fee_t0;
+                    // Toxic if sitting in the risk-accumulation (upper) half.
+                    let mid = (pos.sqrt_lower * pos.sqrt_upper).sqrt();
+                    if pre_sqrt > mid {
+                        toxic_fee_token0 += fee_t0;
                     }
-                };
+                }
             }
         }
 
         let post_sqrt = swap.sqrt_price_x96 / TWO_POW_96;
         tick_window.push(swap.tick);
 
-        // Rebalance if the policy allows it and price left the range.
-        if should_rebalance(&mode) && !position.in_range(post_sqrt) {
-            // Realize: value continues in the position; pay costs and recenter.
-            let pos_value_token0 = position.value_token0(cfg, post_sqrt);
-            gas_usd += cfg.rebalance_gas_usd;
-            let swap_notional_usd =
-                cfg.token0_to_usd(pos_value_token0) * cfg.rebalance_swap_fraction;
-            slippage_usd += swap_notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
-            rebalances += 1;
-
-            let half = next_half_width(&mode, &tick_window);
-            half_width_sum += half as f64;
-            half_width_count += 1;
-            let (nl, nu) = centered_range(swap.tick, half);
-            lower = nl;
-            upper = nu;
-            // Re-open sized to the realized value net of this rebalance's costs.
-            let net_value_token0 = (pos_value_token0
-                - (cfg.rebalance_gas_usd
-                    + swap_notional_usd * cfg.rebalance_slippage_bps / 10_000.0)
-                    / cfg.token0_usd)
-                .max(0.0);
-            position = Position::open_with_capital(cfg, post_sqrt, lower, upper, net_value_token0);
+        // Funding accrual on the short hedge notional.
+        if hedged {
+            let dt_days =
+                swap.block.saturating_sub(prev_block) as f64 * exec.block_seconds / 86_400.0;
+            let short_notional_usd =
+                cfg.token0_to_usd(short_risk_human * risk_price_token0(cfg, post_sqrt));
+            funding_usd += exec.funding_bps_per_day / 10_000.0 * short_notional_usd * dt_days;
         }
 
+        // Position actions on a range breach.
+        if position.is_some() {
+            let (in_range, danger) = {
+                let pos = position.as_ref().unwrap();
+                (pos.in_range(post_sqrt), post_sqrt > pos.sqrt_upper)
+            };
+            if !in_range && hard_exit && danger {
+                // One-way exit: liquidate to the money leg at the delayed price.
+                let (exec_sqrt, _) =
+                    price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                let notional_usd = cfg.token0_to_usd(val);
+                let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                gas_usd += cfg.rebalance_gas_usd;
+                slippage_usd += slip;
+                sidelined_token0 = (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                position = None;
+            } else if !in_range && rebalance {
+                let (exec_sqrt, exec_tick) =
+                    price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                gas_usd += cfg.rebalance_gas_usd;
+                slippage_usd += slip;
+                rebalances += 1;
+                let half = next_half_width(&mode, &tick_window);
+                half_width_sum += half as f64;
+                half_width_count += 1;
+                let (nl, nu) = centered_range(exec_tick, half);
+                lower = nl;
+                upper = nu;
+                let net = (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                position = Some(Position::open_with_capital(
+                    cfg, exec_sqrt, lower, upper, net,
+                ));
+            }
+        } else {
+            // Sidelined: re-enter once price retraces to the old range center.
+            let center_old = (lower + upper) / 2;
+            if swap.tick <= center_old {
+                let half = next_half_width(&mode, &tick_window);
+                half_width_sum += half as f64;
+                half_width_count += 1;
+                let (nl, nu) = centered_range(swap.tick, half);
+                lower = nl;
+                upper = nu;
+                gas_usd += cfg.rebalance_gas_usd;
+                rebalances += 1;
+                position = Some(Position::open_with_capital(
+                    cfg,
+                    post_sqrt,
+                    lower,
+                    upper,
+                    sidelined_token0,
+                ));
+                sidelined_token0 = 0.0;
+            }
+        }
+
+        // One-sided risk hold: active and above range = stuck holding the risk asset.
+        let holding_risk = position
+            .as_ref()
+            .map(|pos| post_sqrt > pos.sqrt_upper)
+            .unwrap_or(false);
+        if holding_risk {
+            let start = *risk_run_start.get_or_insert(swap.block);
+            max_one_sided_risk_blocks =
+                max_one_sided_risk_blocks.max(swap.block.saturating_sub(start));
+        } else {
+            risk_run_start = None;
+        }
+
+        // Mark-to-market equity for drawdown.
+        let pos_val_t0 = match &position {
+            Some(pos) => pos.value_token0(cfg, post_sqrt),
+            None => sidelined_token0,
+        };
+        let hedge_pnl_t0 =
+            short_risk_human * (entry_risk_price - risk_price_token0(cfg, post_sqrt));
+        let equity_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0)
+            - gas_usd
+            - slippage_usd
+            - funding_usd;
+        peak_equity = peak_equity.max(equity_usd);
+        max_drawdown = max_drawdown.max(peak_equity - equity_usd);
+        min_equity = min_equity.min(equity_usd);
+
         pre_sqrt = post_sqrt;
+        prev_block = swap.block;
     }
 
-    let _ = (lower, upper);
     let final_sqrt = swaps.last().unwrap().sqrt_price_x96 / TWO_POW_96;
     let final_tick = swaps.last().unwrap().tick;
 
-    let position_value_token0 = position.value_token0(cfg, final_sqrt);
-    let final_value_usd = cfg.token0_to_usd(position_value_token0 + fees_token0);
+    let pos_val_t0 = match &position {
+        Some(pos) => pos.value_token0(cfg, final_sqrt),
+        None => sidelined_token0,
+    };
+    let hedge_pnl_t0 = short_risk_human * (entry_risk_price - risk_price_token0(cfg, final_sqrt));
+    let hedge_pnl_usd = cfg.token0_to_usd(hedge_pnl_t0);
     let fee_income_usd = cfg.token0_to_usd(fees_token0);
+    let final_value_usd = cfg.token0_to_usd(pos_val_t0 + fees_token0 + hedge_pnl_t0);
 
-    // Inventory IL: hold the *current segment's* entry mix vs the LP amounts now.
-    let hold_entry_value_token0 = cfg.value_token0(
-        position.amount0_entry,
-        position.amount1_entry,
-        final_sqrt * final_sqrt,
-    );
-    let inventory_il_usd = cfg.token0_to_usd(hold_entry_value_token0 - position_value_token0);
+    let inventory_il_usd = match &position {
+        Some(pos) => {
+            let hold_v = cfg.value_token0(
+                pos.amount0_entry,
+                pos.amount1_entry,
+                final_sqrt * final_sqrt,
+            );
+            cfg.token0_to_usd(hold_v - pos.value_token0(cfg, final_sqrt))
+        }
+        None => 0.0,
+    };
 
-    let net_pnl_usd = final_value_usd - cfg.capital_usd - gas_usd - slippage_usd;
-
-    let hold_net = hold_net_pnl(swaps, cfg, entry_sqrt);
+    let net_pnl_usd = final_value_usd - cfg.capital_usd - gas_usd - slippage_usd - funding_usd;
     let swaps_total = swaps.len() as u64;
 
     PolicyReport {
@@ -402,6 +600,12 @@ fn run_policy(swaps: &[SwapObs], cfg: &ReplayConfig, mode: RangeMode, name: &str
         } else {
             0.0
         },
+        max_drawdown_usd: max_drawdown,
+        min_equity_usd: min_equity,
+        max_one_sided_risk_blocks,
+        toxic_fee_usd: cfg.token0_to_usd(toxic_fee_token0),
+        hedge_pnl_usd,
+        funding_cost_usd: funding_usd,
     }
 }
 
@@ -441,18 +645,18 @@ fn centered_range(center_tick: i32, half_width: i32) -> (i32, i32) {
 }
 
 fn initial_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
+    let _ = window;
     match mode {
         RangeMode::HoldInventory => 0,
         RangeMode::StaticWide { half_width_ticks } => *half_width_ticks,
         RangeMode::CenteredRebalance {
             half_width_ticks, ..
         } => *half_width_ticks,
+        RangeMode::HardExitStop { half_width_ticks } => *half_width_ticks,
+        RangeMode::HedgedRebalance {
+            half_width_ticks, ..
+        } => *half_width_ticks,
         RangeMode::VolatilityScaled { floor_ticks, .. } => *floor_ticks.max(&1),
-        #[allow(unreachable_patterns)]
-        _ => {
-            let _ = window;
-            1
-        }
     }
 }
 
@@ -470,6 +674,10 @@ fn next_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         RangeMode::CenteredRebalance {
             half_width_ticks, ..
         } => *half_width_ticks,
+        RangeMode::HardExitStop { half_width_ticks } => *half_width_ticks,
+        RangeMode::HedgedRebalance {
+            half_width_ticks, ..
+        } => *half_width_ticks,
         RangeMode::StaticWide { half_width_ticks } => *half_width_ticks,
         RangeMode::HoldInventory => 0,
     }
@@ -482,6 +690,8 @@ fn should_rebalance(mode: &RangeMode) -> bool {
             rebalance: true,
             ..
         } | RangeMode::VolatilityScaled { .. }
+            | RangeMode::HardExitStop { .. }
+            | RangeMode::HedgedRebalance { .. }
     )
 }
 
@@ -505,10 +715,29 @@ fn rolling_tick_vol(window: &[i32], n: usize) -> f64 {
     var.sqrt()
 }
 
-fn hold_report(swaps: &[SwapObs], cfg: &ReplayConfig, entry_sqrt: f64, name: &str) -> PolicyReport {
+fn hold_report(
+    swaps: &[SwapObs],
+    cfg: &ReplayConfig,
+    entry_sqrt: f64,
+    name: &str,
+    hold_net: f64,
+) -> PolicyReport {
     let final_sqrt = swaps.last().unwrap().sqrt_price_x96 / TWO_POW_96;
     let final_tick = swaps.last().unwrap().tick;
     let (a0, a1) = hold_5050_amounts(cfg, entry_sqrt);
+
+    // Mark the held inventory through the path for drawdown.
+    let mut peak_equity = cfg.capital_usd;
+    let mut max_drawdown = 0.0_f64;
+    let mut min_equity = cfg.capital_usd;
+    for swap in swaps {
+        let post_sqrt = swap.sqrt_price_x96 / TWO_POW_96;
+        let equity_usd = cfg.token0_to_usd(cfg.value_token0(a0, a1, post_sqrt * post_sqrt));
+        peak_equity = peak_equity.max(equity_usd);
+        max_drawdown = max_drawdown.max(peak_equity - equity_usd);
+        min_equity = min_equity.min(equity_usd);
+    }
+
     let final_value_usd = cfg.token0_to_usd(cfg.value_token0(a0, a1, final_sqrt * final_sqrt));
     let net_pnl_usd = final_value_usd - cfg.capital_usd;
     PolicyReport {
@@ -520,13 +749,19 @@ fn hold_report(swaps: &[SwapObs], cfg: &ReplayConfig, entry_sqrt: f64, name: &st
         slippage_cost_usd: 0.0,
         inventory_il_usd: 0.0,
         net_pnl_usd,
-        net_vs_hold_usd: 0.0,
+        net_vs_hold_usd: net_pnl_usd - hold_net,
         rebalances: 0,
         swaps_in_range: 0,
         swaps_total: swaps.len() as u64,
         time_in_range_pct: 0.0,
         final_tick,
         avg_half_width_ticks: 0.0,
+        max_drawdown_usd: max_drawdown,
+        min_equity_usd: min_equity,
+        max_one_sided_risk_blocks: 0,
+        toxic_fee_usd: 0.0,
+        hedge_pnl_usd: 0.0,
+        funding_cost_usd: 0.0,
     }
 }
 
@@ -553,27 +788,31 @@ fn hold_net_pnl(swaps: &[SwapObs], cfg: &ReplayConfig, entry_sqrt: f64) -> f64 {
     cfg.token0_to_usd(cfg.value_token0(a0, a1, final_sqrt * final_sqrt)) - cfg.capital_usd
 }
 
-/// Run the standard baseline battery over a swap stream.
+/// Run the standard baseline battery over a swap stream (default execution model).
 pub fn run_baseline_battery(swaps: &[SwapObs], cfg: &ReplayConfig) -> Vec<PolicyReport> {
-    run_baseline_battery_with(swaps, cfg, 600, 6000, 1.5)
+    run_baseline_battery_with(swaps, cfg, &ExecConfig::default(), 600, 6000, 1.5, 1.0)
 }
 
-/// Run baselines with explicit narrow/wide half-widths and a vol multiplier.
+/// Run baselines with explicit execution model, narrow/wide half-widths, a vol
+/// multiplier, and a hedge fraction.
 pub fn run_baseline_battery_with(
     swaps: &[SwapObs],
     cfg: &ReplayConfig,
+    exec: &ExecConfig,
     narrow_half_width: i32,
     wide_half_width: i32,
     vol_k: f64,
+    hedge_fraction: f64,
 ) -> Vec<PolicyReport> {
     if swaps.is_empty() {
         return Vec::new();
     }
     vec![
-        run_policy(swaps, cfg, RangeMode::HoldInventory, "hold_50_50"),
+        run_policy(swaps, cfg, exec, RangeMode::HoldInventory, "hold_50_50"),
         run_policy(
             swaps,
             cfg,
+            exec,
             RangeMode::StaticWide {
                 half_width_ticks: wide_half_width,
             },
@@ -582,6 +821,7 @@ pub fn run_baseline_battery_with(
         run_policy(
             swaps,
             cfg,
+            exec,
             RangeMode::CenteredRebalance {
                 half_width_ticks: narrow_half_width,
                 rebalance: false,
@@ -591,6 +831,7 @@ pub fn run_baseline_battery_with(
         run_policy(
             swaps,
             cfg,
+            exec,
             RangeMode::CenteredRebalance {
                 half_width_ticks: narrow_half_width,
                 rebalance: true,
@@ -600,6 +841,7 @@ pub fn run_baseline_battery_with(
         run_policy(
             swaps,
             cfg,
+            exec,
             RangeMode::VolatilityScaled {
                 k: vol_k,
                 floor_ticks: narrow_half_width / 2,
@@ -608,7 +850,111 @@ pub fn run_baseline_battery_with(
             },
             "vol_scaled_rebalance",
         ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::HardExitStop {
+                half_width_ticks: narrow_half_width,
+            },
+            "hard_exit_stop",
+        ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::HedgedRebalance {
+                half_width_ticks: narrow_half_width,
+                hedge_fraction,
+            },
+            "hedged_narrow",
+        ),
     ]
+}
+
+/// Synthetic price scenarios for stress-testing policies when real data lacks the
+/// regime of interest (e.g. a crash). `Crash` = the risk asset (token1) collapses,
+/// which raises the pool tick; `Pump` = the opposite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scenario {
+    Calm,
+    Pump,
+    Crash,
+    Chop,
+}
+
+impl Scenario {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "calm" => Some(Self::Calm),
+            "pump" => Some(Self::Pump),
+            "crash" => Some(Self::Crash),
+            "chop" => Some(Self::Chop),
+            _ => None,
+        }
+    }
+}
+
+/// Build a deterministic synthetic swap stream for a scenario. `move_ticks` is the
+/// net tick travel for trending scenarios / amplitude for chop.
+pub fn scenario_swaps(
+    kind: Scenario,
+    start_tick: i32,
+    n: usize,
+    move_ticks: i32,
+    swap_size_token0: f64,
+    liquidity: f64,
+) -> Vec<SwapObs> {
+    let n = n.max(2);
+    let mut rng: u64 = 0x9E37_79B9_7F4A_7C15; // fixed seed -> reproducible
+    let mut next_noise = |amp: f64| -> f64 {
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let unit = ((rng >> 33) as f64 / (1u64 << 31) as f64) - 1.0; // [-1, 1)
+        unit * amp
+    };
+
+    (0..n)
+        .map(|i| {
+            let frac = i as f64 / (n - 1) as f64;
+            let tick = match kind {
+                Scenario::Calm => start_tick + next_noise(40.0).round() as i32,
+                Scenario::Pump => {
+                    start_tick - (move_ticks as f64 * frac).round() as i32
+                        + next_noise(30.0).round() as i32
+                }
+                Scenario::Crash => {
+                    // Front-loaded collapse: most of the move in the first third.
+                    let shape = (frac * 3.0).min(1.0);
+                    start_tick
+                        + (move_ticks as f64 * shape).round() as i32
+                        + next_noise(30.0).round() as i32
+                }
+                Scenario::Chop => {
+                    start_tick
+                        + (move_ticks as f64 * (i as f64 * 0.3).sin()).round() as i32
+                        + next_noise(50.0).round() as i32
+                }
+            };
+            let sqrt = sqrt_ratio_at_tick(tick);
+            // Alternate input side so both tokens see flow.
+            let (amount0, amount1) = if i % 2 == 0 {
+                (swap_size_token0, -swap_size_token0)
+            } else {
+                (-swap_size_token0, swap_size_token0)
+            };
+            SwapObs {
+                block: 1000 + i as u64,
+                log_index: 0,
+                amount0,
+                amount1,
+                sqrt_price_x96: sqrt * TWO_POW_96,
+                liquidity,
+                tick,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -716,7 +1062,8 @@ mod tests {
                 }
             })
             .collect();
-        let reports = run_baseline_battery_with(&swaps, &cfg, 100, 6000, 1.5);
+        let reports =
+            run_baseline_battery_with(&swaps, &cfg, &ExecConfig::default(), 100, 6000, 1.5, 1.0);
         let reb = reports
             .iter()
             .find(|r| r.policy == "narrow_rebalance")
@@ -725,5 +1072,55 @@ mod tests {
             reb.rebalances > 0,
             "trending price should trigger rebalances"
         );
+    }
+
+    #[test]
+    fn crash_scenario_hard_exit_caps_tail_and_hedge_pays() {
+        let cfg = cfg();
+        let exec = ExecConfig {
+            action_delay_blocks: 3,
+            block_seconds: 2.0,
+            funding_bps_per_day: 10.0,
+            risk_asset_is_token1: true,
+        };
+        // AERO crashes: tick rises ~6000 (≈ +82% pool price, AERO ≈ -45%).
+        let swaps = scenario_swaps(Scenario::Crash, 80_000, 1_500, 6_000, 1e18, 1e24);
+        let reports = run_baseline_battery_with(&swaps, &cfg, &exec, 300, 6000, 1.5, 1.0);
+        let get = |name: &str| reports.iter().find(|r| r.policy == name).unwrap().clone();
+
+        let narrow_static = get("narrow_static");
+        let hard_exit = get("hard_exit_stop");
+        let hedged = get("hedged_narrow");
+
+        // One-way exit should lose less than passively holding the falling knife.
+        assert!(
+            hard_exit.net_pnl_usd > narrow_static.net_pnl_usd,
+            "hard_exit {} should beat narrow_static {} in a crash",
+            hard_exit.net_pnl_usd,
+            narrow_static.net_pnl_usd
+        );
+        // And it should cap the drawdown.
+        assert!(
+            hard_exit.max_drawdown_usd < narrow_static.max_drawdown_usd,
+            "hard_exit drawdown {} < narrow_static {}",
+            hard_exit.max_drawdown_usd,
+            narrow_static.max_drawdown_usd
+        );
+        // The short hedge pays off when the risk asset collapses.
+        assert!(
+            hedged.hedge_pnl_usd > 0.0,
+            "hedge should profit in a crash, got {}",
+            hedge_pnl(&hedged)
+        );
+        assert!(
+            hedged.net_pnl_usd > narrow_static.net_pnl_usd,
+            "hedged should beat unhedged narrow in a crash"
+        );
+        // Patiently holding a narrow band through the crash strands inventory.
+        assert!(narrow_static.max_one_sided_risk_blocks > 0);
+    }
+
+    fn hedge_pnl(r: &PolicyReport) -> f64 {
+        r.hedge_pnl_usd
     }
 }

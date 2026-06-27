@@ -196,37 +196,103 @@ enum Command {
         /// Match a pool by symbol (e.g. WETH-AERO) instead of address.
         #[arg(long)]
         symbol: Option<String>,
-        /// Pool fee tier in basis points (30 bps = 0.30%).
-        #[arg(long, default_value_t = 30.0)]
-        fee_bps: f64,
-        /// Decimals of token0 (lower-address token). WETH=18.
-        #[arg(long, default_value_t = 18)]
-        decimals0: u8,
-        /// Decimals of token1 (higher-address token). AERO=18, USDC=6.
-        #[arg(long, default_value_t = 18)]
-        decimals1: u8,
-        /// USD value of one token0 (numeraire anchor). WETH ~ 3300.
-        #[arg(long, default_value_t = 3300.0)]
-        token0_usd: f64,
-        #[arg(long, default_value_t = 10_000.0)]
-        capital_usd: f64,
-        /// Gas cost per rebalance in USD (Base L2 is cheap).
-        #[arg(long, default_value_t = 0.05)]
-        rebalance_gas_usd: f64,
-        #[arg(long, default_value_t = 5.0)]
-        rebalance_slippage_bps: f64,
-        /// Half-width (ticks) for the narrow policies.
-        #[arg(long, default_value_t = 600)]
-        narrow_half_width: i32,
-        /// Half-width (ticks) for the passive-wide policy.
-        #[arg(long, default_value_t = 6_000)]
-        wide_half_width: i32,
-        /// Volatility multiplier for the vol-scaled policy.
-        #[arg(long, default_value_t = 1.5)]
-        vol_k: f64,
+        #[command(flatten)]
+        params: ReplayParams,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Stress-test the range policies against a synthetic price scenario
+    /// (calm / pump / crash / chop) when collected data lacks that regime.
+    ReplayScenario {
+        /// Scenario: calm, pump, crash, or chop.
+        #[arg(long, default_value = "crash")]
+        scenario: String,
+        #[arg(long, default_value_t = 80_000)]
+        start_tick: i32,
+        /// Number of synthetic swaps.
+        #[arg(long, default_value_t = 1_500)]
+        swaps: usize,
+        /// Net tick travel for trending scenarios / amplitude for chop.
+        /// +6000 ticks ≈ +82% pool price ≈ risk asset (token1) down ~45%.
+        #[arg(long, default_value_t = 6_000)]
+        move_ticks: i32,
+        /// Per-swap input size in whole token0 units.
+        #[arg(long, default_value_t = 1.0)]
+        swap_size_token0: f64,
+        /// Pool active liquidity (raw units) used for fee-share.
+        #[arg(long, default_value_t = 1e24)]
+        liquidity: f64,
+        #[command(flatten)]
+        params: ReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+}
+
+/// Shared economic + execution parameters for the replay commands.
+#[derive(Debug, clap::Args)]
+struct ReplayParams {
+    /// Pool fee tier in basis points (30 bps = 0.30%).
+    #[arg(long, default_value_t = 30.0)]
+    fee_bps: f64,
+    /// Decimals of token0 (lower-address token). WETH=18.
+    #[arg(long, default_value_t = 18)]
+    decimals0: u8,
+    /// Decimals of token1 (higher-address token). AERO=18, USDC=6.
+    #[arg(long, default_value_t = 18)]
+    decimals1: u8,
+    /// USD value of one token0 (numeraire anchor). WETH ~ 1574 here.
+    #[arg(long, default_value_t = 3300.0)]
+    token0_usd: f64,
+    #[arg(long, default_value_t = 10_000.0)]
+    capital_usd: f64,
+    /// Gas cost per rebalance in USD (Base L2 is cheap).
+    #[arg(long, default_value_t = 0.05)]
+    rebalance_gas_usd: f64,
+    #[arg(long, default_value_t = 5.0)]
+    rebalance_slippage_bps: f64,
+    /// Half-width (ticks) for the narrow policies.
+    #[arg(long, default_value_t = 600)]
+    narrow_half_width: i32,
+    /// Half-width (ticks) for the passive-wide policy.
+    #[arg(long, default_value_t = 6_000)]
+    wide_half_width: i32,
+    /// Volatility multiplier for the vol-scaled policy.
+    #[arg(long, default_value_t = 1.5)]
+    vol_k: f64,
+    /// Blocks between a trigger and execution (you cannot rebalance instantly).
+    #[arg(long, default_value_t = 0)]
+    action_delay_blocks: u64,
+    /// Funding cost (bps/day) on the short-hedge notional.
+    #[arg(long, default_value_t = 0.0)]
+    funding_bps_per_day: f64,
+    /// Short-hedge size as a fraction of entry risk-asset exposure.
+    #[arg(long, default_value_t = 1.0)]
+    hedge_fraction: f64,
+}
+
+impl ReplayParams {
+    fn replay_config(&self) -> autopool_backtest::ReplayConfig {
+        autopool_backtest::ReplayConfig {
+            decimals0: self.decimals0,
+            decimals1: self.decimals1,
+            fee_fraction: self.fee_bps / 10_000.0,
+            token0_usd: self.token0_usd,
+            capital_usd: self.capital_usd,
+            rebalance_gas_usd: self.rebalance_gas_usd,
+            rebalance_slippage_bps: self.rebalance_slippage_bps,
+            rebalance_swap_fraction: 0.5,
+        }
+    }
+
+    fn exec_config(&self) -> autopool_backtest::ExecConfig {
+        autopool_backtest::ExecConfig {
+            action_delay_blocks: self.action_delay_blocks,
+            block_seconds: 2.0,
+            funding_bps_per_day: self.funding_bps_per_day,
+            risk_asset_is_token1: true,
+        }
+    }
 }
 
 #[tokio::main]
@@ -386,33 +452,28 @@ async fn main() -> Result<()> {
             data_dir,
             pool_address,
             symbol,
-            fee_bps,
-            decimals0,
-            decimals1,
-            token0_usd,
-            capital_usd,
-            rebalance_gas_usd,
-            rebalance_slippage_bps,
-            narrow_half_width,
-            wide_half_width,
-            vol_k,
+            params,
             format,
-        } => replay_events(ReplayArgs {
-            data_dir,
-            pool_address,
-            symbol,
-            fee_bps,
-            decimals0,
-            decimals1,
-            token0_usd,
-            capital_usd,
-            rebalance_gas_usd,
-            rebalance_slippage_bps,
-            narrow_half_width,
-            wide_half_width,
-            vol_k,
+        } => replay_events(data_dir, pool_address, symbol, &params, format)?,
+        Command::ReplayScenario {
+            scenario,
+            start_tick,
+            swaps,
+            move_ticks,
+            swap_size_token0,
+            liquidity,
+            params,
             format,
-        })?,
+        } => replay_scenario(
+            scenario,
+            start_tick,
+            swaps,
+            move_ticks,
+            swap_size_token0,
+            liquidity,
+            &params,
+            format,
+        )?,
     }
 
     Ok(())
@@ -1443,27 +1504,9 @@ fn summarize_slipstream_events(data_dir: PathBuf, format: OutputFormat) -> Resul
     Ok(())
 }
 
-struct ReplayArgs {
-    data_dir: PathBuf,
-    pool_address: Option<String>,
-    symbol: Option<String>,
-    fee_bps: f64,
-    decimals0: u8,
-    decimals1: u8,
-    token0_usd: f64,
-    capital_usd: f64,
-    rebalance_gas_usd: f64,
-    rebalance_slippage_bps: f64,
-    narrow_half_width: i32,
-    wide_half_width: i32,
-    vol_k: f64,
-    format: OutputFormat,
-}
-
 #[derive(Debug, Serialize)]
 struct ReplayReport {
-    pool_address: String,
-    symbol: String,
+    label: String,
     swaps: usize,
     block_first: Option<u64>,
     block_last: Option<u64>,
@@ -1473,18 +1516,112 @@ struct ReplayReport {
     policies: Vec<autopool_backtest::PolicyReport>,
 }
 
-fn replay_events(args: ReplayArgs) -> Result<()> {
-    let events_dir = args.data_dir.join("events");
+fn params_json(params: &ReplayParams) -> serde_json::Value {
+    json!({
+        "fee_bps": params.fee_bps,
+        "decimals0": params.decimals0,
+        "decimals1": params.decimals1,
+        "token0_usd": params.token0_usd,
+        "capital_usd": params.capital_usd,
+        "rebalance_gas_usd": params.rebalance_gas_usd,
+        "rebalance_slippage_bps": params.rebalance_slippage_bps,
+        "narrow_half_width": params.narrow_half_width,
+        "wide_half_width": params.wide_half_width,
+        "vol_k": params.vol_k,
+        "action_delay_blocks": params.action_delay_blocks,
+        "funding_bps_per_day": params.funding_bps_per_day,
+        "hedge_fraction": params.hedge_fraction,
+    })
+}
+
+fn run_battery(
+    params: &ReplayParams,
+    swaps: &[autopool_backtest::SwapObs],
+) -> Vec<autopool_backtest::PolicyReport> {
+    autopool_backtest::run_baseline_battery_with(
+        swaps,
+        &params.replay_config(),
+        &params.exec_config(),
+        params.narrow_half_width,
+        params.wide_half_width,
+        params.vol_k,
+        params.hedge_fraction,
+    )
+}
+
+fn emit_replay_report(
+    report: ReplayReport,
+    params: &ReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "replay {} swaps={} blocks={}..{} ticks={}..{}",
+        report.label,
+        report.swaps,
+        optional_u64(report.block_first),
+        optional_u64(report.block_last),
+        optional_i32(report.tick_first),
+        optional_i32(report.tick_last),
+    );
+    println!(
+        "config: fee={:.2}bps capital=${:.0} token0=${:.0} gas=${:.3}/reb delay={}blk fund={}bps/d hedge={} narrow=±{} wide=±{}",
+        params.fee_bps,
+        params.capital_usd,
+        params.token0_usd,
+        params.rebalance_gas_usd,
+        params.action_delay_blocks,
+        params.funding_bps_per_day,
+        params.hedge_fraction,
+        params.narrow_half_width,
+        params.wide_half_width,
+    );
+    println!(
+        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
+        "policy",
+        "net_pnl",
+        "vs_hold",
+        "fees",
+        "maxDD",
+        "hedge",
+        "1side_blk",
+        "in_range%",
+        "rebals"
+    );
+    for policy in &report.policies {
+        println!(
+            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>9.2} {:>9} {:>8.1}% {:>8}",
+            policy.policy,
+            policy.net_pnl_usd,
+            policy.net_vs_hold_usd,
+            policy.fee_income_usd,
+            policy.max_drawdown_usd,
+            policy.hedge_pnl_usd,
+            policy.max_one_sided_risk_blocks,
+            policy.time_in_range_pct,
+            policy.rebalances,
+        );
+    }
+    Ok(())
+}
+
+fn replay_events(
+    data_dir: PathBuf,
+    pool_address: Option<String>,
+    symbol: Option<String>,
+    params: &ReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    let events_dir = data_dir.join("events");
     if !events_dir.exists() {
         anyhow::bail!("event directory does not exist: {}", events_dir.display());
     }
 
-    let target = select_replay_target(
-        &events_dir,
-        args.pool_address.as_deref(),
-        args.symbol.as_deref(),
-    )?;
-
+    let target = select_replay_target(&events_dir, pool_address.as_deref(), symbol.as_deref())?;
     let (symbol, swaps) = load_swaps(&target)?;
     if swaps.is_empty() {
         anyhow::bail!("no decodable swap events found in {}", target.display());
@@ -1496,93 +1633,58 @@ fn replay_events(args: ReplayArgs) -> Result<()> {
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "-".to_string());
 
-    let cfg = autopool_backtest::ReplayConfig {
-        decimals0: args.decimals0,
-        decimals1: args.decimals1,
-        fee_fraction: args.fee_bps / 10_000.0,
-        token0_usd: args.token0_usd,
-        capital_usd: args.capital_usd,
-        rebalance_gas_usd: args.rebalance_gas_usd,
-        rebalance_slippage_bps: args.rebalance_slippage_bps,
-        rebalance_swap_fraction: 0.5,
-    };
-
-    let policies = autopool_backtest::run_baseline_battery_with(
-        &swaps,
-        &cfg,
-        args.narrow_half_width,
-        args.wide_half_width,
-        args.vol_k,
-    );
-
+    let policies = run_battery(params, &swaps);
     let report = ReplayReport {
-        pool_address,
-        symbol,
+        label: format!("{symbol} ({pool_address})"),
         swaps: swaps.len(),
         block_first: swaps.first().map(|swap| swap.block),
         block_last: swaps.last().map(|swap| swap.block),
         tick_first: swaps.first().map(|swap| swap.tick),
         tick_last: swaps.last().map(|swap| swap.tick),
-        config: json!({
-            "fee_bps": args.fee_bps,
-            "decimals0": args.decimals0,
-            "decimals1": args.decimals1,
-            "token0_usd": args.token0_usd,
-            "capital_usd": args.capital_usd,
-            "rebalance_gas_usd": args.rebalance_gas_usd,
-            "rebalance_slippage_bps": args.rebalance_slippage_bps,
-            "narrow_half_width": args.narrow_half_width,
-            "wide_half_width": args.wide_half_width,
-            "vol_k": args.vol_k,
-        }),
+        config: params_json(params),
         policies,
     };
+    emit_replay_report(report, params, format)
+}
 
-    if args.format == OutputFormat::Json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+#[allow(clippy::too_many_arguments)]
+fn replay_scenario(
+    scenario: String,
+    start_tick: i32,
+    swaps: usize,
+    move_ticks: i32,
+    swap_size_token0: f64,
+    liquidity: f64,
+    params: &ReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    let kind = autopool_backtest::Scenario::parse(&scenario)
+        .with_context(|| format!("unknown scenario `{scenario}` (calm|pump|crash|chop)"))?;
+    let swap_size_raw = swap_size_token0 * 10f64.powi(params.decimals0 as i32);
+    let stream = autopool_backtest::scenario_swaps(
+        kind,
+        start_tick,
+        swaps,
+        move_ticks,
+        swap_size_raw,
+        liquidity,
+    );
+    if stream.is_empty() {
+        anyhow::bail!("scenario produced no swaps");
     }
 
-    println!(
-        "replay {} ({}) swaps={} blocks={}..{} ticks={}..{}",
-        report.symbol,
-        report.pool_address,
-        report.swaps,
-        optional_u64(report.block_first),
-        optional_u64(report.block_last),
-        optional_i32(report.tick_first),
-        optional_i32(report.tick_last),
-    );
-    println!(
-        "config: fee={:.2}bps capital=${:.0} token0=${:.0} gas=${:.3}/reb narrow=±{} wide=±{} vol_k={}",
-        args.fee_bps,
-        args.capital_usd,
-        args.token0_usd,
-        args.rebalance_gas_usd,
-        args.narrow_half_width,
-        args.wide_half_width,
-        args.vol_k,
-    );
-    println!(
-        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>10} {:>10} {:>8} {:>9}",
-        "policy", "net_pnl", "vs_hold", "fees", "il", "gas+slip", "in_range%", "rebals", "avg_w"
-    );
-    for policy in &report.policies {
-        println!(
-            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>10.2} {:>9.1}% {:>8} {:>9.0}",
-            policy.policy,
-            policy.net_pnl_usd,
-            policy.net_vs_hold_usd,
-            policy.fee_income_usd,
-            policy.inventory_il_usd,
-            policy.gas_cost_usd + policy.slippage_cost_usd,
-            policy.time_in_range_pct,
-            policy.rebalances,
-            policy.avg_half_width_ticks,
-        );
-    }
-
-    Ok(())
+    let policies = run_battery(params, &stream);
+    let report = ReplayReport {
+        label: format!("scenario:{scenario} move={move_ticks}t"),
+        swaps: stream.len(),
+        block_first: stream.first().map(|swap| swap.block),
+        block_last: stream.last().map(|swap| swap.block),
+        tick_first: stream.first().map(|swap| swap.tick),
+        tick_last: stream.last().map(|swap| swap.tick),
+        config: params_json(params),
+        policies,
+    };
+    emit_replay_report(report, params, format)
 }
 
 /// Find the events.jsonl to replay: by explicit pool address, by symbol match, or

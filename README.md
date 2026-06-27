@@ -49,18 +49,23 @@ BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- sample-s
 BASE_RPC_URL=https://your-base-rpc.example cargo run -p autopool-cli -- backfill-slipstream-events --profile opportunistic --include-symbol WETH-AERO --include-symbol WETH-USDC --lookback-blocks 7200 --max-blocks-per-run 200 --log-chunk-blocks 10 --poll-seconds 30 --iterations 1
 cargo run -p autopool-cli -- summarize-slipstream-events --data-dir data/base/aerodrome
 cargo run -p autopool-cli -- replay-events --symbol WETH-AERO --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 100
+cargo run -p autopool-cli -- replay-scenario --scenario crash --move-ticks 6000 --fee-bps 21.25 --token0-usd 1574 --narrow-half-width 300 --action-delay-blocks 3 --funding-bps-per-day 10
 ```
 
 The `replay-events` command turns collected swap events into LP profit-and-loss
-for a battery of baseline range policies (hold, passive-wide, narrow-static,
-narrow-rebalance, vol-scaled) with PnL attribution into fees, inventory IL, gas,
-and slippage. It is the first strategy-research environment (architecture
-Milestone 3).
+for a battery of range policies (hold, passive-wide, narrow-static,
+narrow-rebalance, vol-scaled, hard-exit-stop, hedged-narrow) with PnL attribution
+into fees, inventory IL, gas, slippage, plus tail metrics (max drawdown, longest
+forced risk-asset hold, toxic fees, hedge PnL) and an execution-latency model. It
+is the strategy-research environment (architecture Milestone 3). `replay-scenario`
+runs the same battery against synthetic calm/pump/crash/chop paths.
 
-See `docs/first-data-analysis.md` for the first Base / Aerodrome event-readout, and
-`docs/replay-weth-aero.md` for the first range-policy replay results (fee density
-dominates a calm window; rebalancing-on-exit is a tax) and the discovery of the
-real active WETH-USDC pool.
+See `docs/first-data-analysis.md` for the first Base / Aerodrome event-readout;
+`docs/replay-weth-aero.md` for the first range-policy replay (fee density dominates
+a calm window; rebalancing-on-exit is a tax) plus the discovery of the real active
+WETH-USDC pool; and `docs/tail-risk-scenarios.md` for the down-crash / chop /
+hedging stress tests (one-way hard-exit and a short hedge cap the down-tail;
+mechanical rebalancing is ruinous in crash and chop).
 
 ## External References
 
