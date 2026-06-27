@@ -59,12 +59,54 @@ Targeted next experiment:
    at ~2 swaps/kblk a few hundred swaps needs ~150–200k blocks.
 3. Replay + multi-path: does `fee − LVR` stay large *and* net beat hold after churn?
 
-## Conclusion
+## CTR-USDC (100 bps) result
 
-For Base / Aerodrome Slipstream, active concentrated LP is structurally thin-margin:
-its active pools are all ≤ ~21 bps, where alpha is either negative (5 bps) or
-churn-eaten (21 bps). The single high-fee/volatile exception is **CTR-USDC (100 bps)**
-— the one place net alpha might survive, and the clear next test. If CTR-USDC also
-fails, the rigorous conclusion is that this venue does not support active LP and the
-search should move to higher-fee-density venues/chains (or settle for passive-wide,
-which at least beat hold on ~72–86% of paths).
+Collected 322 swaps over ~200k blocks (token0 = CTR 18dec, token1 = USDC 6dec, so
+replayed with `--invert`: USDC becomes the token0 numeraire, CTR the risk token1).
+
+**Gross alpha is large and positive at 100 bps.** Single window (a CTR down-trend):
+narrow_rebalance fee − LVR = **+$178** on 322 swaps = **$0.55/swap**, ~6× WETH-AERO's
+$0.09/swap. So the fee tier does exactly what the threshold analysis predicted — it
+lifts gross alpha well above the LVR bleed.
+
+Demeaned multi-path (200 paths, martingale), net PnL:
+
+| policy | mean net | std | fee − LVR | win% hold |
+| --- | ---: | ---: | ---: | ---: |
+| **passive_wide** | **+116** | 229 | +23 | **83%** |
+| hold_50_50 | +103 | 236 | 0 | — |
+| narrow_static | +1 | 220 | +42 | 37% |
+| hard_exit_stop | -47 | 115 | +85 | 23% |
+| narrow_rebalance | -146 | 211 | **+179** | 1% |
+| delta_hedged | -204 | **74** | +179 | 15% |
+
+Two findings:
+
+1. **Higher fee does NOT rescue narrow rebalancing.** Despite the largest gross alpha
+   yet (fee − LVR +$179), narrow_rebalance still net-loses (−$146): CTR is *more
+   volatile* (tick_vol 4.58), so the ±100 band is crossed even more often and the
+   rebalance churn grows with volatility. High-fee pools are high-vol, so churn
+   tracks the fee — the rebalancing approach loses at every tier.
+2. **Higher fee DOES pay for low-churn LP.** `passive_wide` has positive expectancy
+   (+$116) and beats hold on **83%** of paths — up from +$10 / 72% on WETH-AERO
+   (21 bps). `narrow_static` rises from −$98 (WETH-AERO) to ~breakeven. Low-churn LP
+   improves materially with fee density.
+
+## Final synthesis
+
+Across 5 / 21 / 100 bps, three pools, single windows and bootstrapped distributions:
+
+- **Active narrow *rebalancing* never wins.** On-chain churn cost scales with
+  volatility, and so does fee, so churn eats the gross alpha at every fee tier
+  (5 bps: no alpha; 21 bps & 100 bps: alpha exists but churn-eaten).
+- **The deployable edge is low-churn LP on a high-fee-density active pool.** A wide,
+  rarely-rebalanced band (`passive_wide`) is the only consistently
+  positive-expectancy policy, and it pays materially better as fee density rises
+  (+$10/72% at 21 bps → +$116/83% at 100 bps).
+- **Hedging is for variance/tail, not mean.** `delta_hedged` always has the lowest
+  variance/drawdown but inherits the churn of whatever range policy it wraps; pair it
+  with a *wide* band, not a narrow one, to get low-churn + low-beta + fee harvest.
+
+So the recommended live shape is: **CTR-USDC-style (highest-fee active pool) + a wide
+band + minimal rebalancing + optional delta hedge for variance.** The next build is a
+*delta-hedged passive-wide* policy and a scan for more 100 bps-class active pools.
