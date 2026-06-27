@@ -386,6 +386,26 @@ struct ReplayParams {
     /// Haircut on reward income for liquidation cost (0.1 keeps 90%).
     #[arg(long, default_value_t = 0.0)]
     reward_haircut: f64,
+    /// Invert token0/token1 so the stable/numeraire leg (if it is token1, e.g.
+    /// USDC in CTR-USDC) becomes token0. Swap --decimals0/--decimals1 accordingly.
+    #[arg(long, default_value_t = false)]
+    invert: bool,
+}
+
+impl ReplayParams {
+    /// Load swaps for a pool, applying token0/token1 inversion if requested.
+    fn load_swaps(
+        &self,
+        target: &std::path::Path,
+    ) -> Result<(String, Vec<autopool_backtest::SwapObs>)> {
+        let (symbol, mut swaps) = load_swaps(target)?;
+        if self.invert {
+            for swap in &mut swaps {
+                *swap = swap.inverted();
+            }
+        }
+        Ok((symbol, swaps))
+    }
 }
 
 impl ReplayParams {
@@ -1759,6 +1779,7 @@ fn params_json(params: &ReplayParams) -> serde_json::Value {
         "trend_exit_threshold": params.trend_exit_threshold,
         "reward_apr": params.reward_apr,
         "reward_haircut": params.reward_haircut,
+        "invert": params.invert,
     })
 }
 
@@ -1843,7 +1864,7 @@ fn replay_events(
     }
 
     let target = select_replay_target(&events_dir, pool_address.as_deref(), symbol.as_deref())?;
-    let (symbol, swaps) = load_swaps(&target)?;
+    let (symbol, swaps) = params.load_swaps(&target)?;
     if swaps.is_empty() {
         anyhow::bail!("no decodable swap events found in {}", target.display());
     }
@@ -1931,7 +1952,7 @@ fn walk_forward_cmd(args: WalkForwardArgs) -> Result<()> {
         args.pool_address.as_deref(),
         args.symbol.as_deref(),
     )?;
-    let (symbol, swaps) = load_swaps(&target)?;
+    let (symbol, swaps) = args.params.load_swaps(&target)?;
     if swaps.is_empty() {
         anyhow::bail!("no decodable swap events found in {}", target.display());
     }
@@ -2019,7 +2040,7 @@ fn multi_path_cmd(
         anyhow::bail!("event directory does not exist: {}", events_dir.display());
     }
     let target = select_replay_target(&events_dir, pool_address.as_deref(), symbol.as_deref())?;
-    let (symbol, swaps) = load_swaps(&target)?;
+    let (symbol, swaps) = params.load_swaps(&target)?;
     if swaps.len() < block_len.max(2) {
         anyhow::bail!("not enough swaps ({}) to bootstrap", swaps.len());
     }

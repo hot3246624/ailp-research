@@ -54,6 +54,25 @@ impl SwapObs {
             (self.amount1.max(0.0), false)
         }
     }
+
+    /// Return this swap with token0/token1 roles swapped (price inverted). Lets a
+    /// pool whose stable/numeraire leg is token1 (e.g. CTR-USDC, USDC = token1) be
+    /// replayed with the stable as token0, so the engine's token0-numeraire and
+    /// `risk_asset_is_token1` conventions hold. Decimals must be swapped by caller.
+    pub fn inverted(self) -> SwapObs {
+        let two_pow_192 = TWO_POW_96 * TWO_POW_96;
+        SwapObs {
+            amount0: self.amount1,
+            amount1: self.amount0,
+            sqrt_price_x96: if self.sqrt_price_x96 > 0.0 {
+                two_pow_192 / self.sqrt_price_x96
+            } else {
+                0.0
+            },
+            tick: -self.tick,
+            ..self
+        }
+    }
 }
 
 const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0; // 2^96
@@ -1900,6 +1919,27 @@ mod tests {
             "walk-forward should cap OOS drawdown, got {}",
             report.oos_max_drawdown_usd
         );
+    }
+
+    #[test]
+    fn inverted_swap_flips_price_and_amounts() {
+        let data = concat!(
+            "0x",
+            "0000000000000000000000000000000000000000000000000c44307e19296880",
+            "ffffffffffffffffffffffffffffffffffffffffffffff62c8758726b99a9885",
+            "0000000000000000000000000000000000000039569350230507fbd1d71113b1",
+            "000000000000000000000000000000000000000000039aeded48a3857e640b9b",
+            "0000000000000000000000000000000000000000000000000000000000013c57"
+        );
+        let obs = decode_swap_obs(data, 100, 1).unwrap();
+        let inv = obs.inverted();
+        assert_eq!(inv.tick, -obs.tick);
+        assert_eq!(inv.amount0, obs.amount1);
+        assert_eq!(inv.amount1, obs.amount0);
+        // Inverted price is the reciprocal of the original.
+        assert!((inv.price_raw() * obs.price_raw() - 1.0).abs() < 1e-6);
+        // Double inversion restores the original price.
+        assert!((inv.inverted().price_raw() - obs.price_raw()).abs() / obs.price_raw() < 1e-9);
     }
 
     #[test]
