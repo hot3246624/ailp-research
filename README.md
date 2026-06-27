@@ -85,7 +85,11 @@ bootstrap (`multi-path`) — across the realistic volatility×cost distribution 
 delta hedge collapses net-PnL variance (lowest std) but does not fix rebalance
 churn, so narrow rebalancing policies net-lose despite positive gross fee−LVR, and
 the robust positive-expectancy LP is *low-churn* (passive-wide beats hold 72% of
-paths). 21 bps is too thin — find higher-fee/ranging pools.
+paths). 21 bps is too thin — find higher-fee/ranging pools; and `docs/pool-pivot.md`
+for the fee-density threshold (5 bps: fee−LVR < 0, no alpha; 21 bps: alpha but
+churn-eaten; need higher fee) and the robust scan showing Slipstream's active pools
+are all low-fee while high-fee pools are inactive — CTR-USDC (100 bps, real vol) is
+the one candidate worth a dedicated test.
 
 ## External References
 
