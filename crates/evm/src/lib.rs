@@ -360,7 +360,7 @@ impl JsonRpcClient {
 
         // Free RPC tiers rate-limit (HTTP 429) and occasionally 503. Retry with
         // exponential backoff so the indexers and scans coexist on one endpoint.
-        const MAX_ATTEMPTS: u32 = 6;
+        const MAX_ATTEMPTS: u32 = 9;
         let mut last_err = EvmError::Provider("no attempts".to_string());
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
@@ -395,13 +395,18 @@ impl JsonRpcClient {
             let response = serde_json::from_str::<Value>(&body_text)
                 .map_err(|err| EvmError::InvalidRpcResponse(err.to_string()))?;
             if let Some(error) = response.get("error") {
-                // -32005 / "capacity" style errors are rate limits; retry those too.
-                let text = error.to_string();
-                if text.contains("rate") || text.contains("capacity") || text.contains("-32005") {
-                    last_err = EvmError::Rpc(text);
+                // Rate-limit errors come in many shapes across providers; retry those.
+                let text = error.to_string().to_ascii_lowercase();
+                let rate_limited = ["rate", "limit", "too many", "capacity", "exceeded"]
+                    .iter()
+                    .any(|needle| text.contains(needle))
+                    || text.contains("-32005")
+                    || text.contains("-32016");
+                if rate_limited {
+                    last_err = EvmError::Rpc(error.to_string());
                     continue;
                 }
-                return Err(EvmError::Rpc(text));
+                return Err(EvmError::Rpc(error.to_string()));
             }
 
             return response

@@ -1356,6 +1356,8 @@ async fn resolve_pilot_candidates(
                 });
                 break;
             }
+            // Pace factory probes so the burst does not trip public-RPC rate limits.
+            tokio::time::sleep(Duration::from_millis(60)).await;
         }
     }
 
