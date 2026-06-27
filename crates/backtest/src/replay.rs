@@ -1490,6 +1490,180 @@ pub fn walk_forward(
     }
 }
 
+/// Aggregate distribution of one policy's outcome across bootstrapped paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyDistribution {
+    pub policy: String,
+    pub mean_net_usd: f64,
+    pub std_net_usd: f64,
+    pub p05_net_usd: f64,
+    pub p50_net_usd: f64,
+    pub p95_net_usd: f64,
+    /// Fraction of paths where this policy's net beat hold's net.
+    pub win_rate_vs_hold: f64,
+    pub mean_fee_minus_lvr_usd: f64,
+    pub mean_max_drawdown_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiPathReport {
+    pub n_paths: usize,
+    pub swaps_per_path: usize,
+    pub block_len: usize,
+    pub policies: Vec<PolicyDistribution>,
+}
+
+/// Moving-block bootstrap of a real swap stream: resample contiguous blocks of
+/// (tick-increment, amounts, liquidity, block-gap), accumulate into a new tick
+/// path, and rebuild swaps. Preserves local volatility/microstructure and the
+/// direction-size coupling while randomizing the overall realized direction.
+fn bootstrap_path(src: &[SwapObs], n: usize, block_len: usize, rng: &mut u64) -> Vec<SwapObs> {
+    let m = src.len();
+    let block_len = block_len.max(1);
+    let mut out: Vec<SwapObs> = Vec::with_capacity(n);
+    let mut cur_tick = src[0].tick;
+    let mut cur_block = src[0].block;
+    while out.len() < n {
+        *rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let bs = ((*rng >> 33) as usize) % m;
+        for k in 0..block_len {
+            let idx = bs + k;
+            if idx >= m {
+                break;
+            }
+            let s = &src[idx];
+            let dtick = if idx == 0 {
+                0
+            } else {
+                src[idx].tick - src[idx - 1].tick
+            };
+            let dblock = if idx == 0 {
+                1
+            } else {
+                src[idx].block.saturating_sub(src[idx - 1].block)
+            };
+            cur_tick += dtick;
+            cur_block += dblock;
+            let sqrt = sqrt_ratio_at_tick(cur_tick);
+            out.push(SwapObs {
+                block: cur_block,
+                log_index: 0,
+                amount0: s.amount0,
+                amount1: s.amount1,
+                sqrt_price_x96: sqrt * TWO_POW_96,
+                liquidity: s.liquidity,
+                tick: cur_tick,
+            });
+            if out.len() >= n {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * pct / 100.0).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Run the baseline battery over `n_paths` bootstrapped resamples of the real swap
+/// stream and report each policy's outcome distribution. The point: a delta-hedged
+/// LP should show a tight, positive net distribution (≈ fee − LVR) while an
+/// unhedged LP shows a wide one (it swings with whichever direction each path took).
+#[allow(clippy::too_many_arguments)]
+pub fn multi_path_eval(
+    swaps: &[SwapObs],
+    cfg: &ReplayConfig,
+    exec: &ExecConfig,
+    narrow_half_width: i32,
+    wide_half_width: i32,
+    vol_k: f64,
+    hedge_fraction: f64,
+    adaptive_trend_threshold: f64,
+    n_paths: usize,
+    block_len: usize,
+    seed: u64,
+) -> MultiPathReport {
+    let n = swaps.len();
+    let mut rng = seed | 1;
+
+    let mut names: Vec<String> = Vec::new();
+    let mut nets: Vec<Vec<f64>> = Vec::new();
+    let mut fee_lvr: Vec<f64> = Vec::new();
+    let mut dd: Vec<f64> = Vec::new();
+    let mut wins: Vec<u64> = Vec::new();
+
+    for _ in 0..n_paths {
+        let path = bootstrap_path(swaps, n, block_len, &mut rng);
+        let reports = run_baseline_battery_with(
+            &path,
+            cfg,
+            exec,
+            narrow_half_width,
+            wide_half_width,
+            vol_k,
+            hedge_fraction,
+            adaptive_trend_threshold,
+        );
+        if names.is_empty() {
+            names = reports.iter().map(|r| r.policy.clone()).collect();
+            nets = vec![Vec::with_capacity(n_paths); reports.len()];
+            fee_lvr = vec![0.0; reports.len()];
+            dd = vec![0.0; reports.len()];
+            wins = vec![0; reports.len()];
+        }
+        let hold_net = reports
+            .iter()
+            .find(|r| r.policy == "hold_50_50")
+            .map(|r| r.net_pnl_usd)
+            .unwrap_or(0.0);
+        for (j, r) in reports.iter().enumerate() {
+            nets[j].push(r.net_pnl_usd);
+            fee_lvr[j] += r.fee_minus_lvr_usd;
+            dd[j] += r.max_drawdown_usd;
+            if r.net_pnl_usd > hold_net {
+                wins[j] += 1;
+            }
+        }
+    }
+
+    let paths = n_paths.max(1) as f64;
+    let policies = names
+        .into_iter()
+        .enumerate()
+        .map(|(j, policy)| {
+            let mut sorted = nets[j].clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mean = nets[j].iter().sum::<f64>() / paths;
+            let var = nets[j].iter().map(|x| (x - mean).powi(2)).sum::<f64>() / paths;
+            PolicyDistribution {
+                policy,
+                mean_net_usd: mean,
+                std_net_usd: var.sqrt(),
+                p05_net_usd: percentile(&sorted, 5.0),
+                p50_net_usd: percentile(&sorted, 50.0),
+                p95_net_usd: percentile(&sorted, 95.0),
+                win_rate_vs_hold: wins[j] as f64 / paths,
+                mean_fee_minus_lvr_usd: fee_lvr[j] / paths,
+                mean_max_drawdown_usd: dd[j] / paths,
+            }
+        })
+        .collect();
+
+    MultiPathReport {
+        n_paths,
+        swaps_per_path: n,
+        block_len,
+        policies,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1708,6 +1882,40 @@ mod tests {
             "walk-forward should cap OOS drawdown, got {}",
             report.oos_max_drawdown_usd
         );
+    }
+
+    #[test]
+    fn multi_path_delta_hedge_reduces_variance() {
+        let cfg = cfg();
+        let exec = ExecConfig::default();
+        // Base with directional blocks in both directions (pump then crash) so that
+        // bootstrap reorderings produce paths with varied net direction — that is
+        // the beta variance a delta hedge is meant to remove.
+        let mut base = scenario_swaps(Scenario::Pump, 80_000, 800, 4_000, 1e18, 1e24);
+        let crash = scenario_swaps(Scenario::Crash, 80_000, 800, 4_000, 1e18, 1e24);
+        base.extend(crash);
+        for (i, s) in base.iter_mut().enumerate() {
+            s.block = 1000 + i as u64;
+        }
+        let report = multi_path_eval(&base, &cfg, &exec, 300, 6000, 1.5, 1.0, 6.0, 80, 50, 42);
+        let pick = |name: &str| {
+            report
+                .policies
+                .iter()
+                .find(|p| p.policy == name)
+                .unwrap()
+                .clone()
+        };
+        let delta = pick("delta_hedged");
+        let unhedged = pick("narrow_rebalance");
+        // The whole point: hedging collapses the directional variance of net PnL.
+        assert!(
+            delta.std_net_usd < unhedged.std_net_usd,
+            "delta-hedged net std {} should be below unhedged {}",
+            delta.std_net_usd,
+            unhedged.std_net_usd
+        );
+        assert_eq!(report.n_paths, 80);
     }
 
     #[test]

@@ -304,6 +304,30 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Moving-block bootstrap of a collected swap stream: run the policy battery over
+    /// many resampled paths and report each policy's net-PnL distribution. Shows that
+    /// a delta-hedged LP harvests fee−LVR with low variance while unhedged swings
+    /// with whichever direction each path took.
+    MultiPath {
+        #[arg(long, default_value = "data/base/aerodrome-trend")]
+        data_dir: PathBuf,
+        #[arg(long)]
+        pool_address: Option<String>,
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Number of bootstrapped paths.
+        #[arg(long, default_value_t = 200)]
+        paths: usize,
+        /// Moving-block length, in swaps (preserves local microstructure).
+        #[arg(long, default_value_t = 100)]
+        block_len: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[command(flatten)]
+        params: ReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
 }
 
 /// Shared economic + execution parameters for the replay commands.
@@ -625,6 +649,25 @@ async fn main() -> Result<()> {
             })
             .await?
         }
+        Command::MultiPath {
+            data_dir,
+            pool_address,
+            symbol,
+            paths,
+            block_len,
+            seed,
+            params,
+            format,
+        } => multi_path_cmd(
+            data_dir,
+            pool_address,
+            symbol,
+            paths,
+            block_len,
+            seed,
+            &params,
+            format,
+        )?,
     }
 
     Ok(())
@@ -1947,6 +1990,73 @@ fn walk_forward_cmd(args: WalkForwardArgs) -> Result<()> {
         report.fixed_adaptive_net_usd, report.static_net_usd, report.hold_net_usd
     );
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn multi_path_cmd(
+    data_dir: PathBuf,
+    pool_address: Option<String>,
+    symbol: Option<String>,
+    paths: usize,
+    block_len: usize,
+    seed: u64,
+    params: &ReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    let events_dir = data_dir.join("events");
+    if !events_dir.exists() {
+        anyhow::bail!("event directory does not exist: {}", events_dir.display());
+    }
+    let target = select_replay_target(&events_dir, pool_address.as_deref(), symbol.as_deref())?;
+    let (symbol, swaps) = load_swaps(&target)?;
+    if swaps.len() < block_len.max(2) {
+        anyhow::bail!("not enough swaps ({}) to bootstrap", swaps.len());
+    }
+
+    let report = autopool_backtest::multi_path_eval(
+        &swaps,
+        &params.replay_config(),
+        &params.exec_config(),
+        params.narrow_half_width,
+        params.wide_half_width,
+        params.vol_k,
+        params.hedge_fraction,
+        params.trend_exit_threshold,
+        paths,
+        block_len,
+        seed,
+    );
+
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "multi-path {symbol} swaps/path={} paths={} block_len={} (bootstrap of {} real swaps)",
+        report.swaps_per_path,
+        report.n_paths,
+        report.block_len,
+        swaps.len()
+    );
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10}",
+        "policy", "mean_net", "std_net", "p05", "p95", "fee-LVR", "win%hold", "meanDD"
+    );
+    for p in &report.policies {
+        println!(
+            "{:<22} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.0}% {:>10.2}",
+            p.policy,
+            p.mean_net_usd,
+            p.std_net_usd,
+            p.p05_net_usd,
+            p.p95_net_usd,
+            p.mean_fee_minus_lvr_usd,
+            p.win_rate_vs_hold * 100.0,
+            p.mean_max_drawdown_usd,
+        );
+    }
     Ok(())
 }
 
