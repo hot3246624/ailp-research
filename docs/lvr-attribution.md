@@ -76,6 +76,59 @@ the strongest argument yet for pairing the LP with a delta hedge rather than run
 it naked. The LP-on/off gate (calm-only LPing) is the no-derivatives way to
 approximate the same thing.
 
+## Dynamic delta hedge — the alpha harvester (and its honest cost)
+
+`DeltaHedged` shorts the position's *current* AERO delta (its token1 holding) and
+rehedges as that delta drifts (band = 25% of entry exposure), with per-swap MTM +
+funding. This is the build the LVR analysis pointed to.
+
+**Crash scenario** (AERO −45%, ±300, 3-blk latency, 10 bps/day funding):
+
+| policy | net | vs hold | max DD |
+| --- | ---: | ---: | ---: |
+| hold_50_50 | -2,256 | 0 | 2,263 |
+| narrow_rebalance (unhedged) | -3,758 | -1,502 | 3,787 |
+| hedged_narrow (static) | -1,502 | +753 | 1,525 |
+| **delta_hedged (dynamic)** | **-657** | **+1,598** | **673** |
+
+Dynamic hedging is decisively the best crash protection: ~6× less drawdown than
+unhedged and far better than the static hedge, because the dynamic short grows with
+the AERO bag the LP accumulates on the way down.
+
+**Real up-trend window** (AERO +~18%):
+
+| policy | net | vs hold | max DD |
+| --- | ---: | ---: | ---: |
+| hold_50_50 | +1,145 | 0 | 283 |
+| narrow_rebalance (unhedged) | +430 | -715 | 277 |
+| **delta_hedged** | **-590** | -1,736 | 611 |
+
+Here the hedge **hurts**: it shorts AERO, which rose, so it gives up the favorable
+move and pays funding/rehedge cost on top.
+
+### The honest framing
+
+Delta-neutral strips beta in **both** directions to isolate the fee−LVR alpha:
+
+- it **wins big in crashes** (removes the adverse inventory beta) and
+- it **loses in favorable trends** (removes the beta you'd have wanted).
+
+You cannot know ex ante whether a trend will be favorable or adverse — that is a
+directional view. So the dynamic delta hedge is **not** a return-maximizer on any
+single path; it is a **pure-alpha / variance-reduction** play: in expectation over
+mixed paths its net ≈ `fee − LVR` (positive), with the directional swings removed
+and the crash tail capped. Unhedged LP, by contrast, swings ±hugely with whichever
+direction the market happened to take.
+
+So the strategy menu is now clear and evidence-based:
+
+1. **No view, want low variance + crash safety** → delta-hedged LP (harvest alpha,
+   cap the tail, accept giving up lucky trends).
+2. **No view, no derivatives** → the LP-on/off **gate** (calm-only LPing) approximates
+   the same de-risking without a perp.
+3. **Directional view** → unhedged LP is a leveraged bet on that view; only justified
+   when you actually have the view.
+
 ## Caveats
 
 - LVR is computed discretely per swap (old-holdings-at-new-price); it is an
