@@ -118,6 +118,11 @@ shape is high fee / low volatility with small capacity, WETH-USDC 200 bps passes
 impact gates around $1k-$5k but not $10k, and the project is not ready for unattended
 live trading until monitoring, shadow PnL, hedge integration, kill-switches, and a
 manual guarded execution path are complete.
+`docs/solana-pivot.md` opens the next research line: Base proved the execution
+machinery but has a thin candidate surface, while Solana currently exposes many more
+organic high-APY LP candidates. The new `solana-universe` command ranks Raydium/Orca/
+Kamino candidates by organic base APY, TVL, volume, reward share, and concentrated
+liquidity suitability.
 
 ## External References
 

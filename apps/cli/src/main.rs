@@ -4,7 +4,7 @@ use autopool_aerodrome::{
     base_slipstream_factories_latest_first, build_pilot_universe_for_profile,
 };
 use autopool_core::YieldSnapshot;
-use autopool_defillama::{DefiLlamaClient, PoolFilter};
+use autopool_defillama::{DefiLlamaClient, DefiLlamaPool, PoolFilter};
 use autopool_evm::{BURN_TOPIC, COLLECT_TOPIC, JsonRpcClient, MINT_TOPIC, SWAP_TOPIC};
 use autopool_strategy::WeightedRiskModel;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -78,6 +78,37 @@ enum Command {
         #[arg(long = "include-symbol")]
         include_symbols: Vec<String>,
         #[arg(long, default_value_t = 12)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Rank Solana LP candidates from DeFiLlama. This is the first Solana research
+    /// pass: organic base APY, TVL, volume/Tvl, reward share, and fee tier when
+    /// available. It does not imply the pool is executable yet.
+    SolanaUniverse {
+        #[arg(long, default_value_t = 50_000.0)]
+        min_tvl_usd: f64,
+        #[arg(long, default_value_t = 25_000.0)]
+        min_volume_usd_1d: f64,
+        #[arg(long, default_value_t = 20.0)]
+        min_base_apy: f64,
+        #[arg(long, default_value_t = 0.25)]
+        max_reward_share: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_fee_bps: f64,
+        #[arg(long, default_value_t = false)]
+        include_outliers: bool,
+        #[arg(long, default_value_t = false)]
+        concentrated_only: bool,
+        #[arg(long, default_value_t = false)]
+        blue_chip_only: bool,
+        #[arg(long = "project", default_values_t = [
+            "raydium-amm".to_string(),
+            "orca-dex".to_string(),
+            "kamino-liquidity".to_string()
+        ])]
+        projects: Vec<String>,
+        #[arg(long, default_value_t = 25)]
         limit: usize,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
@@ -555,6 +586,34 @@ async fn main() -> Result<()> {
                 limit,
                 format,
             )
+            .await?
+        }
+        Command::SolanaUniverse {
+            min_tvl_usd,
+            min_volume_usd_1d,
+            min_base_apy,
+            max_reward_share,
+            min_fee_bps,
+            include_outliers,
+            concentrated_only,
+            blue_chip_only,
+            projects,
+            limit,
+            format,
+        } => {
+            solana_universe(SolanaUniverseArgs {
+                min_tvl_usd,
+                min_volume_usd_1d,
+                min_base_apy,
+                max_reward_share,
+                min_fee_bps,
+                include_outliers,
+                concentrated_only,
+                blue_chip_only,
+                projects,
+                limit,
+                format,
+            })
             .await?
         }
         Command::SampleBaseNetwork {
@@ -1039,6 +1098,233 @@ async fn pilot_universe(
             candidate.apy_base,
             candidate.apy_reward,
             candidate.reward_share,
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SolanaUniverseArgs {
+    min_tvl_usd: f64,
+    min_volume_usd_1d: f64,
+    min_base_apy: f64,
+    max_reward_share: f64,
+    min_fee_bps: f64,
+    include_outliers: bool,
+    concentrated_only: bool,
+    blue_chip_only: bool,
+    projects: Vec<String>,
+    limit: usize,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct SolanaCandidateRow {
+    project: String,
+    protocol: String,
+    symbol: String,
+    pool_id: String,
+    pool_meta: Option<String>,
+    fee_bps: Option<f64>,
+    tvl_usd: f64,
+    volume_usd_1d: f64,
+    volume_usd_7d: f64,
+    volume_tvl_1d: f64,
+    apy: f64,
+    apy_base: f64,
+    apy_reward: f64,
+    reward_share: f64,
+    stablecoin: Option<bool>,
+    outlier: bool,
+    underlying_tokens: Vec<String>,
+    blue_chip_score: f64,
+    deployability_score: f64,
+    notes: Vec<String>,
+}
+
+fn reward_share(apy: f64, apy_reward: f64) -> f64 {
+    if apy.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        (apy_reward.max(0.0) / apy.max(0.0)).clamp(0.0, 1.0)
+    }
+}
+
+fn blue_chip_score(symbol: &str) -> f64 {
+    let key = symbol.to_ascii_uppercase();
+    let majors = [
+        "SOL", "WSOL", "USDC", "USDT", "JUP", "JTO", "JITOSOL", "BONK", "WIF",
+    ];
+    let count = key
+        .split(['-', '/', '_'])
+        .filter(|part| majors.contains(part))
+        .count();
+    match count {
+        0 => 0.0,
+        1 => 0.5,
+        _ => 1.0,
+    }
+}
+
+fn solana_candidate_row(pool: DefiLlamaPool) -> SolanaCandidateRow {
+    let snapshot = pool.clone().into_snapshot();
+    let tvl_usd = pool.tvl_usd.unwrap_or(0.0);
+    let volume_usd_1d = pool.volume_usd_1d.unwrap_or(0.0);
+    let volume_usd_7d = pool.volume_usd_7d.unwrap_or(0.0);
+    let apy = pool.apy.unwrap_or(0.0);
+    let apy_base = pool.apy_base.unwrap_or(0.0);
+    let apy_reward = pool.apy_reward.unwrap_or(0.0);
+    let reward_share = reward_share(apy, apy_reward);
+    let volume_tvl_1d = if tvl_usd > 0.0 {
+        volume_usd_1d / tvl_usd
+    } else {
+        0.0
+    };
+    let blue_chip_score = blue_chip_score(&pool.symbol);
+    let liquidity_weight = (1.0 + tvl_usd / 100_000.0).ln();
+    let flow_weight = (1.0 + volume_usd_1d / 100_000.0).ln();
+    let organic_weight = 1.0 - reward_share;
+    let blue_chip_weight = 0.5 + blue_chip_score;
+    let deployability_score = apy_base.max(0.0)
+        * liquidity_weight.max(0.0)
+        * flow_weight.max(0.0)
+        * organic_weight.max(0.0)
+        * blue_chip_weight;
+    let mut notes = Vec::new();
+    if pool.outlier.unwrap_or(false) {
+        notes.push("defillama_outlier".to_string());
+    }
+    if reward_share > 0.25 {
+        notes.push("reward_heavy".to_string());
+    }
+    if volume_tvl_1d > 1.0 {
+        notes.push("high_turnover".to_string());
+    }
+    if blue_chip_score < 0.5 {
+        notes.push("long_tail_inventory".to_string());
+    }
+    if snapshot.pool.fee_tier_bps.is_none() {
+        notes.push("fee_tier_missing".to_string());
+    }
+
+    SolanaCandidateRow {
+        project: pool.project,
+        protocol: format!("{:?}", snapshot.pool.protocol),
+        symbol: pool.symbol,
+        pool_id: pool.pool,
+        pool_meta: pool.pool_meta,
+        fee_bps: snapshot.pool.fee_tier_bps,
+        tvl_usd,
+        volume_usd_1d,
+        volume_usd_7d,
+        volume_tvl_1d,
+        apy,
+        apy_base,
+        apy_reward,
+        reward_share,
+        stablecoin: pool.stablecoin,
+        outlier: pool.outlier.unwrap_or(false),
+        underlying_tokens: pool.underlying_tokens.unwrap_or_default(),
+        blue_chip_score,
+        deployability_score,
+        notes,
+    }
+}
+
+fn is_concentrated_solana_candidate(row: &SolanaCandidateRow) -> bool {
+    let project = row.project.to_ascii_lowercase();
+    let meta = row.pool_meta.as_deref().unwrap_or("").to_ascii_lowercase();
+    match project.as_str() {
+        "raydium-amm" => meta.contains("concentrated"),
+        "orca-dex" => true,
+        "kamino-liquidity" => true,
+        "meteora" | "meteora-dlmm" => true,
+        _ => false,
+    }
+}
+
+async fn solana_universe(args: SolanaUniverseArgs) -> Result<()> {
+    let client = DefiLlamaClient::default();
+    let projects = args
+        .projects
+        .iter()
+        .map(|project| project.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut rows = client
+        .fetch_pools()
+        .await?
+        .into_iter()
+        .filter(|pool| pool.chain.eq_ignore_ascii_case("Solana"))
+        .filter(|pool| projects.is_empty() || projects.contains(&pool.project.to_ascii_lowercase()))
+        .filter(|pool| {
+            pool.il_risk.as_deref() == Some("yes") || pool.exposure.as_deref() == Some("multi")
+        })
+        .map(solana_candidate_row)
+        .filter(|row| args.include_outliers || !row.outlier)
+        .filter(|row| row.tvl_usd >= args.min_tvl_usd)
+        .filter(|row| row.volume_usd_1d >= args.min_volume_usd_1d)
+        .filter(|row| row.apy_base >= args.min_base_apy)
+        .filter(|row| row.reward_share <= args.max_reward_share)
+        .filter(|row| row.fee_bps.unwrap_or(0.0) >= args.min_fee_bps)
+        .filter(|row| !args.concentrated_only || is_concentrated_solana_candidate(row))
+        .filter(|row| !args.blue_chip_only || row.blue_chip_score >= 0.5)
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| {
+        right
+            .deployability_score
+            .total_cmp(&left.deployability_score)
+    });
+
+    if args.format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows.into_iter().take(args.limit).collect::<Vec<_>>())?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "solana LP universe projects={:?} filters: tvl>={:.0} vol1d>={:.0} base_apy>={:.1}% reward_share<={:.0}% outliers={} concentrated_only={} blue_chip_only={}",
+        args.projects,
+        args.min_tvl_usd,
+        args.min_volume_usd_1d,
+        args.min_base_apy,
+        args.max_reward_share * 100.0,
+        args.include_outliers,
+        args.concentrated_only,
+        args.blue_chip_only
+    );
+    println!(
+        "{:<13} {:<18} {:<24} {:>8} {:>10} {:>12} {:>8} {:>8} {:>8} {:>10}  notes",
+        "project",
+        "protocol",
+        "symbol",
+        "fee_bps",
+        "tvl_usd",
+        "vol_1d",
+        "vol/tvl",
+        "base",
+        "reward",
+        "score"
+    );
+    for row in rows.into_iter().take(args.limit) {
+        println!(
+            "{:<13} {:<18} {:<24} {:>8} {:>10.0} {:>12.0} {:>8.2} {:>7.2}% {:>7.2}% {:>10.1}  {}",
+            row.project,
+            row.protocol,
+            row.symbol,
+            row.fee_bps
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+            row.tvl_usd,
+            row.volume_usd_1d,
+            row.volume_tvl_1d,
+            row.apy_base,
+            row.apy_reward,
+            row.deployability_score,
+            row.notes.join(",")
         );
     }
 

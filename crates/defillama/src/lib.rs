@@ -214,6 +214,10 @@ fn protocol_from_project(project: &str) -> DexProtocol {
         "uniswap-v3" => DexProtocol::UniswapV3,
         "uniswap-v4" => DexProtocol::UniswapV4,
         "aerodrome-v1" | "aerodrome-slipstream" => DexProtocol::Aerodrome,
+        "orca-dex" => DexProtocol::Orca,
+        "raydium-amm" => DexProtocol::Raydium,
+        "meteora" | "meteora-dlmm" => DexProtocol::Meteora,
+        "kamino-liquidity" => DexProtocol::Kamino,
         "curve-dex" => DexProtocol::Curve,
         "balancer-v3" | "balancer-v2" => DexProtocol::Balancer,
         "sushiswap" => DexProtocol::SushiSwap,
@@ -228,6 +232,11 @@ fn is_known_dex_project(project: &str) -> bool {
             | "uniswap-v4"
             | "aerodrome-v1"
             | "aerodrome-slipstream"
+            | "orca-dex"
+            | "raydium-amm"
+            | "meteora"
+            | "meteora-dlmm"
+            | "kamino-liquidity"
             | "curve-dex"
             | "balancer-v3"
             | "balancer-v2"
@@ -290,5 +299,18 @@ mod tests {
         assert_eq!(tick_spacing_from_meta(Some("CL50 - 0.0079%")), Some(50));
         assert_eq!(tick_spacing_from_meta(Some("CL1 - 0.0009%")), Some(1));
         assert_eq!(tick_spacing_from_meta(Some("0.3%")), None);
+    }
+
+    #[test]
+    fn maps_solana_dex_projects() {
+        assert_eq!(protocol_from_project("orca-dex"), DexProtocol::Orca);
+        assert_eq!(protocol_from_project("raydium-amm"), DexProtocol::Raydium);
+        assert_eq!(
+            protocol_from_project("kamino-liquidity"),
+            DexProtocol::Kamino
+        );
+        assert!(is_known_dex_project("orca-dex"));
+        assert!(is_known_dex_project("raydium-amm"));
+        assert!(is_known_dex_project("kamino-liquidity"));
     }
 }
