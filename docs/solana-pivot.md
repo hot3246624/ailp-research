@@ -32,7 +32,8 @@ cargo run -p autopool-cli -- solana-universe \
   --min-base-apy 20 \
   --max-reward-share 0.25 \
   --concentrated-only \
-  --limit 20
+  --limit 20 \
+  --output data/solana/universe/latest.json
 ```
 
 The command uses DeFiLlama yields as a first-pass filter and ranks by a deployability
@@ -46,6 +47,27 @@ score built from:
 - fee tier parsed from pool metadata when available.
 
 It is deliberately **not** a live-trading signal. It is a candidate generator.
+The optional `--output` flag writes the limited ranked rows as JSON so later replay,
+stability checks, and execution adapters consume the same candidate set.
+
+The protocol-owned API pass is:
+
+```bash
+cargo run -p autopool-cli -- solana-discover \
+  --min-tvl-usd 50000 \
+  --min-volume-usd-24h 25000 \
+  --min-fee-apr 20 \
+  --max-fee-apr 1000 \
+  --page-size 100 \
+  --limit 30 \
+  --output data/solana/discovery/latest.json
+```
+
+This reads Orca Whirlpools, Raydium CLMM, and Meteora DLMM directly. It normalizes
+fee units, tick/bin spacing, 24h volume, fee APR, verification flags, and warnings.
+The default `--max-fee-apr 1000` is an anomaly guard, not a strategy target; pools
+above that are usually short-lived, toxic, or API-unit edge cases until proven
+otherwise.
 
 ## Current Conservative Scan
 
@@ -62,6 +84,24 @@ Concentrated-only, excluding DeFiLlama outliers:
 This already looks more promising than Base if the data survives validation:
 organic fee APR can be much higher, and several pools have enough daily volume to
 support active monitoring.
+
+## Current Protocol Scan
+
+Orca/Raydium-only, capped to 20%-300% fee APR:
+
+| venue | symbol | TVL | 24h volume | fee APR | spacing | notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Orca | SOL-USDC | $23.5m | $84.6m | 52.5% | tick 4 | high turnover |
+| Raydium | CARDS-USDC | $3.30m | $3.78m | 167.0% | tick 60 | tail inventory |
+| Raydium | WSOL-USDC | $5.20m | $18.4m | 51.6% | tick 1 | high turnover |
+| Orca | SOL-PUMP | $482k | $1.93m | 234.8% | tick 16 | high turnover |
+| Orca | JTO-JitoSOL | $1.56m | $1.28m | 89.4% | tick 64 | correlated inventory |
+| Raydium | WSOL-CX | $651k | $866k | 121.4% | tick 60 | tail inventory |
+
+This is the first scan that looks strategically relevant: it has pools with real
+fee density, enough TVL to deploy small test capital, and protocol-level parameters.
+It is still not a live signal because we do not yet know active-liquidity distribution,
+range occupancy, swap toxicity, or whether the APR survives across multiple days.
 
 ## Aggressive Scan
 
@@ -102,16 +142,21 @@ The Solana search should be:
 
 ## Next Build
 
-1. Add a Solana market-data crate with adapters:
-   - DeFiLlama first-pass yields;
-   - Orca Whirlpool pool stats;
-   - Raydium CLMM pool stats;
-   - Meteora DLMM pool stats.
+1. Extend the Solana market-data crate:
+   - keep DeFiLlama as first-pass yields;
+   - keep Orca/Raydium/Meteora protocol APIs as discovery;
+   - add pool-specific RPC/SDK enrichment for the top N rows.
 2. Store Solana pool snapshots under `data/solana/...`.
-3. Implement a Solana replay source from recent swaps / price candles.
-4. Port the policy battery to non-EVM concentrated liquidity abstractions:
+3. Enrich top pools from RPC/SDK accounts:
+   - active tick/bin;
+   - tick-array or bin liquidity distribution;
+   - vault balances;
+   - reward emissions;
+   - observation/candle data.
+4. Implement a Solana replay source from recent swaps / price candles.
+5. Port the policy battery to non-EVM concentrated liquidity abstractions:
    tick/range for CLMM, bin/range for DLMM.
-5. Only after replay edge is confirmed: build execution simulation.
+6. Only after replay edge is confirmed: build execution simulation.
 
 Bottom line: Base remains the execution training ground. Solana is now the main
 candidate-discovery frontier.

@@ -6,6 +6,7 @@ use autopool_aerodrome::{
 use autopool_core::YieldSnapshot;
 use autopool_defillama::{DefiLlamaClient, DefiLlamaPool, PoolFilter};
 use autopool_evm::{BURN_TOPIC, COLLECT_TOPIC, JsonRpcClient, MINT_TOPIC, SWAP_TOPIC};
+use autopool_solana::{DiscoveryOptions, SolanaDiscoveryClient, SolanaPoolCandidate, SolanaVenue};
 use autopool_strategy::WeightedRiskModel;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,23 @@ impl From<CandidateProfile> for PilotProfile {
         match value {
             CandidateProfile::Control => Self::Control,
             CandidateProfile::Opportunistic => Self::Opportunistic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SolanaDiscoverVenue {
+    Orca,
+    Raydium,
+    Meteora,
+}
+
+impl From<SolanaDiscoverVenue> for SolanaVenue {
+    fn from(value: SolanaDiscoverVenue) -> Self {
+        match value {
+            SolanaDiscoverVenue::Orca => Self::OrcaWhirlpool,
+            SolanaDiscoverVenue::Raydium => Self::RaydiumClmm,
+            SolanaDiscoverVenue::Meteora => Self::MeteoraDlmm,
         }
     }
 }
@@ -110,6 +128,36 @@ enum Command {
         projects: Vec<String>,
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        /// Optional JSON output path for snapshotting the ranked rows.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Discover executable Solana LP candidates from protocol-owned APIs.
+    /// This is still read-only research: no wallet, signing, or transaction
+    /// planning. It normalizes Orca Whirlpool, Raydium CLMM, and Meteora DLMM
+    /// pool statistics into one candidate table.
+    SolanaDiscover {
+        #[arg(long = "venue", value_enum)]
+        venues: Vec<SolanaDiscoverVenue>,
+        #[arg(long, default_value_t = 100_000.0)]
+        min_tvl_usd: f64,
+        #[arg(long, default_value_t = 100_000.0)]
+        min_volume_usd_24h: f64,
+        #[arg(long, default_value_t = 20.0)]
+        min_fee_apr: f64,
+        #[arg(long, default_value_t = 1_000.0)]
+        max_fee_apr: f64,
+        #[arg(long, default_value_t = false)]
+        verified_only: bool,
+        #[arg(long, default_value_t = 100)]
+        page_size: usize,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Optional JSON output path for snapshotting protocol API rows.
+        #[arg(long)]
+        output: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -599,6 +647,7 @@ async fn main() -> Result<()> {
             blue_chip_only,
             projects,
             limit,
+            output,
             format,
         } => {
             solana_universe(SolanaUniverseArgs {
@@ -612,6 +661,33 @@ async fn main() -> Result<()> {
                 blue_chip_only,
                 projects,
                 limit,
+                output,
+                format,
+            })
+            .await?
+        }
+        Command::SolanaDiscover {
+            venues,
+            min_tvl_usd,
+            min_volume_usd_24h,
+            min_fee_apr,
+            max_fee_apr,
+            verified_only,
+            page_size,
+            limit,
+            output,
+            format,
+        } => {
+            solana_discover(SolanaDiscoverArgs {
+                venues,
+                min_tvl_usd,
+                min_volume_usd_24h,
+                min_fee_apr,
+                max_fee_apr,
+                verified_only,
+                page_size,
+                limit,
+                output,
                 format,
             })
             .await?
@@ -1116,6 +1192,7 @@ struct SolanaUniverseArgs {
     blue_chip_only: bool,
     projects: Vec<String>,
     limit: usize,
+    output: Option<PathBuf>,
     format: OutputFormat,
 }
 
@@ -1277,11 +1354,18 @@ async fn solana_universe(args: SolanaUniverseArgs) -> Result<()> {
             .total_cmp(&left.deployability_score)
     });
 
+    let limited_rows = rows.into_iter().take(args.limit).collect::<Vec<_>>();
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_string_pretty(&limited_rows)?)
+            .with_context(|| format!("writing Solana universe snapshot {}", output.display()))?;
+    }
+
     if args.format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&rows.into_iter().take(args.limit).collect::<Vec<_>>())?
-        );
+        println!("{}", serde_json::to_string_pretty(&limited_rows)?);
         return Ok(());
     }
 
@@ -1309,7 +1393,7 @@ async fn solana_universe(args: SolanaUniverseArgs) -> Result<()> {
         "reward",
         "score"
     );
-    for row in rows.into_iter().take(args.limit) {
+    for row in limited_rows {
         println!(
             "{:<13} {:<18} {:<24} {:>8} {:>10.0} {:>12.0} {:>8.2} {:>7.2}% {:>7.2}% {:>10.1}  {}",
             row.project,
@@ -1329,6 +1413,126 @@ async fn solana_universe(args: SolanaUniverseArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SolanaDiscoverArgs {
+    venues: Vec<SolanaDiscoverVenue>,
+    min_tvl_usd: f64,
+    min_volume_usd_24h: f64,
+    min_fee_apr: f64,
+    max_fee_apr: f64,
+    verified_only: bool,
+    page_size: usize,
+    limit: usize,
+    output: Option<PathBuf>,
+    format: OutputFormat,
+}
+
+async fn solana_discover(args: SolanaDiscoverArgs) -> Result<()> {
+    let venues = if args.venues.is_empty() {
+        vec![
+            SolanaVenue::OrcaWhirlpool,
+            SolanaVenue::RaydiumClmm,
+            SolanaVenue::MeteoraDlmm,
+        ]
+    } else {
+        args.venues.iter().copied().map(Into::into).collect()
+    };
+    let options = DiscoveryOptions {
+        min_tvl_usd: args.min_tvl_usd,
+        page_size: args.page_size,
+    };
+    let client = SolanaDiscoveryClient::default();
+    let mut rows = client.discover_many(&venues, &options).await?;
+
+    rows.retain(|row| row.tvl_usd >= args.min_tvl_usd);
+    rows.retain(|row| row.volume_usd_24h.unwrap_or(0.0) >= args.min_volume_usd_24h);
+    rows.retain(|row| row.fee_apr_24h.unwrap_or(0.0) >= args.min_fee_apr);
+    rows.retain(|row| row.fee_apr_24h.unwrap_or(f64::INFINITY) <= args.max_fee_apr);
+    rows.retain(|row| !args.verified_only || row.verified);
+    rows.sort_by(|left, right| {
+        right
+            .deployability_score
+            .total_cmp(&left.deployability_score)
+    });
+
+    let limited_rows = rows.into_iter().take(args.limit).collect::<Vec<_>>();
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_string_pretty(&limited_rows)?)
+            .with_context(|| format!("writing Solana discovery snapshot {}", output.display()))?;
+    }
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&limited_rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "solana protocol discovery venues={:?} filters: tvl>={:.0} vol24h>={:.0} fee_apr={:.1}%..{:.1}% verified_only={} page_size={}",
+        venues.iter().map(|venue| venue.label()).collect::<Vec<_>>(),
+        args.min_tvl_usd,
+        args.min_volume_usd_24h,
+        args.min_fee_apr,
+        args.max_fee_apr,
+        args.verified_only,
+        args.page_size
+    );
+    println!(
+        "{:<8} {:<24} {:>8} {:>10} {:>12} {:>9} {:>9} {:>10} {:<12}  warnings",
+        "venue",
+        "symbol",
+        "fee_bps",
+        "tvl_usd",
+        "vol_24h",
+        "fee_apr",
+        "total_apr",
+        "score",
+        "spacing"
+    );
+    for row in limited_rows {
+        println!(
+            "{:<8} {:<24} {:>8} {:>10.0} {:>12.0} {:>8} {:>8} {:>10.1} {:<12}  {}",
+            row.venue.label(),
+            row.symbol,
+            format_opt_f64(row.fee_bps, 2),
+            row.tvl_usd,
+            row.volume_usd_24h.unwrap_or(0.0),
+            format_opt_pct(row.fee_apr_24h),
+            format_opt_pct(row.total_apr),
+            row.deployability_score,
+            solana_spacing_label(&row),
+            row.warnings.join(",")
+        );
+    }
+
+    Ok(())
+}
+
+fn solana_spacing_label(row: &SolanaPoolCandidate) -> String {
+    if let Some(tick_spacing) = row.tick_spacing {
+        return format!("tick:{tick_spacing}");
+    }
+    if let Some(bin_step) = row.bin_step {
+        return format!("bin:{bin_step}");
+    }
+    "-".to_string()
+}
+
+fn format_opt_pct(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_opt_f64(value: Option<f64>, decimals: usize) -> String {
+    value
+        .map(|value| format!("{value:.prec$}", prec = decimals))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 async fn sample_base_network(

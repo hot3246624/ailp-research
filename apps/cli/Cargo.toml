@@ -12,6 +12,7 @@ autopool-backtest.workspace = true
 autopool-core.workspace = true
 autopool-defillama.workspace = true
 autopool-evm.workspace = true
+autopool-solana.workspace = true
 autopool-strategy.workspace = true
 clap.workspace = true
 serde.workspace = true

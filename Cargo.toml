@@ -6,6 +6,7 @@ members = [
   "crates/core",
   "crates/defillama",
   "crates/evm",
+  "crates/solana",
   "crates/strategy",
 ]
 resolver = "2"
@@ -31,4 +32,5 @@ autopool-aerodrome = { path = "crates/aerodrome" }
 autopool-core = { path = "crates/core" }
 autopool-defillama = { path = "crates/defillama" }
 autopool-evm = { path = "crates/evm" }
+autopool-solana = { path = "crates/solana" }
 autopool-strategy = { path = "crates/strategy" }

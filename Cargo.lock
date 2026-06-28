@@ -101,6 +101,7 @@ dependencies = [
  "autopool-core",
  "autopool-defillama",
  "autopool-evm",
+ "autopool-solana",
  "autopool-strategy",
  "clap",
  "serde",
@@ -140,6 +141,18 @@ dependencies = [
  "thiserror",
  "tiny-keccak",
  "tokio",
+]
+
+[[package]]
+name = "autopool-solana"
+version = "0.1.0"
+dependencies = [
+ "autopool-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
 ]
 
 [[package]]

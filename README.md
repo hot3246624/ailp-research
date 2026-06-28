@@ -122,7 +122,11 @@ manual guarded execution path are complete.
 machinery but has a thin candidate surface, while Solana currently exposes many more
 organic high-APY LP candidates. The new `solana-universe` command ranks Raydium/Orca/
 Kamino candidates by organic base APY, TVL, volume, reward share, and concentrated
-liquidity suitability.
+liquidity suitability, and can snapshot the ranked rows with `--output` for replay
+and day-over-day validation. `solana-discover` is the stricter protocol-API layer:
+it reads Orca Whirlpools, Raydium CLMM, and Meteora DLMM directly, normalizes fee
+units/APR fields, applies an outlier cap, and writes the executable candidate rows
+for replay/RPC enrichment.
 
 ## External References
 
