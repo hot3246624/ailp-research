@@ -76,12 +76,34 @@ dominates. The deep pool that *can* take size has no alpha. That tension — alp
 in thin pools, depth lives in zero-fee pools — is the real ceiling on this venue, and
 the execution layer now enforces it before any signature.
 
+## Real calldata (done) + on-chain quote (partial)
+
+The planner now emits **real, signable calldata bytes** for the swap and mint.
+Selectors are computed with **keccak** from the exact Slipstream signatures (which use
+`int24 tickSpacing`, not `uint24 fee`), and verified against known selectors
+(`getPool(address,address,int24)` → `28af8d0b`, `transfer` → `a9059cbb`). Ticks are
+sign-extended int24; example swap calldata for WETH→AERO decodes correctly
+(selector `a026383e`, tokens, `tickSpacing=0xc8`=200, recipient, deadline, amountIn).
+
+The **swap is simulated against the pool's real in-range liquidity**
+(`simulate_v3_swap`): e.g. 1.77 WETH → 5,974 AERO, 11.1 bps impact, which sets
+`amountOutMin` and the price-impact gate.
+
+The **on-chain Quoter cross-check is best-effort and currently falls back**: Slipstream's
+MixedQuoter is the Uniswap-**v1 Quoter pattern** (it *reverts* with the result encoded
+in the revert data rather than returning it), so a plain `eth_call` shows `execution
+reverted`. Completing it needs either (a) parsing the revert `data` bytes, or (b) the
+deployment-matched **QuoterV2** address that returns normally. The offline real-state
+sim is the working swap simulation in the meantime.
+
 ## What is deliberately NOT done yet
 
-- **Final ABI calldata bytes** for each call and the `multicall` wrapper.
-- **On-chain `eth_call` simulation** of the bundle (needs a funded sender / fork to
-  get real outputs, gas, and revert reasons). The current gas figure is a units ×
-  gas-price estimate.
+- The `multicall` wrapper bundling the actions into one tx.
+- **Full bundle `eth_call` simulation from a funded sender** (state-override `eth_call`
+  setting the sender's token balances/allowances, or a fork) to get real gas + revert
+  reasons for `mint`/`collect`/`decreaseLiquidity`. The current gas figure is a units ×
+  gas-price estimate; the swap output is the real-state sim above.
+- On-chain Quoter revert-data parsing (above).
 - **The delta-hedge leg.** The deployable strategy is delta-hedged, but the short is a
   **perp on a different venue** (e.g. Hyperliquid), so it is a *separate* plan/adapter,
   not a Slipstream action.
