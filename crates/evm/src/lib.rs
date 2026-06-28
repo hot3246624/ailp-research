@@ -207,9 +207,49 @@ impl JsonRpcClient {
         Ok(decode_address_result(&result))
     }
 
-    /// Real on-chain swap quote via the Slipstream QuoterV2 (a read-only `eth_call`,
-    /// no funded sender needed). Returns the expected output in raw units. The exact
-    /// struct order is verified empirically against the chain.
+    /// `eth_call` that, on an execution revert, returns the revert `data` instead of
+    /// erroring — needed for the Uniswap-v1-style Quoter, which encodes its result in
+    /// the revert payload. Returns (success, hex_data).
+    pub async fn eth_call_revertable(
+        &self,
+        to: &str,
+        data: &str,
+    ) -> Result<(bool, String), EvmError> {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+        });
+        let resp = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| EvmError::Provider(err.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|err| EvmError::Provider(err.to_string()))?;
+        let value = serde_json::from_str::<Value>(&text)
+            .map_err(|err| EvmError::InvalidRpcResponse(err.to_string()))?;
+        if let Some(result) = value.get("result").and_then(|r| r.as_str()) {
+            return Ok((true, result.to_string()));
+        }
+        if let Some(error) = value.get("error") {
+            if let Some(d) = error.get("data").and_then(|d| d.as_str()) {
+                if d.starts_with("0x") && d.len() >= 66 {
+                    return Ok((false, d.to_string()));
+                }
+            }
+            return Err(EvmError::Rpc(error.to_string()));
+        }
+        Err(EvmError::InvalidRpcResponse(text))
+    }
+
+    /// Real on-chain swap quote via the Slipstream Quoter (a read-only `eth_call`,
+    /// no funded sender needed). Slipstream's MixedQuoter is the v1 pattern: it
+    /// reverts with `abi.encode(amountOut)`, so we read the first word of either the
+    /// return value (v2) or the revert data (v1). Returns the output in raw units.
     pub async fn quote_exact_input_single(
         &self,
         quoter: &str,
@@ -220,9 +260,8 @@ impl JsonRpcClient {
     ) -> Result<u128, EvmError> {
         let calldata =
             encode_quote_exact_input_single(token_in, token_out, tick_spacing, amount_in_raw);
-        let result = self.eth_call(quoter, &calldata).await?;
-        // First 32-byte word of the return tuple is amountOut.
-        let words = decode_words(&result)?;
+        let (_ok, ret) = self.eth_call_revertable(quoter, &calldata).await?;
+        let words = decode_words(&ret)?;
         let first = words
             .first()
             .ok_or_else(|| EvmError::InvalidRpcResponse("empty quoter result".to_string()))?;
