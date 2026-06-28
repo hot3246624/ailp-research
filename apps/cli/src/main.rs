@@ -304,6 +304,21 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Inspect a Slipstream NonfungiblePositionManager NFT: owner, range, liquidity,
+    /// owed tokens, current pool tick, and whether the NFT appears staked in the
+    /// pool gauge. Read-only; never signs.
+    InspectPosition {
+        #[arg(long, env = "BASE_RPC_URL")]
+        rpc_url: String,
+        #[arg(long)]
+        token_id: u64,
+        /// Optional pool address. If omitted, the command resolves it from the
+        /// position tokens + tick spacing via the Slipstream pool factory.
+        #[arg(long)]
+        pool_address: Option<String>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Moving-block bootstrap of a collected swap stream: run the policy battery over
     /// many resampled paths and report each policy's net-PnL distribution. Shows that
     /// a delta-hedged LP harvests fee−LVR with low variance while unhedged swings
@@ -334,10 +349,10 @@ enum Command {
         format: OutputFormat,
     },
     /// Build a DRY-RUN Aerodrome Slipstream (Uniswap-v3 model) rebalance plan for a
-    /// pool: reads pool state, proposes the collect→burn→swap→mint(+stake) action
-    /// sequence with slippage-protected min amounts, estimates gas, runs hard risk
-    /// gates, and NEVER signs or broadcasts. v2 (Aerodrome V1) and v4 need separate
-    /// adapters — this planner is Slipstream/v3 only.
+    /// pool: reads pool state, proposes the collect→decrease→collect→swap→mint
+    /// (+stake) action sequence with slippage-protected min amounts, estimates gas,
+    /// runs hard risk gates, and NEVER signs or broadcasts. v2 (Aerodrome V1) and v4
+    /// need separate adapters — this planner is Slipstream/v3 only.
     DryRunRebalance {
         #[arg(long, env = "BASE_RPC_URL")]
         rpc_url: String,
@@ -734,6 +749,12 @@ async fn main() -> Result<()> {
             })
             .await?
         }
+        Command::InspectPosition {
+            rpc_url,
+            token_id,
+            pool_address,
+            format,
+        } => inspect_position(rpc_url, token_id, pool_address, format).await?,
         Command::MultiPath {
             data_dir,
             pool_address,
@@ -2374,11 +2395,39 @@ struct NpmPositionSnapshot {
     liquidity: u128,
 }
 
+#[derive(Debug, Clone)]
+struct NpmPositionDetail {
+    token0: String,
+    token1: String,
+    tick_spacing: i32,
+    tick_lower: i32,
+    tick_upper: i32,
+    liquidity: u128,
+    fee_growth_inside0_last_x128: String,
+    fee_growth_inside1_last_x128: String,
+    tokens_owed0: u128,
+    tokens_owed1: u128,
+}
+
 async fn read_npm_position(
     rpc: &JsonRpcClient,
     npm: &str,
     token_id: u64,
 ) -> Result<NpmPositionSnapshot> {
+    let detail = read_npm_position_detail(rpc, npm, token_id).await?;
+
+    Ok(NpmPositionSnapshot {
+        tick_lower: detail.tick_lower,
+        tick_upper: detail.tick_upper,
+        liquidity: detail.liquidity,
+    })
+}
+
+async fn read_npm_position_detail(
+    rpc: &JsonRpcClient,
+    npm: &str,
+    token_id: u64,
+) -> Result<NpmPositionDetail> {
     let calldata = format!(
         "0x{}{}",
         autopool_evm::abi::selector("positions(uint256)"),
@@ -2386,6 +2435,21 @@ async fn read_npm_position(
     );
     let raw = rpc.eth_call(npm, &calldata).await?;
     let words = abi_words(&raw).context("positions(tokenId) returned malformed ABI")?;
+    let token0 = decode_address_abi_word(
+        words
+            .get(2)
+            .context("positions(tokenId) missing token0 word")?,
+    )?;
+    let token1 = decode_address_abi_word(
+        words
+            .get(3)
+            .context("positions(tokenId) missing token1 word")?,
+    )?;
+    let tick_spacing = decode_i24_abi_word(
+        words
+            .get(4)
+            .context("positions(tokenId) missing tickSpacing word")?,
+    )?;
     let tick_lower = decode_i24_abi_word(
         words
             .get(5)
@@ -2401,12 +2465,41 @@ async fn read_npm_position(
             .get(7)
             .context("positions(tokenId) missing liquidity word")?,
     )?;
+    let fee_growth_inside0_last_x128 = words
+        .get(8)
+        .map(|word| format!("0x{word}"))
+        .unwrap_or_else(|| "0x0".to_string());
+    let fee_growth_inside1_last_x128 = words
+        .get(9)
+        .map(|word| format!("0x{word}"))
+        .unwrap_or_else(|| "0x0".to_string());
+    let tokens_owed0 = words
+        .get(10)
+        .map(|word| decode_u128_abi_word(word))
+        .transpose()?
+        .unwrap_or(0);
+    let tokens_owed1 = words
+        .get(11)
+        .map(|word| decode_u128_abi_word(word))
+        .transpose()?
+        .unwrap_or(0);
 
-    Ok(NpmPositionSnapshot {
+    Ok(NpmPositionDetail {
+        token0,
+        token1,
+        tick_spacing,
         tick_lower,
         tick_upper,
         liquidity,
+        fee_growth_inside0_last_x128,
+        fee_growth_inside1_last_x128,
+        tokens_owed0,
+        tokens_owed1,
     })
+}
+
+fn decode_address_abi_word(word: &str) -> Result<String> {
+    Ok(format!("0x{}", &word[word.len().saturating_sub(40)..]))
 }
 
 fn decode_i24_abi_word(word: &str) -> Result<i32> {
@@ -2424,6 +2517,160 @@ fn decode_u128_abi_word(word: &str) -> Result<u128> {
         &word[word.len().saturating_sub(32)..],
         16,
     )?)
+}
+
+async fn read_owner_of(rpc: &JsonRpcClient, npm: &str, token_id: u64) -> Result<String> {
+    let calldata = format!(
+        "0x{}{}",
+        autopool_evm::abi::selector("ownerOf(uint256)"),
+        autopool_evm::abi::enc_uint(token_id as u128)
+    );
+    let raw = rpc.eth_call(npm, &calldata).await?;
+    let words = abi_words(&raw).context("ownerOf(tokenId) returned malformed ABI")?;
+    decode_address_abi_word(
+        words
+            .first()
+            .context("ownerOf(tokenId) missing owner word")?,
+    )
+}
+
+async fn read_pool_gauge(rpc: &JsonRpcClient, pool_address: &str) -> Result<Option<String>> {
+    let calldata = format!("0x{}", autopool_evm::abi::selector("gauge()"));
+    let raw = match rpc.eth_call(pool_address, &calldata).await {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let words = abi_words(&raw).context("gauge() returned malformed ABI")?;
+    let gauge = decode_address_abi_word(words.first().context("gauge() missing address word")?)?;
+    if gauge.eq_ignore_ascii_case("0x0000000000000000000000000000000000000000") {
+        Ok(None)
+    } else {
+        Ok(Some(gauge))
+    }
+}
+
+async fn inspect_position(
+    rpc_url: String,
+    token_id: u64,
+    pool_address: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
+    let rpc = JsonRpcClient::new(rpc_url);
+    let c = BASE_SLIPSTREAM_GAUGES_V3;
+    let npm = c.nonfungible_position_manager;
+    let owner = read_owner_of(&rpc, npm, token_id).await?;
+    let position = read_npm_position_detail(&rpc, npm, token_id).await?;
+    let resolved_pool = match pool_address {
+        Some(address) => Some(address),
+        None => {
+            rpc.get_cl_pool(
+                c.pool_factory,
+                &position.token0,
+                &position.token1,
+                position.tick_spacing,
+            )
+            .await?
+        }
+    };
+
+    let mut current_tick: Option<i32> = None;
+    let mut tick_spacing_live: Option<i32> = None;
+    let mut in_range: Option<bool> = None;
+    let mut fee_bps: Option<f64> = None;
+    let mut gauge: Option<String> = None;
+
+    if let Some(pool) = resolved_pool.as_deref() {
+        let state = rpc.read_cl_pool_state(pool).await?;
+        current_tick = Some(state.current_tick);
+        tick_spacing_live = Some(state.tick_spacing);
+        in_range = Some(
+            state.current_tick >= position.tick_lower && state.current_tick < position.tick_upper,
+        );
+        fee_bps = rpc
+            .eth_call(pool, "0xddca3f43")
+            .await
+            .ok()
+            .and_then(|hex| parse_hex_u64_lossy(&hex))
+            .map(|value| value as f64 / 100.0);
+        gauge = read_pool_gauge(&rpc, pool).await?;
+    }
+
+    let appears_staked = gauge
+        .as_deref()
+        .map(|value| owner.eq_ignore_ascii_case(value))
+        .unwrap_or(false);
+    let range_width_ticks = position.tick_upper - position.tick_lower;
+    let distance_to_lower = current_tick.map(|tick| tick - position.tick_lower);
+    let distance_to_upper = current_tick.map(|tick| position.tick_upper - tick);
+    let result = json!({
+        "token_id": token_id,
+        "npm": npm,
+        "owner": owner,
+        "pool": resolved_pool,
+        "gauge": gauge,
+        "appears_staked": appears_staked,
+        "token0": position.token0,
+        "token1": position.token1,
+        "tick_spacing_position": position.tick_spacing,
+        "tick_spacing_pool": tick_spacing_live,
+        "tick_lower": position.tick_lower,
+        "tick_upper": position.tick_upper,
+        "range_width_ticks": range_width_ticks,
+        "current_tick": current_tick,
+        "in_range": in_range,
+        "distance_to_lower_ticks": distance_to_lower,
+        "distance_to_upper_ticks": distance_to_upper,
+        "liquidity_raw": position.liquidity.to_string(),
+        "tokens_owed0_raw": position.tokens_owed0.to_string(),
+        "tokens_owed1_raw": position.tokens_owed1.to_string(),
+        "fee_growth_inside0_last_x128": position.fee_growth_inside0_last_x128,
+        "fee_growth_inside1_last_x128": position.fee_growth_inside1_last_x128,
+        "fee_bps": fee_bps,
+        "requires_signature": false,
+        "broadcast": false
+    });
+
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!("position #{token_id} (read-only)");
+    println!("  npm        : {npm}");
+    println!("  owner      : {}", result["owner"].as_str().unwrap_or(""));
+    if let Some(pool) = result["pool"].as_str() {
+        println!("  pool       : {pool}");
+    } else {
+        println!("  pool       : unresolved");
+    }
+    if let Some(gauge) = result["gauge"].as_str() {
+        println!("  gauge      : {gauge}");
+    }
+    println!("  staked?    : {appears_staked}");
+    println!("  token0     : {}", result["token0"].as_str().unwrap_or(""));
+    println!("  token1     : {}", result["token1"].as_str().unwrap_or(""));
+    println!(
+        "  range      : [{}, {}) width={} ticks spacing={}",
+        position.tick_lower, position.tick_upper, range_width_ticks, position.tick_spacing
+    );
+    if let Some(tick) = current_tick {
+        println!(
+            "  current    : tick={} in_range={} dist_lower={} dist_upper={}",
+            tick,
+            in_range.unwrap_or(false),
+            distance_to_lower.unwrap_or(0),
+            distance_to_upper.unwrap_or(0)
+        );
+    }
+    if let Some(fee) = fee_bps {
+        println!("  fee_bps    : {fee:.2}");
+    }
+    println!("  liquidity  : {}", position.liquidity);
+    println!("  owed0_raw  : {}", position.tokens_owed0);
+    println!("  owed1_raw  : {}", position.tokens_owed1);
+    println!("  broadcast  : false");
+
+    Ok(())
 }
 
 /// Build a dry-run Slipstream (v3) rebalance plan. Reads pool state, computes the

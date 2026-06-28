@@ -58,6 +58,9 @@ Ready:
 - Pool discovery and scoring loop exists.
 - Strategy replay / stress / multi-path framework exists.
 - Real Slipstream calldata exists.
+- Minimal read-only position inspection exists:
+  `inspect-position --token-id ...` reads owner, pool, gauge, range, current tick,
+  in-range status, liquidity, and owed tokens.
 - Funded fork simulation passes for fresh mint and rebalance:
   `swap -> mint`, then `collect -> decreaseLiquidity -> collect -> mint`.
 - Receipt-status checking and real gas readings exist.
@@ -67,8 +70,8 @@ Ready:
 
 Not ready:
 
-- No live **position monitor** yet: NFT owner, current range, in-range status,
-  uncollected fees, owed tokens, gauge stake status, wallet balances.
+- No live **position monitor daemon** yet: the one-shot inspector exists, but it does
+  not persist snapshots, alert, compute USD exposure, or watch wallet balances.
 - No **delta hedge adapter** yet. The best risk-adjusted strategy depends on a perp
   hedge, likely Hyperliquid or another venue.
 - No **post-trade accounting ledger** yet: fees, rewards, hedge PnL, gas, slippage,
@@ -101,7 +104,8 @@ The next deployable milestone is a **shadow/live pilot with tiny capital**:
 ## Next Build Order
 
 1. **Position monitor**: read active NFT, range, liquidity, balances, fees, stake
-   state, and current exposure.
+   state, and current exposure. The one-shot NFT inspector is done; the next step is
+   persistence, wallet balances, and alerting.
 2. **Proposal daemon**: periodically produce a signed-off JSON plan with gates and
    expected edge; store every plan.
 3. **Shadow PnL ledger**: mark plan outcomes without trading.
