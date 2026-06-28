@@ -28,6 +28,8 @@ TOKEN0_USD="${TOKEN0_USD:-3000}"
 FRESH_HALF_WIDTH_TICKS="${FRESH_HALF_WIDTH_TICKS:-600}"
 REBALANCE_HALF_WIDTH_TICKS="${REBALANCE_HALF_WIDTH_TICKS:-600}"
 SLIPPAGE_BPS="${SLIPPAGE_BPS:-30}"
+RISK_TOKEN_SIDE="${RISK_TOKEN_SIDE:-token1}"
+MAX_RISK_TOKEN_SHARE="${MAX_RISK_TOKEN_SHARE:-0.8}"
 WETH_DEPOSIT="${WETH_DEPOSIT:-20ether}"
 GAS_LIMIT="${GAS_LIMIT:-5000000}"
 MAX_UINT="115792089237316195423570985008687907853269984665640564039457584007913129639935"
@@ -135,6 +137,16 @@ gas_used() {
   jq -r '.gasUsed // .receipt.gasUsed // "unknown"' "$1"
 }
 
+gas_used_dec() {
+  local gas
+  gas="$(gas_used "$1")"
+  if [[ "${gas}" == 0x* ]]; then
+    cast to-dec "${gas}"
+  else
+    echo "${gas}"
+  fi
+}
+
 first_transfer_token_id() {
   local receipt="$1"
   local zero_topic="0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -164,6 +176,8 @@ write_plan fresh-plan \
   --half-width-ticks "${FRESH_HALF_WIDTH_TICKS}" \
   --recipient "${SENDER}" \
   --slippage-bps "${SLIPPAGE_BPS}" \
+  --risk-token-side "${RISK_TOKEN_SIDE}" \
+  --max-risk-token-share "${MAX_RISK_TOKEN_SHARE}" \
   --staked false
 
 ROUTER="$(jq -r '.actions[] | select(.step == "swap") | .contract' "${WORKDIR}/fresh-plan.json")"
@@ -184,6 +198,15 @@ send_json fresh_npm_multicall "${NPM}" "${FRESH_NPM_CALLDATA}"
 TOKEN_ID="$(first_transfer_token_id "${WORKDIR}/fresh_npm_multicall.json")"
 echo "minted tokenId=${TOKEN_ID}"
 
+echo "snapshot minted position"
+BASE_RPC_URL="${FORK_RPC}" cargo run -q -p autopool-cli -- monitor-position \
+  --token-id "${TOKEN_ID}" \
+  --pool-address "${POOL}" \
+  --output "${WORKDIR}/position-monitor.jsonl" \
+  --iterations 1 \
+  --format json \
+  >"${WORKDIR}/position-monitor.stdout.json"
+
 write_plan rebalance-plan \
   --pool-address "${POOL}" \
   --capital-usd "${CAPITAL_USD}" \
@@ -196,6 +219,8 @@ write_plan rebalance-plan \
   --token-id "${TOKEN_ID}" \
   --recipient "${SENDER}" \
   --slippage-bps "${SLIPPAGE_BPS}" \
+  --risk-token-side "${RISK_TOKEN_SIDE}" \
+  --max-risk-token-share "${MAX_RISK_TOKEN_SHARE}" \
   --staked false
 
 REBALANCE_NPM_CALLDATA="$(jq -r '.npm_multicall.calldata' "${WORKDIR}/rebalance-plan.json")"
@@ -211,9 +236,13 @@ cat >"${WORKDIR}/summary.json" <<JSON
   "fresh_target_range": {"lower": ${CURRENT_LOWER}, "upper": ${CURRENT_UPPER}},
   "minted_token_id": "${TOKEN_ID}",
   "fresh_swap_gas": "$(gas_used "${WORKDIR}/fresh_swap.json")",
+  "fresh_swap_gas_dec": "$(gas_used_dec "${WORKDIR}/fresh_swap.json")",
   "fresh_npm_multicall_gas": "$(gas_used "${WORKDIR}/fresh_npm_multicall.json")",
+  "fresh_npm_multicall_gas_dec": "$(gas_used_dec "${WORKDIR}/fresh_npm_multicall.json")",
   "rebalance_npm_calls": ${REBALANCE_CALLS},
   "rebalance_npm_multicall_gas": "$(gas_used "${WORKDIR}/rebalance_npm_multicall.json")",
+  "rebalance_npm_multicall_gas_dec": "$(gas_used_dec "${WORKDIR}/rebalance_npm_multicall.json")",
+  "position_monitor_jsonl": "${WORKDIR}/position-monitor.jsonl",
   "workdir": "${WORKDIR}"
 }
 JSON

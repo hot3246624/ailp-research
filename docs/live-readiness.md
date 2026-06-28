@@ -67,11 +67,15 @@ Ready:
 - Main execution bug classes found and fixed:
   - second collect is required after decreaseLiquidity;
   - raw NPM `u128` liquidity must not be rounded through `f64`.
+  - risk-token inventory gates are side-aware via `--risk-token-side`.
 
 Not ready:
 
-- No live **position monitor daemon** yet: the one-shot inspector exists, but it does
-  not persist snapshots, alert, compute USD exposure, or watch wallet balances.
+- Minimal read-only position monitoring now exists:
+  `monitor-position --token-id ... --output logs/base/positions.jsonl` persists
+  current tick, in-range status, liquidity, owed tokens, owner/gauge state, and
+  receipt-safe metadata as JSONL. It still does not alert, compute USD exposure,
+  compute shadow PnL, or watch wallet balances.
 - No **delta hedge adapter** yet. The best risk-adjusted strategy depends on a perp
   hedge, likely Hyperliquid or another venue.
 - No **post-trade accounting ledger** yet: fees, rewards, hedge PnL, gas, slippage,

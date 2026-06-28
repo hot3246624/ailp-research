@@ -124,15 +124,17 @@ new NFT is minted.
 
 `scripts/fork-sim-rebalance.sh` starts a local Base fork, funds the standard anvil test
 account, deposits WETH, approves the router/NPM, executes the dry-run's real calldata,
-and checks receipt status. It never signs or broadcasts on mainnet.
+snapshots the minted NFT with `monitor-position`, and checks receipt status. It never
+signs or broadcasts on mainnet.
 
 Validated on WETH-AERO GaugesV3 (`0x4e5066...e51`) using a local Base fork:
 
 | step | calls | gas |
 | --- | ---: | ---: |
-| fresh SwapRouter swap | 1 | 219,338 |
-| fresh NPM mint multicall | 1 | 384,761 |
-| rebalance NPM multicall | 4 | 497,334 |
+| fresh SwapRouter swap | 1 | 224,119 |
+| fresh NPM mint multicall | 1 | 418,491 |
+| monitor minted position | read-only | n/a |
+| rebalance NPM multicall | 4 | 497,130 |
 
 Two fork findings are now baked into the CLI:
 
@@ -141,6 +143,9 @@ Two fork findings are now baked into the CLI:
 - NPM position liquidity is read as exact `u128` and passed unchanged to
   `decreaseLiquidity`; converting through `f64` can round above the real liquidity and
   cause an immediate NPM revert.
+- The one-sided inventory gate now takes an explicit `--risk-token-side token0|token1`
+  plus `--max-risk-token-share`; this prevents WETH-USDC-style pools from being checked
+  as if the stablecoin side were the risk asset.
 
 ## Remaining gaps
 
@@ -151,9 +156,6 @@ Two fork findings are now baked into the CLI:
 - **The delta-hedge leg.** The deployable strategy is delta-hedged, but the short is a
   perp on a different venue (e.g. Hyperliquid), so it is a separate plan/adapter, not a
   Slipstream action.
-- **Risk-gate token orientation.** The one-sided-inventory gate treats token1 as the
-  risk asset (matching the engine / `--invert` convention). For a pool read in natural
-  order where the risk asset is token0 (e.g. WETH in WETH-USDC), verify the side.
 
 ## Next
 

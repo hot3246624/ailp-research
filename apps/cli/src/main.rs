@@ -55,6 +55,21 @@ impl From<SolanaDiscoverVenue> for SolanaVenue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+enum RiskTokenSide {
+    Token0,
+    Token1,
+}
+
+impl RiskTokenSide {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Token0 => "token0",
+            Self::Token1 => "token1",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "autopool")]
 #[command(about = "AILP research CLI for autonomous DEX LP range management")]
@@ -398,6 +413,27 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Poll a Slipstream NPM position and append read-only JSONL snapshots for
+    /// shadow monitoring. This never signs or broadcasts.
+    MonitorPosition {
+        #[arg(long, env = "BASE_RPC_URL")]
+        rpc_url: String,
+        #[arg(long)]
+        token_id: u64,
+        /// Optional pool address. If omitted, the command resolves it from the
+        /// position tokens + tick spacing via the Slipstream pool factory.
+        #[arg(long)]
+        pool_address: Option<String>,
+        #[arg(long, default_value = "logs/base/positions.jsonl")]
+        output: PathBuf,
+        #[arg(long, default_value_t = 60)]
+        poll_seconds: u64,
+        /// Number of snapshots to write. Use 0 for an endless monitor.
+        #[arg(long, default_value_t = 1)]
+        iterations: u64,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Moving-block bootstrap of a collected swap stream: run the policy battery over
     /// many resampled paths and report each policy's net-PnL distribution. Shows that
     /// a delta-hedged LP harvests fee−LVR with low variance while unhedged swings
@@ -475,6 +511,14 @@ enum Command {
         /// Position is staked in the gauge (adds unstake/stake steps + gas).
         #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         staked: bool,
+        /// Which side should be counted as the risk inventory for the one-sided
+        /// inventory gate. For WETH-USDC in natural pool order this is token0; for
+        /// WETH-AERO this is usually token1/AERO.
+        #[arg(long, value_enum, default_value_t = RiskTokenSide::Token1)]
+        risk_token_side: RiskTokenSide,
+        /// Maximum share of portfolio value allowed in the risk token after mint.
+        #[arg(long, default_value_t = 0.8)]
+        max_risk_token_share: f64,
         /// Recipient/owner address baked into the swap & mint calldata (set to the
         /// funded test account when executing the calldata on a local fork).
         #[arg(long, default_value = "0x000000000000000000000000000000000000dEaD")]
@@ -890,6 +934,26 @@ async fn main() -> Result<()> {
             pool_address,
             format,
         } => inspect_position(rpc_url, token_id, pool_address, format).await?,
+        Command::MonitorPosition {
+            rpc_url,
+            token_id,
+            pool_address,
+            output,
+            poll_seconds,
+            iterations,
+            format,
+        } => {
+            monitor_position(PositionMonitorArgs {
+                rpc_url,
+                token_id,
+                pool_address,
+                output,
+                poll_seconds,
+                iterations,
+                format,
+            })
+            .await?
+        }
         Command::MultiPath {
             data_dir,
             pool_address,
@@ -928,6 +992,8 @@ async fn main() -> Result<()> {
             expected_edge_usd,
             max_gas_to_edge_pct,
             staked,
+            risk_token_side,
+            max_risk_token_share,
             recipient,
             skip_quoter,
             format,
@@ -950,6 +1016,8 @@ async fn main() -> Result<()> {
                 expected_edge_usd,
                 max_gas_to_edge_pct,
                 staked,
+                risk_token_side,
+                max_risk_token_share,
                 skip_quoter,
                 format,
             })
@@ -2725,6 +2793,8 @@ struct DryRunArgs {
     expected_edge_usd: f64,
     max_gas_to_edge_pct: f64,
     staked: bool,
+    risk_token_side: RiskTokenSide,
+    max_risk_token_share: f64,
     skip_quoter: bool,
     format: OutputFormat,
 }
@@ -2876,6 +2946,26 @@ fn fit_to_range_ratio(balance0: f64, balance1: f64, target_ratio_1_per_0: f64) -
         .max(0.0)
         .min(balance1.max(0.0) / target_ratio_1_per_0);
     (amount0, amount0 * target_ratio_1_per_0)
+}
+
+fn risk_token_inventory_share(
+    amount0: f64,
+    amount1: f64,
+    price_token1_per_token0: f64,
+    side: RiskTokenSide,
+) -> f64 {
+    if amount0 < 0.0 || amount1 < 0.0 || price_token1_per_token0 <= 0.0 {
+        return 0.0;
+    }
+    let token1_value_in_token0 = amount1 / price_token1_per_token0;
+    let total_value_in_token0 = amount0 + token1_value_in_token0;
+    if total_value_in_token0 <= 0.0 {
+        return 0.0;
+    }
+    match side {
+        RiskTokenSide::Token0 => amount0 / total_value_in_token0,
+        RiskTokenSide::Token1 => token1_value_in_token0 / total_value_in_token0,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3039,19 +3129,17 @@ async fn read_pool_gauge(rpc: &JsonRpcClient, pool_address: &str) -> Result<Opti
     }
 }
 
-async fn inspect_position(
-    rpc_url: String,
+async fn build_position_snapshot(
+    rpc: &JsonRpcClient,
     token_id: u64,
-    pool_address: Option<String>,
-    format: OutputFormat,
-) -> Result<()> {
-    let rpc = JsonRpcClient::new(rpc_url);
+    pool_address: Option<&str>,
+) -> Result<serde_json::Value> {
     let c = BASE_SLIPSTREAM_GAUGES_V3;
     let npm = c.nonfungible_position_manager;
-    let owner = read_owner_of(&rpc, npm, token_id).await?;
-    let position = read_npm_position_detail(&rpc, npm, token_id).await?;
+    let owner = read_owner_of(rpc, npm, token_id).await?;
+    let position = read_npm_position_detail(rpc, npm, token_id).await?;
     let resolved_pool = match pool_address {
-        Some(address) => Some(address),
+        Some(address) => Some(address.to_string()),
         None => {
             rpc.get_cl_pool(
                 c.pool_factory,
@@ -3119,6 +3207,17 @@ async fn inspect_position(
         "requires_signature": false,
         "broadcast": false
     });
+    Ok(result)
+}
+
+async fn inspect_position(
+    rpc_url: String,
+    token_id: u64,
+    pool_address: Option<String>,
+    format: OutputFormat,
+) -> Result<()> {
+    let rpc = JsonRpcClient::new(rpc_url);
+    let result = build_position_snapshot(&rpc, token_id, pool_address.as_deref()).await?;
 
     if format == OutputFormat::Json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -3126,7 +3225,7 @@ async fn inspect_position(
     }
 
     println!("position #{token_id} (read-only)");
-    println!("  npm        : {npm}");
+    println!("  npm        : {}", json_str(&result, "npm"));
     println!("  owner      : {}", result["owner"].as_str().unwrap_or(""));
     if let Some(pool) = result["pool"].as_str() {
         println!("  pool       : {pool}");
@@ -3136,29 +3235,102 @@ async fn inspect_position(
     if let Some(gauge) = result["gauge"].as_str() {
         println!("  gauge      : {gauge}");
     }
-    println!("  staked?    : {appears_staked}");
+    println!("  staked?    : {}", json_bool(&result, "appears_staked"));
     println!("  token0     : {}", result["token0"].as_str().unwrap_or(""));
     println!("  token1     : {}", result["token1"].as_str().unwrap_or(""));
     println!(
         "  range      : [{}, {}) width={} ticks spacing={}",
-        position.tick_lower, position.tick_upper, range_width_ticks, position.tick_spacing
+        json_i64(&result, "tick_lower"),
+        json_i64(&result, "tick_upper"),
+        json_i64(&result, "range_width_ticks"),
+        json_i64(&result, "tick_spacing_position")
     );
-    if let Some(tick) = current_tick {
+    if let Some(tick) = result["current_tick"].as_i64() {
         println!(
             "  current    : tick={} in_range={} dist_lower={} dist_upper={}",
             tick,
-            in_range.unwrap_or(false),
-            distance_to_lower.unwrap_or(0),
-            distance_to_upper.unwrap_or(0)
+            json_optional_bool(&result, "in_range"),
+            json_optional_i64(&result, "distance_to_lower_ticks"),
+            json_optional_i64(&result, "distance_to_upper_ticks")
         );
     }
-    if let Some(fee) = fee_bps {
+    if let Some(fee) = result["fee_bps"].as_f64() {
         println!("  fee_bps    : {fee:.2}");
     }
-    println!("  liquidity  : {}", position.liquidity);
-    println!("  owed0_raw  : {}", position.tokens_owed0);
-    println!("  owed1_raw  : {}", position.tokens_owed1);
+    println!("  liquidity  : {}", json_str(&result, "liquidity_raw"));
+    println!("  owed0_raw  : {}", json_str(&result, "tokens_owed0_raw"));
+    println!("  owed1_raw  : {}", json_str(&result, "tokens_owed1_raw"));
     println!("  broadcast  : false");
+
+    Ok(())
+}
+
+struct PositionMonitorArgs {
+    rpc_url: String,
+    token_id: u64,
+    pool_address: Option<String>,
+    output: PathBuf,
+    poll_seconds: u64,
+    iterations: u64,
+    format: OutputFormat,
+}
+
+async fn monitor_position(args: PositionMonitorArgs) -> Result<()> {
+    if let Some(parent) = args
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating monitor output directory {}", parent.display()))?;
+    }
+    let rpc = JsonRpcClient::new(args.rpc_url);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.output)
+        .with_context(|| format!("opening monitor output {}", args.output.display()))?;
+
+    let mut iteration = 0_u64;
+    loop {
+        if args.iterations != 0 && iteration >= args.iterations {
+            break;
+        }
+        iteration += 1;
+        let mut snapshot =
+            build_position_snapshot(&rpc, args.token_id, args.pool_address.as_deref()).await?;
+        if let Some(object) = snapshot.as_object_mut() {
+            object.insert("monitor_sequence".to_string(), json!(iteration));
+            object.insert(
+                "observed_at_unix".to_string(),
+                json!(current_unix_timestamp()),
+            );
+            object.insert(
+                "monitor_output".to_string(),
+                json!(args.output.display().to_string()),
+            );
+        }
+        writeln!(file, "{}", serde_json::to_string(&snapshot)?)?;
+        file.flush()?;
+
+        match args.format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&snapshot)?),
+            OutputFormat::Table => println!(
+                "snapshot #{iteration} token_id={} tick={} in_range={} owed0={} owed1={} -> {}",
+                args.token_id,
+                json_optional_i64(&snapshot, "current_tick"),
+                json_optional_bool(&snapshot, "in_range"),
+                json_str(&snapshot, "tokens_owed0_raw"),
+                json_str(&snapshot, "tokens_owed1_raw"),
+                args.output.display()
+            ),
+        }
+
+        if args.iterations != 0 && iteration >= args.iterations {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(args.poll_seconds)).await;
+    }
 
     Ok(())
 }
@@ -3338,8 +3510,6 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
             "calldata":calldata
         }));
     }
-    let _ = price_human;
-
     let mint_calldata = autopool_evm::encode_mint(
         &token0,
         &token1,
@@ -3383,15 +3553,8 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
 
     // Risk gates.
     let gas_usd = net.estimated_rebalance_gas_usd.unwrap_or(0.0);
-    let risk_token_share = {
-        let t1_in_t0 = if price_human > 0.0 {
-            mint1 / price_human
-        } else {
-            0.0
-        };
-        let total = mint0 + t1_in_t0;
-        if total > 0.0 { t1_in_t0 / total } else { 0.0 }
-    };
+    let risk_token_share =
+        risk_token_inventory_share(mint0, mint1, price_human, args.risk_token_side);
     let mut gates: Vec<(String, bool, String)> = Vec::new();
     let gas_gate = args.expected_edge_usd <= 0.0
         || gas_usd <= args.max_gas_to_edge_pct * args.expected_edge_usd;
@@ -3407,10 +3570,12 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     ));
     gates.push((
         "one_sided_inventory".into(),
-        risk_token_share <= 0.8,
+        risk_token_share <= args.max_risk_token_share,
         format!(
-            "risk-token (token1) share {:.0}% <= 80%",
-            risk_token_share * 100.0
+            "risk-token ({}) share {:.0}% <= {:.0}%",
+            args.risk_token_side.label(),
+            risk_token_share * 100.0,
+            args.max_risk_token_share * 100.0
         ),
     ));
     gates.push((
@@ -3441,6 +3606,9 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         "tick_spacing": spacing,
         "gas_price_gwei": net.gas_price_gwei,
         "est_gas_usd": gas_usd,
+        "risk_token_side": args.risk_token_side,
+        "max_risk_token_share": args.max_risk_token_share,
+        "risk_token_share": risk_token_share,
         "target_range": {"lower": lower, "upper": upper, "liquidity_est": target_liq},
         "actions": actions,
         "npm_multicall": {"contract": c.nonfungible_position_manager, "calls": npm_calls.len(), "calldata": npm_multicall},
@@ -3466,6 +3634,12 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
             "fresh mint"
         }
     );
+    println!(
+        "risk inventory: {} share {:.1}% (limit {:.1}%)",
+        args.risk_token_side.label(),
+        risk_token_share * 100.0,
+        args.max_risk_token_share * 100.0
+    );
     println!("plan:");
     for (i, a) in actions.iter().enumerate() {
         println!(
@@ -3480,7 +3654,7 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         println!("  [{}] {:<22} {}", if *ok { "PASS" } else { "FAIL" }, n, d);
     }
     println!(
-        "decision: {} (this is a proposal only; full ABI calldata + on-chain eth_call simulation from a funded sender is the next step)",
+        "decision: {} (proposal only; validate executable calldata with scripts/fork-sim-rebalance.sh before any guarded signing path)",
         if all_pass {
             "GATES PASS — would propose"
         } else {
@@ -3872,9 +4046,78 @@ fn optional_f64(value: Option<f64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn json_str(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn json_bool(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_bool())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn json_i64(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_i64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn json_optional_i64(value: &serde_json::Value, key: &str) -> String {
+    json_i64(value, key)
+}
+
+fn json_optional_bool(value: &serde_json::Value, key: &str) -> String {
+    json_bool(value, key)
+}
+
 fn current_unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn risk_token_inventory_share_respects_token_side() {
+        let token0 = 2.0;
+        let token1 = 400.0;
+        let price_token1_per_token0 = 200.0;
+
+        let token0_share = risk_token_inventory_share(
+            token0,
+            token1,
+            price_token1_per_token0,
+            RiskTokenSide::Token0,
+        );
+        let token1_share = risk_token_inventory_share(
+            token0,
+            token1,
+            price_token1_per_token0,
+            RiskTokenSide::Token1,
+        );
+
+        assert!((token0_share - 0.5).abs() < 1e-9);
+        assert!((token1_share - 0.5).abs() < 1e-9);
+        assert!((token0_share + token1_share - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn risk_token_inventory_share_rejects_invalid_price() {
+        assert_eq!(
+            risk_token_inventory_share(1.0, 1.0, 0.0, RiskTokenSide::Token1),
+            0.0
+        );
+    }
 }
