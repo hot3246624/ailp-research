@@ -3,6 +3,58 @@ use autopool_core::{CoreError, PoolKey, PoolMarketState, PositionState, RangeSpe
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tiny_keccak::{Hasher, Keccak};
+
+/// Minimal ABI helpers for building real, signable Slipstream/v3 calldata.
+/// Slipstream uses `int24 tickSpacing` where Uniswap v3 uses `uint24 fee`, so its
+/// function selectors differ — we compute them from the exact signature via keccak.
+pub mod abi {
+    use super::{Hasher, Keccak};
+
+    pub fn keccak256(data: &[u8]) -> [u8; 32] {
+        let mut k = Keccak::v256();
+        k.update(data);
+        let mut out = [0u8; 32];
+        k.finalize(&mut out);
+        out
+    }
+
+    /// First 4 bytes of keccak256(signature), as a lowercase hex string (no 0x).
+    pub fn selector(signature: &str) -> String {
+        let h = keccak256(signature.as_bytes());
+        hex(&h[..4])
+    }
+
+    pub fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Left-pad a 20-byte address into a 32-byte ABI word.
+    pub fn enc_address(addr: &str) -> String {
+        let s = addr.trim_start_matches("0x").to_ascii_lowercase();
+        format!("{s:0>64}")
+    }
+
+    /// uint256 from a u128 (covers raw token amounts up to ~3.4e38).
+    pub fn enc_uint(value: u128) -> String {
+        let mut word = [0u8; 32];
+        word[16..32].copy_from_slice(&value.to_be_bytes());
+        hex(&word)
+    }
+
+    /// Signed integer (e.g. int24 tick) sign-extended to a 32-byte word.
+    pub fn enc_int(value: i64) -> String {
+        let fill = if value < 0 { 0xffu8 } else { 0x00 };
+        let mut word = [fill; 32];
+        word[24..32].copy_from_slice(&value.to_be_bytes());
+        hex(&word)
+    }
+
+    /// Round a raw (decimals-scaled) f64 amount to a u128 for encoding.
+    pub fn amount_to_u128(raw: f64) -> u128 {
+        if raw <= 0.0 { 0 } else { raw.round() as u128 }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EvmError {
@@ -153,6 +205,28 @@ impl JsonRpcClient {
         let calldata = encode_get_pool_call(token_a, token_b, tick_spacing)?;
         let result = self.eth_call(factory, &calldata).await?;
         Ok(decode_address_result(&result))
+    }
+
+    /// Real on-chain swap quote via the Slipstream QuoterV2 (a read-only `eth_call`,
+    /// no funded sender needed). Returns the expected output in raw units. The exact
+    /// struct order is verified empirically against the chain.
+    pub async fn quote_exact_input_single(
+        &self,
+        quoter: &str,
+        token_in: &str,
+        token_out: &str,
+        tick_spacing: i32,
+        amount_in_raw: u128,
+    ) -> Result<u128, EvmError> {
+        let calldata =
+            encode_quote_exact_input_single(token_in, token_out, tick_spacing, amount_in_raw);
+        let result = self.eth_call(quoter, &calldata).await?;
+        // First 32-byte word of the return tuple is amountOut.
+        let words = decode_words(&result)?;
+        let first = words
+            .first()
+            .ok_or_else(|| EvmError::InvalidRpcResponse("empty quoter result".to_string()))?;
+        parse_hex_u128(&format!("0x{}", &first[first.len().saturating_sub(32)..]))
     }
 
     pub async fn read_cl_pool_state(&self, pool_address: &str) -> Result<ClPoolState, EvmError> {
@@ -502,6 +576,92 @@ fn encode_get_pool_call(
     ))
 }
 
+/// Calldata for Slipstream QuoterV2.quoteExactInputSingle((tokenIn, tokenOut,
+/// amountIn, tickSpacing, sqrtPriceLimitX96)). sqrtPriceLimitX96 = 0 (no limit).
+pub fn encode_quote_exact_input_single(
+    token_in: &str,
+    token_out: &str,
+    tick_spacing: i32,
+    amount_in_raw: u128,
+) -> String {
+    let sel = abi::selector("quoteExactInputSingle((address,address,uint256,int24,uint160))");
+    format!(
+        "0x{}{}{}{}{}{}",
+        sel,
+        abi::enc_address(token_in),
+        abi::enc_address(token_out),
+        abi::enc_uint(amount_in_raw),
+        abi::enc_int(tick_spacing as i64),
+        abi::enc_uint(0),
+    )
+}
+
+/// Signable calldata for Slipstream SwapRouter.exactInputSingle((tokenIn, tokenOut,
+/// tickSpacing, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96)).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_exact_input_single(
+    token_in: &str,
+    token_out: &str,
+    tick_spacing: i32,
+    recipient: &str,
+    deadline: u64,
+    amount_in_raw: u128,
+    amount_out_min_raw: u128,
+) -> String {
+    let sel = abi::selector(
+        "exactInputSingle((address,address,int24,address,uint256,uint256,uint256,uint160))",
+    );
+    format!(
+        "0x{}{}{}{}{}{}{}{}{}",
+        sel,
+        abi::enc_address(token_in),
+        abi::enc_address(token_out),
+        abi::enc_int(tick_spacing as i64),
+        abi::enc_address(recipient),
+        abi::enc_uint(deadline as u128),
+        abi::enc_uint(amount_in_raw),
+        abi::enc_uint(amount_out_min_raw),
+        abi::enc_uint(0),
+    )
+}
+
+/// Signable calldata for Slipstream NonfungiblePositionManager.mint((token0, token1,
+/// tickSpacing, tickLower, tickUpper, amount0Desired, amount1Desired, amount0Min,
+/// amount1Min, recipient, deadline, sqrtPriceX96)).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_mint(
+    token0: &str,
+    token1: &str,
+    tick_spacing: i32,
+    tick_lower: i32,
+    tick_upper: i32,
+    amount0_desired: u128,
+    amount1_desired: u128,
+    amount0_min: u128,
+    amount1_min: u128,
+    recipient: &str,
+    deadline: u64,
+) -> String {
+    let sel = abi::selector(
+        "mint((address,address,int24,int24,int24,uint256,uint256,uint256,uint256,address,uint256,uint160))",
+    );
+    let parts = [
+        abi::enc_address(token0),
+        abi::enc_address(token1),
+        abi::enc_int(tick_spacing as i64),
+        abi::enc_int(tick_lower as i64),
+        abi::enc_int(tick_upper as i64),
+        abi::enc_uint(amount0_desired),
+        abi::enc_uint(amount1_desired),
+        abi::enc_uint(amount0_min),
+        abi::enc_uint(amount1_min),
+        abi::enc_address(recipient),
+        abi::enc_uint(deadline as u128),
+        abi::enc_uint(0),
+    ];
+    format!("0x{}{}", sel, parts.concat())
+}
+
 fn encode_address(address: &str) -> Result<String, EvmError> {
     let stripped = address.trim_start_matches("0x");
     if stripped.len() != 40 || !stripped.chars().all(|value| value.is_ascii_hexdigit()) {
@@ -588,6 +748,42 @@ mod tests {
     fn parses_rpc_hex_values() {
         assert_eq!(parse_hex_u64("0x10").unwrap(), 16);
         assert_eq!(parse_hex_u128("0x3b9aca00").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn keccak_selector_matches_known() {
+        // getPool(address,address,int24) is the call encode_get_pool_call uses (0x28af8d0b).
+        assert_eq!(abi::selector("getPool(address,address,int24)"), "28af8d0b");
+        // A canonical Uniswap selector as an independent check: transfer(address,uint256).
+        assert_eq!(abi::selector("transfer(address,uint256)"), "a9059cbb");
+    }
+
+    #[test]
+    fn encodes_signed_ticks_and_amounts() {
+        assert_eq!(
+            abi::enc_int(-1),
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert_eq!(
+            abi::enc_int(0),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            abi::enc_uint(1),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        // Real swap calldata starts with the right selector and is word-aligned.
+        let cd = encode_exact_input_single(
+            "0x4200000000000000000000000000000000000006",
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            100,
+            "0x000000000000000000000000000000000000dead",
+            1_900_000_000,
+            1_000_000_000_000_000_000,
+            900_000_000,
+        );
+        assert!(cd.starts_with("0x"));
+        assert_eq!((cd.len() - 2) % 64, 8); // 4-byte selector + n*32-byte words
     }
 
     #[test]

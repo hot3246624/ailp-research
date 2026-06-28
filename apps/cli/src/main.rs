@@ -2227,6 +2227,17 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         .sample_network(BASE_CHAIN_ID, args.rebalance_gas_units, Some(args.eth_usd))
         .await?;
 
+    // Read the pool's tokens so we can build real, signable calldata.
+    let read_addr = |hex: &str| -> String {
+        let w = hex.trim_start_matches("0x");
+        format!("0x{}", &w[w.len().saturating_sub(40)..])
+    };
+    let token0 = read_addr(&rpc.eth_call(&args.pool_address, "0x0dfe1681").await?);
+    let token1 = read_addr(&rpc.eth_call(&args.pool_address, "0xd21220a7").await?);
+    // Placeholder owner + deadline for the (unsigned) calldata.
+    let recipient = "0x000000000000000000000000000000000000dEaD";
+    let deadline = current_unix_timestamp() + 1200;
+
     let sqrt_x96 = hex_word_to_f64(&state.sqrt_price_x96_hex);
     let spacing = state.tick_spacing.max(1);
     let lower = snap_to_spacing(state.current_tick - args.half_width_ticks, spacing);
@@ -2287,37 +2298,69 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     let pool_liquidity = state.liquidity.parse::<f64>().unwrap_or(0.0);
     let fee_fraction = fee_bps / 10_000.0;
     let mut swap_impact_bps = 0.0_f64;
-    if d0 < -1e-12 {
-        // excess token0 -> sell for token1 (zero_for_one)
-        let amount_in = -d0;
-        let amount_in_raw = amount_in * 10f64.powi(args.decimals0 as i32);
-        let sim = autopool_backtest::simulate_v3_swap(
-            sqrt_x96,
-            pool_liquidity,
-            fee_fraction,
-            amount_in_raw,
-            true,
-        );
-        let expected_out = sim.amount_out / 10f64.powi(args.decimals1 as i32);
-        swap_impact_bps = sim.price_impact_bps;
-        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token0->token1)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip),"price_impact_bps":sim.price_impact_bps}));
+    // (token_in, token_out, amount_in_human, dec_in, dec_out, zero_for_one)
+    let swap_leg = if d0 < -1e-12 {
+        Some((&token0, &token1, -d0, args.decimals0, args.decimals1, true))
     } else if d1 < -1e-12 {
-        let amount_in = -d1;
-        let amount_in_raw = amount_in * 10f64.powi(args.decimals1 as i32);
+        Some((&token1, &token0, -d1, args.decimals1, args.decimals0, false))
+    } else {
+        None
+    };
+    if let Some((tin, tout, amount_in, dec_in, dec_out, zfo)) = swap_leg {
+        let amount_in_raw = amount_in * 10f64.powi(dec_in as i32);
+        let amount_in_u128 = amount_in_raw.round() as u128;
         let sim = autopool_backtest::simulate_v3_swap(
             sqrt_x96,
             pool_liquidity,
             fee_fraction,
             amount_in_raw,
-            false,
+            zfo,
         );
-        let expected_out = sim.amount_out / 10f64.powi(args.decimals0 as i32);
+        let expected_out = sim.amount_out / 10f64.powi(dec_out as i32);
         swap_impact_bps = sim.price_impact_bps;
-        actions.push(json!({"step":"swap","contract":c.swap_router,"call":"exactInputSingle(token1->token0)","amount_in":amount_in,"expected_out":expected_out,"amountOutMin":expected_out*(1.0-slip),"price_impact_bps":sim.price_impact_bps}));
+        let amount_out_min = (expected_out * (1.0 - slip)).max(0.0);
+        let amount_out_min_raw = (amount_out_min * 10f64.powi(dec_out as i32)).round() as u128;
+        // Best-effort real on-chain quote via the Quoter (read-only eth_call).
+        let onchain_out = match rpc
+            .quote_exact_input_single(c.mixed_quoter, tin, tout, spacing, amount_in_u128)
+            .await
+        {
+            Ok(out_raw) => json!(out_raw as f64 / 10f64.powi(dec_out as i32)),
+            Err(e) => json!(format!("quoter unavailable: {e}")),
+        };
+        let calldata = autopool_evm::encode_exact_input_single(
+            tin,
+            tout,
+            spacing,
+            recipient,
+            deadline,
+            amount_in_u128,
+            amount_out_min_raw,
+        );
+        actions.push(json!({
+            "step":"swap","contract":c.swap_router,
+            "call":format!("exactInputSingle({} -> {})", tin, tout),
+            "amount_in":amount_in,"expected_out_sim":expected_out,"onchain_quote_out":onchain_out,
+            "amountOutMin":amount_out_min,"price_impact_bps":sim.price_impact_bps,
+            "calldata":calldata
+        }));
     }
     let _ = price_human;
 
-    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(token0,token1,tickSpacing,tickLower,tickUpper,amount0Desired,amount1Desired,amount0Min,amount1Min,recipient,deadline)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip)}));
+    let mint_calldata = autopool_evm::encode_mint(
+        &token0,
+        &token1,
+        spacing,
+        lower,
+        upper,
+        (t0 * 10f64.powi(args.decimals0 as i32)).round() as u128,
+        (t1 * 10f64.powi(args.decimals1 as i32)).round() as u128,
+        (t0 * (1.0 - slip) * 10f64.powi(args.decimals0 as i32)).round() as u128,
+        (t1 * (1.0 - slip) * 10f64.powi(args.decimals1 as i32)).round() as u128,
+        recipient,
+        deadline,
+    );
+    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(...)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip),"calldata":mint_calldata}));
     if args.staked {
         actions.push(json!({"step":"stake","contract":c.gauge_factory,"call":"gauge.deposit(tokenId)","note":"stake the new NFT to earn emissions"}));
     }

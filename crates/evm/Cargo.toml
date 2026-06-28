@@ -12,4 +12,5 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tiny-keccak = { version = "2", features = ["keccak"] }
 tokio.workspace = true
