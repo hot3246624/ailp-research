@@ -54,6 +54,47 @@ pub mod abi {
     pub fn amount_to_u128(raw: f64) -> u128 {
         if raw <= 0.0 { 0 } else { raw.round() as u128 }
     }
+
+    /// Decode a hex string (with/without 0x) into bytes.
+    pub fn hex_decode(s: &str) -> Vec<u8> {
+        let s = s.trim_start_matches("0x");
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or(0))
+            .collect()
+    }
+
+    /// Encode `multicall(bytes[] data)` — bundles several calls into one tx on a
+    /// contract that supports it (the Slipstream NonfungiblePositionManager does).
+    pub fn encode_multicall(calls: &[String]) -> String {
+        let elems: Vec<Vec<u8>> = calls.iter().map(|c| hex_decode(c)).collect();
+        let n = elems.len();
+        // Offsets are relative to the start of the array's data region (after the
+        // length word), so the first element sits past the n-word offset table.
+        let mut offsets = String::new();
+        let mut data = String::new();
+        let mut running = (n * 32) as u128;
+        for e in &elems {
+            offsets.push_str(&enc_uint(running));
+            let padded = ((e.len() + 31) / 32) * 32;
+            running += (32 + padded) as u128;
+        }
+        for e in &elems {
+            data.push_str(&enc_uint(e.len() as u128));
+            let mut h = hex(e);
+            while h.len() % 64 != 0 {
+                h.push('0');
+            }
+            data.push_str(&h);
+        }
+        format!(
+            "0x{}{}{}{}{}",
+            selector("multicall(bytes[])"),
+            enc_uint(0x20),
+            enc_uint(n as u128),
+            offsets,
+            data
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -664,6 +705,41 @@ pub fn encode_exact_input_single(
     )
 }
 
+/// Slipstream NPM.collect((tokenId, recipient, amount0Max, amount1Max)) — collect
+/// all uncollected fees (maxes = uint128::MAX).
+pub fn encode_collect(token_id: u128, recipient: &str) -> String {
+    let sel = abi::selector("collect((uint256,address,uint128,uint128))");
+    format!(
+        "0x{}{}{}{}{}",
+        sel,
+        abi::enc_uint(token_id),
+        abi::enc_address(recipient),
+        abi::enc_uint(u128::MAX),
+        abi::enc_uint(u128::MAX),
+    )
+}
+
+/// Slipstream NPM.decreaseLiquidity((tokenId, liquidity, amount0Min, amount1Min,
+/// deadline)) — withdraw `liquidity` from the position.
+pub fn encode_decrease_liquidity(
+    token_id: u128,
+    liquidity: u128,
+    amount0_min: u128,
+    amount1_min: u128,
+    deadline: u64,
+) -> String {
+    let sel = abi::selector("decreaseLiquidity((uint256,uint128,uint256,uint256,uint256))");
+    format!(
+        "0x{}{}{}{}{}{}",
+        sel,
+        abi::enc_uint(token_id),
+        abi::enc_uint(liquidity),
+        abi::enc_uint(amount0_min),
+        abi::enc_uint(amount1_min),
+        abi::enc_uint(deadline as u128),
+    )
+}
+
 /// Signable calldata for Slipstream NonfungiblePositionManager.mint((token0, token1,
 /// tickSpacing, tickLower, tickUpper, amount0Desired, amount1Desired, amount0Min,
 /// amount1Min, recipient, deadline, sqrtPriceX96)).
@@ -787,6 +863,24 @@ mod tests {
     fn parses_rpc_hex_values() {
         assert_eq!(parse_hex_u64("0x10").unwrap(), 16);
         assert_eq!(parse_hex_u128("0x3b9aca00").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn encodes_multicall_bytes_array() {
+        // multicall selector is the well-known 0xac9650d8.
+        assert_eq!(abi::selector("multicall(bytes[])"), "ac9650d8");
+        // Two short calls: structure = selector + head(0x20) + len(2) + 2 offsets +
+        // 2 elements (each len word + padded data).
+        let cd = abi::encode_multicall(&["0xaabbccdd".to_string(), "0x11223344".to_string()]);
+        let body = cd.trim_start_matches("0x");
+        assert_eq!(&body[..8], "ac9650d8");
+        // head offset = 0x20
+        assert!(body[8..72].ends_with("20"));
+        // array length = 2
+        assert!(body[72..136].ends_with("2"));
+        // first element's offset is 0x40 (two offset words), second 0x80.
+        assert!(body[136..200].ends_with("40"));
+        assert!(body[200..264].ends_with("80"));
     }
 
     #[test]

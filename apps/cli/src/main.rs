@@ -361,6 +361,9 @@ enum Command {
         current_lower: Option<i32>,
         #[arg(long)]
         current_upper: Option<i32>,
+        /// Existing position NFT id (enables a real collect+decrease+mint multicall).
+        #[arg(long)]
+        token_id: Option<u64>,
         /// Max slippage on the rebalance swap and mint, in bps.
         #[arg(long, default_value_t = 30.0)]
         slippage_bps: f64,
@@ -753,6 +756,7 @@ async fn main() -> Result<()> {
             half_width_ticks,
             current_lower,
             current_upper,
+            token_id,
             slippage_bps,
             rebalance_gas_units,
             eth_usd,
@@ -771,6 +775,7 @@ async fn main() -> Result<()> {
                 half_width_ticks,
                 current_lower,
                 current_upper,
+                token_id,
                 slippage_bps,
                 rebalance_gas_units,
                 eth_usd,
@@ -2188,6 +2193,7 @@ struct DryRunArgs {
     half_width_ticks: i32,
     current_lower: Option<i32>,
     current_upper: Option<i32>,
+    token_id: Option<u64>,
     slippage_bps: f64,
     rebalance_gas_units: u64,
     eth_usd: f64,
@@ -2253,10 +2259,11 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         sqrt_x96,
         capital_token0,
     );
-    // Current inventory: from the old band if rebalancing, else all token0.
+    // Current inventory + liquidity: from the old band if rebalancing, else all token0.
+    let mut current_liquidity = 0.0_f64;
     let (c0, c1) = match (args.current_lower, args.current_upper) {
         (Some(cl), Some(cu)) => {
-            let (a0, a1, _) = autopool_backtest::cl_mint_amounts(
+            let (a0, a1, liq) = autopool_backtest::cl_mint_amounts(
                 args.decimals0,
                 args.decimals1,
                 cl,
@@ -2264,6 +2271,7 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
                 sqrt_x96,
                 capital_token0,
             );
+            current_liquidity = liq;
             (a0, a1)
         }
         _ => (capital_token0, 0.0),
@@ -2360,10 +2368,30 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         recipient,
         deadline,
     );
-    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(...)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip),"calldata":mint_calldata}));
+    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(...)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip),"calldata":mint_calldata.clone()}));
     if args.staked {
         actions.push(json!({"step":"stake","contract":c.gauge_factory,"call":"gauge.deposit(tokenId)","note":"stake the new NFT to earn emissions"}));
     }
+
+    // Bundle the NPM-side calls (collect + decreaseLiquidity + mint when rebalancing
+    // an existing tokenId, else just mint) into one real multicall calldata. The swap
+    // (SwapRouter) and stake (gauge) are separate contracts, so separate txs.
+    let mut npm_calls: Vec<String> = Vec::new();
+    if rebalancing {
+        if let Some(tid) = args.token_id {
+            let tid = tid as u128;
+            npm_calls.push(autopool_evm::encode_collect(tid, recipient));
+            npm_calls.push(autopool_evm::encode_decrease_liquidity(
+                tid,
+                current_liquidity.round() as u128,
+                (c0 * (1.0 - slip) * 10f64.powi(args.decimals0 as i32)).round() as u128,
+                (c1 * (1.0 - slip) * 10f64.powi(args.decimals1 as i32)).round() as u128,
+                deadline,
+            ));
+        }
+    }
+    npm_calls.push(mint_calldata);
+    let npm_multicall = autopool_evm::abi::encode_multicall(&npm_calls);
 
     // Risk gates.
     let gas_usd = net.estimated_rebalance_gas_usd.unwrap_or(0.0);
@@ -2427,6 +2455,7 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         "est_gas_usd": gas_usd,
         "target_range": {"lower": lower, "upper": upper, "liquidity_est": target_liq},
         "actions": actions,
+        "npm_multicall": {"contract": c.nonfungible_position_manager, "calls": npm_calls.len(), "calldata": npm_multicall},
         "gates": gates.iter().map(|(n,ok,d)| json!({"gate":n,"pass":ok,"detail":d})).collect::<Vec<_>>(),
         "all_gates_pass": all_pass,
     });
