@@ -78,11 +78,13 @@ the execution layer now enforces it before any signature.
 
 ## Real calldata (done) + on-chain quote (partial)
 
-The planner now emits **real, signable calldata bytes** for the swap and mint.
+The planner now emits **real, signable calldata bytes** for the swap, collect,
+decreaseLiquidity, and mint path.
 Selectors are computed with **keccak** from the exact Slipstream signatures (which use
 `int24 tickSpacing`, not `uint24 fee`), and verified against known selectors
-(`getPool(address,address,int24)` → `28af8d0b`, `transfer` → `a9059cbb`). Ticks are
-sign-extended int24; example swap calldata for WETH→AERO decodes correctly
+(`getPool(address,address,int24)` -> `28af8d0b`, `transfer` -> `a9059cbb`,
+`burn(uint256)` -> `42966c68`). Ticks are sign-extended int24; example swap calldata
+for WETH->AERO decodes correctly
 (selector `a026383e`, tokens, `tickSpacing=0xc8`=200, recipient, deadline, amountIn).
 
 The **swap is simulated against the pool's real in-range liquidity**
@@ -99,40 +101,64 @@ sim is the working swap simulation in the meantime.
 ## Multicall (done)
 
 The NPM-side actions are bundled into one real `multicall(bytes[])` calldata
-(`abi::encode_multicall`, selector `ac9650d8` verified): `collect + decreaseLiquidity
-+ mint` when rebalancing a known `--token-id`, else just `mint`. The swap (SwapRouter)
-and stake (gauge) are different contracts, so they stay separate txs. Example: a
-WETH-AERO rebalance produces a 1,028-byte NPM multicall over the full lifecycle
-`unstake → collect → decreaseLiquidity → burn → swap → mint → stake`.
+(`abi::encode_multicall`, selector `ac9650d8` verified):
 
-## What still needs a tool I don't have (the ask)
+- Fresh position: `mint`.
+- Rebalance with known `--token-id`: `collect -> decreaseLiquidity -> collect -> mint`.
 
-- **Full bundle `eth_call` simulation from a funded sender** — to get *real* gas +
-  revert reasons for the mint/collect/decrease bundle, I need a **mainnet fork**:
-  `anvil`/Foundry installed on the EC2 box, or a **Tenderly API key**. Raw `eth_call`
-  state-overrides can't cleanly fund the NFT mint + gauge stake by hand. This single
-  tool also unblocks the on-chain Quoter (a fork returns the v1 revert data).
-- **On-chain Quoter result** — the free Alchemy tier returns `{"code":3,"message":
-  "execution reverted"}` with **no `data` field**, so the v1 quoter's revert payload
-  can't be read. Needs an RPC that returns revert data (Foundry/Tenderly/paid tier).
-  Until then the dry-run uses the offline real-state `simulate_v3_swap` (valid for
-  within-tick swaps).
+The second `collect` is required. Slipstream's `decreaseLiquidity` records withdrawn
+principal as owed tokens; it does not transfer the tokens to the wallet. Without the
+second `collect`, the following `mint` reverts in the callback with `STF` because the
+wallet cannot satisfy `transferFrom`.
 
-Everything else — real selectors, signable swap/mint/collect/decrease calldata, the
-multicall bundle, real-state swap sim, and the risk gates — is done and never signs.
+`burn(tokenId)` is intentionally **not** part of the executable rebalance multicall.
+It is a separate cleanup step for the empty old NFT; the funded fork showed Slipstream
+can reject `burn` in the same path with `NC` even after principal is collected. The
+strategy does not require burn to complete the capital rotation.
+
+The swap (SwapRouter) and stake (gauge) are different contracts, so they stay separate
+txs. A staked position still needs `unstake` before modification and `stake` after the
+new NFT is minted.
+
+## Funded fork simulation (done)
+
+`scripts/fork-sim-rebalance.sh` starts a local Base fork, funds the standard anvil test
+account, deposits WETH, approves the router/NPM, executes the dry-run's real calldata,
+and checks receipt status. It never signs or broadcasts on mainnet.
+
+Validated on WETH-AERO GaugesV3 (`0x4e5066...e51`) using a local Base fork:
+
+| step | calls | gas |
+| --- | ---: | ---: |
+| fresh SwapRouter swap | 1 | 219,338 |
+| fresh NPM mint multicall | 1 | 384,761 |
+| rebalance NPM multicall | 4 | 497,334 |
+
+Two fork findings are now baked into the CLI:
+
+- The funded recipient must be configurable (`--recipient`) so fork calldata pulls from
+  the funded test account rather than the dead default address.
+- NPM position liquidity is read as exact `u128` and passed unchanged to
+  `decreaseLiquidity`; converting through `f64` can round above the real liquidity and
+  cause an immediate NPM revert.
+
+## Remaining gaps
+
+- **On-chain Quoter result.** The free Alchemy tier returns `{"code":3,"message":
+  "execution reverted"}` with no revert `data`, so the v1 quoter payload still cannot
+  be decoded reliably. The dry-run keeps using the offline real-state
+  `simulate_v3_swap` unless `--skip-quoter=false` succeeds on a better RPC/fork.
 - **The delta-hedge leg.** The deployable strategy is delta-hedged, but the short is a
-  **perp on a different venue** (e.g. Hyperliquid), so it is a *separate* plan/adapter,
-  not a Slipstream action.
+  perp on a different venue (e.g. Hyperliquid), so it is a separate plan/adapter, not a
+  Slipstream action.
 - **Risk-gate token orientation.** The one-sided-inventory gate treats token1 as the
   risk asset (matching the engine / `--invert` convention). For a pool read in natural
   order where the risk asset is token0 (e.g. WETH in WETH-USDC), verify the side.
 
 ## Next
 
-1. Encode real calldata + a `multicall`, and simulate the bundle via `eth_call` from a
-   funded read-only sender (or a fork) to get true amounts/gas/reverts.
-2. Add the perp-hedge plan as a second adapter and a combined risk view.
-3. Wire the plan to the actual strategy output (delta-hedged narrow band on the
+1. Add the perp-hedge plan as a second adapter and a combined risk view.
+2. Wire the plan to the actual strategy output (delta-hedged narrow band on the
    highest-`fee/vol` pool) so proposals are generated from live state.
-4. Only after stable dry-run proposals: guarded execution behind config gates
+3. Only after stable dry-run proposals: guarded execution behind config gates
    (Milestone 6), still never signing without explicit opt-in.

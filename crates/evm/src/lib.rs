@@ -740,6 +740,13 @@ pub fn encode_decrease_liquidity(
     )
 }
 
+/// Slipstream NPM.burn(tokenId) — burn an empty position after liquidity and
+/// owed tokens have been fully collected.
+pub fn encode_burn(token_id: u128) -> String {
+    let sel = abi::selector("burn(uint256)");
+    format!("0x{}{}", sel, abi::enc_uint(token_id))
+}
+
 /// Signable calldata for Slipstream NonfungiblePositionManager.mint((token0, token1,
 /// tickSpacing, tickLower, tickUpper, amount0Desired, amount1Desired, amount0Min,
 /// amount1Min, recipient, deadline, sqrtPriceX96)).
@@ -889,6 +896,8 @@ mod tests {
         assert_eq!(abi::selector("getPool(address,address,int24)"), "28af8d0b");
         // A canonical Uniswap selector as an independent check: transfer(address,uint256).
         assert_eq!(abi::selector("transfer(address,uint256)"), "a9059cbb");
+        // NonfungiblePositionManager burn(uint256).
+        assert_eq!(abi::selector("burn(uint256)"), "42966c68");
     }
 
     #[test]

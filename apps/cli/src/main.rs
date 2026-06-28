@@ -379,8 +379,17 @@ enum Command {
         #[arg(long, default_value_t = 0.15)]
         max_gas_to_edge_pct: f64,
         /// Position is staked in the gauge (adds unstake/stake steps + gas).
-        #[arg(long, default_value_t = true)]
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         staked: bool,
+        /// Recipient/owner address baked into the swap & mint calldata (set to the
+        /// funded test account when executing the calldata on a local fork).
+        #[arg(long, default_value = "0x000000000000000000000000000000000000dEaD")]
+        recipient: String,
+        /// Skip the on-chain Quoter eth_call and rely on the local v3 state
+        /// simulation. Useful on forks/free RPCs where revert data or upstream
+        /// account fetches are unreliable.
+        #[arg(long, default_value_t = false)]
+        skip_quoter: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -763,6 +772,8 @@ async fn main() -> Result<()> {
             expected_edge_usd,
             max_gas_to_edge_pct,
             staked,
+            recipient,
+            skip_quoter,
             format,
         } => {
             dry_run_rebalance(DryRunArgs {
@@ -776,12 +787,14 @@ async fn main() -> Result<()> {
                 current_lower,
                 current_upper,
                 token_id,
+                recipient,
                 slippage_bps,
                 rebalance_gas_units,
                 eth_usd,
                 expected_edge_usd,
                 max_gas_to_edge_pct,
                 staked,
+                skip_quoter,
                 format,
             })
             .await?
@@ -2194,12 +2207,14 @@ struct DryRunArgs {
     current_lower: Option<i32>,
     current_upper: Option<i32>,
     token_id: Option<u64>,
+    recipient: String,
     slippage_bps: f64,
     rebalance_gas_units: u64,
     eth_usd: f64,
     expected_edge_usd: f64,
     max_gas_to_edge_pct: f64,
     staked: bool,
+    skip_quoter: bool,
     format: OutputFormat,
 }
 
@@ -2215,6 +2230,200 @@ fn hex_word_to_f64(hex: &str) -> f64 {
 fn snap_to_spacing(tick: i32, spacing: i32) -> i32 {
     let s = spacing.max(1);
     ((tick as f64 / s as f64).round() as i32) * s
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DryRunSwapPlan {
+    zero_for_one: bool,
+    amount_in: f64,
+    expected_out: f64,
+    price_impact_bps: f64,
+}
+
+fn solve_inventory_swap(
+    sqrt_x96: f64,
+    liquidity: f64,
+    fee_fraction: f64,
+    decimals0: u8,
+    decimals1: u8,
+    current0: f64,
+    current1: f64,
+    target_ratio_1_per_0: f64,
+) -> Option<DryRunSwapPlan> {
+    if liquidity <= 0.0
+        || current0 < 0.0
+        || current1 < 0.0
+        || !target_ratio_1_per_0.is_finite()
+        || target_ratio_1_per_0 <= 0.0
+    {
+        return None;
+    }
+
+    let current_ratio = if current0 > 0.0 {
+        current1 / current0
+    } else {
+        f64::INFINITY
+    };
+    if current_ratio.is_finite()
+        && ((current_ratio - target_ratio_1_per_0).abs() / target_ratio_1_per_0) < 0.0001
+    {
+        return None;
+    }
+
+    if current_ratio < target_ratio_1_per_0 {
+        let mut lo = 0.0;
+        let mut hi = current0 * 0.999;
+        if hi <= 0.0 {
+            return None;
+        }
+        for _ in 0..80 {
+            let mid = (lo + hi) / 2.0;
+            let sim = autopool_backtest::simulate_v3_swap(
+                sqrt_x96,
+                liquidity,
+                fee_fraction,
+                mid * 10f64.powi(decimals0 as i32),
+                true,
+            );
+            let out = sim.amount_out / 10f64.powi(decimals1 as i32);
+            let post0 = current0 - mid;
+            let post1 = current1 + out;
+            let ratio = if post0 > 0.0 {
+                post1 / post0
+            } else {
+                f64::INFINITY
+            };
+            if ratio < target_ratio_1_per_0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let sim = autopool_backtest::simulate_v3_swap(
+            sqrt_x96,
+            liquidity,
+            fee_fraction,
+            hi * 10f64.powi(decimals0 as i32),
+            true,
+        );
+        return Some(DryRunSwapPlan {
+            zero_for_one: true,
+            amount_in: hi,
+            expected_out: sim.amount_out / 10f64.powi(decimals1 as i32),
+            price_impact_bps: sim.price_impact_bps,
+        });
+    }
+
+    let mut lo = 0.0;
+    let mut hi = current1 * 0.999;
+    if hi <= 0.0 {
+        return None;
+    }
+    for _ in 0..80 {
+        let mid = (lo + hi) / 2.0;
+        let sim = autopool_backtest::simulate_v3_swap(
+            sqrt_x96,
+            liquidity,
+            fee_fraction,
+            mid * 10f64.powi(decimals1 as i32),
+            false,
+        );
+        let out = sim.amount_out / 10f64.powi(decimals0 as i32);
+        let post0 = current0 + out;
+        let post1 = current1 - mid;
+        let ratio = if post0 > 0.0 {
+            post1 / post0
+        } else {
+            f64::INFINITY
+        };
+        if ratio > target_ratio_1_per_0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let sim = autopool_backtest::simulate_v3_swap(
+        sqrt_x96,
+        liquidity,
+        fee_fraction,
+        hi * 10f64.powi(decimals1 as i32),
+        false,
+    );
+    Some(DryRunSwapPlan {
+        zero_for_one: false,
+        amount_in: hi,
+        expected_out: sim.amount_out / 10f64.powi(decimals0 as i32),
+        price_impact_bps: sim.price_impact_bps,
+    })
+}
+
+fn fit_to_range_ratio(balance0: f64, balance1: f64, target_ratio_1_per_0: f64) -> (f64, f64) {
+    if !target_ratio_1_per_0.is_finite() || target_ratio_1_per_0 <= 0.0 {
+        return (balance0.max(0.0), balance1.max(0.0));
+    }
+    let amount0 = balance0
+        .max(0.0)
+        .min(balance1.max(0.0) / target_ratio_1_per_0);
+    (amount0, amount0 * target_ratio_1_per_0)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NpmPositionSnapshot {
+    tick_lower: i32,
+    tick_upper: i32,
+    liquidity: u128,
+}
+
+async fn read_npm_position(
+    rpc: &JsonRpcClient,
+    npm: &str,
+    token_id: u64,
+) -> Result<NpmPositionSnapshot> {
+    let calldata = format!(
+        "0x{}{}",
+        autopool_evm::abi::selector("positions(uint256)"),
+        autopool_evm::abi::enc_uint(token_id as u128)
+    );
+    let raw = rpc.eth_call(npm, &calldata).await?;
+    let words = abi_words(&raw).context("positions(tokenId) returned malformed ABI")?;
+    let tick_lower = decode_i24_abi_word(
+        words
+            .get(5)
+            .context("positions(tokenId) missing tickLower word")?,
+    )?;
+    let tick_upper = decode_i24_abi_word(
+        words
+            .get(6)
+            .context("positions(tokenId) missing tickUpper word")?,
+    )?;
+    let liquidity = decode_u128_abi_word(
+        words
+            .get(7)
+            .context("positions(tokenId) missing liquidity word")?,
+    )?;
+
+    Ok(NpmPositionSnapshot {
+        tick_lower,
+        tick_upper,
+        liquidity,
+    })
+}
+
+fn decode_i24_abi_word(word: &str) -> Result<i32> {
+    let lower = &word[word.len().saturating_sub(6)..];
+    let raw = i32::from_str_radix(lower, 16)?;
+    Ok(if raw & 0x80_0000 != 0 {
+        raw - 0x100_0000
+    } else {
+        raw
+    })
+}
+
+fn decode_u128_abi_word(word: &str) -> Result<u128> {
+    Ok(u128::from_str_radix(
+        &word[word.len().saturating_sub(32)..],
+        16,
+    )?)
 }
 
 /// Build a dry-run Slipstream (v3) rebalance plan. Reads pool state, computes the
@@ -2240,9 +2449,16 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     };
     let token0 = read_addr(&rpc.eth_call(&args.pool_address, "0x0dfe1681").await?);
     let token1 = read_addr(&rpc.eth_call(&args.pool_address, "0xd21220a7").await?);
-    // Placeholder owner + deadline for the (unsigned) calldata.
-    let recipient = "0x000000000000000000000000000000000000dEaD";
+    // Owner/recipient + deadline baked into the (unsigned) calldata.
+    let recipient = args.recipient.as_str();
     let deadline = current_unix_timestamp() + 1200;
+    let c = BASE_SLIPSTREAM_GAUGES_V3;
+    let npm_position = match args.token_id {
+        Some(token_id) => {
+            Some(read_npm_position(&rpc, c.nonfungible_position_manager, token_id).await?)
+        }
+        None => None,
+    };
 
     let sqrt_x96 = hex_word_to_f64(&state.sqrt_price_x96_hex);
     let spacing = state.tick_spacing.max(1);
@@ -2261,9 +2477,16 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     );
     // Current inventory + liquidity: from the old band if rebalancing, else all token0.
     let mut current_liquidity = 0.0_f64;
-    let (c0, c1) = match (args.current_lower, args.current_upper) {
+    let mut current_liquidity_raw: Option<u128> = None;
+    let current_lower = args
+        .current_lower
+        .or_else(|| npm_position.as_ref().map(|position| position.tick_lower));
+    let current_upper = args
+        .current_upper
+        .or_else(|| npm_position.as_ref().map(|position| position.tick_upper));
+    let (c0, c1) = match (current_lower, current_upper) {
         (Some(cl), Some(cu)) => {
-            let (a0, a1, liq) = autopool_backtest::cl_mint_amounts(
+            let (mut a0, mut a1, liq) = autopool_backtest::cl_mint_amounts(
                 args.decimals0,
                 args.decimals1,
                 cl,
@@ -2271,7 +2494,18 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
                 sqrt_x96,
                 capital_token0,
             );
-            current_liquidity = liq;
+            if let Some(position) = npm_position {
+                current_liquidity = position.liquidity as f64;
+                current_liquidity_raw = Some(position.liquidity);
+                if liq > 0.0 {
+                    let scale = current_liquidity / liq;
+                    a0 *= scale;
+                    a1 *= scale;
+                }
+            } else {
+                current_liquidity = liq;
+                current_liquidity_raw = Some(liq.round() as u128);
+            }
             (a0, a1)
         }
         _ => (capital_token0, 0.0),
@@ -2282,59 +2516,73 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         p_raw * 10f64.powi(args.decimals0 as i32 - args.decimals1 as i32)
     };
     let slip = args.slippage_bps / 10_000.0;
+    let target_ratio_1_per_0 = if t0 > 0.0 { t1 / t0 } else { f64::INFINITY };
 
     // Slipstream/v3 deployment contracts (verify the pool's deployment matches).
-    let c = BASE_SLIPSTREAM_GAUGES_V3;
-    let rebalancing = args.current_lower.is_some() && args.current_upper.is_some();
+    let rebalancing = current_lower.is_some() && current_upper.is_some();
     let mut actions: Vec<serde_json::Value> = Vec::new();
 
     if rebalancing && args.staked {
         actions.push(json!({"step":"unstake","contract":c.gauge_factory,"call":"gauge.withdraw(tokenId)","note":"emissions require staking; must unstake before modifying"}));
     }
     if rebalancing {
-        actions.push(json!({"step":"collect","contract":c.nonfungible_position_manager,"call":"collect(tokenId, max, max)","expects":"uncollected fees out"}));
+        actions.push(json!({"step":"collect","contract":c.nonfungible_position_manager,"call":"collect(tokenId, max, max)","expects":"pre-decrease fees out"}));
         actions.push(json!({"step":"decreaseLiquidity","contract":c.nonfungible_position_manager,"call":"decreaseLiquidity(tokenId, liquidity, amount0Min, amount1Min, deadline)","amount0_out_est":c0,"amount1_out_est":c1,"amount0Min":c0*(1.0-slip),"amount1Min":c1*(1.0-slip)}));
+        actions.push(json!({"step":"collectWithdrawn","contract":c.nonfungible_position_manager,"call":"collect(tokenId, max, max)","expects":"principal + fees owed after decreaseLiquidity"}));
         actions.push(
-            json!({"step":"burn","contract":c.nonfungible_position_manager,"call":"burn(tokenId)"}),
+            json!({"step":"burn","contract":c.nonfungible_position_manager,"call":"burn(tokenId)","note":"optional cleanup after the executable rebalance; not included in the main NPM multicall"}),
         );
     }
 
     // Swap to reach the target ratio, simulated against the pool's real in-range
     // liquidity (so expected_out and price impact reflect actual depth, not just mid).
-    let d0 = t0 - c0;
-    let d1 = t1 - c1;
     let pool_liquidity = state.liquidity.parse::<f64>().unwrap_or(0.0);
     let fee_fraction = fee_bps / 10_000.0;
     let mut swap_impact_bps = 0.0_f64;
-    // (token_in, token_out, amount_in_human, dec_in, dec_out, zero_for_one)
-    let swap_leg = if d0 < -1e-12 {
-        Some((&token0, &token1, -d0, args.decimals0, args.decimals1, true))
-    } else if d1 < -1e-12 {
-        Some((&token1, &token0, -d1, args.decimals1, args.decimals0, false))
-    } else {
-        None
-    };
-    if let Some((tin, tout, amount_in, dec_in, dec_out, zfo)) = swap_leg {
+    let (mut mint0, mut mint1) = fit_to_range_ratio(c0, c1, target_ratio_1_per_0);
+    if let Some(swap_plan) = solve_inventory_swap(
+        sqrt_x96,
+        pool_liquidity,
+        fee_fraction,
+        args.decimals0,
+        args.decimals1,
+        c0,
+        c1,
+        target_ratio_1_per_0,
+    ) {
+        let (tin, tout, dec_in, dec_out) = if swap_plan.zero_for_one {
+            (&token0, &token1, args.decimals0, args.decimals1)
+        } else {
+            (&token1, &token0, args.decimals1, args.decimals0)
+        };
+        let amount_in = swap_plan.amount_in;
         let amount_in_raw = amount_in * 10f64.powi(dec_in as i32);
         let amount_in_u128 = amount_in_raw.round() as u128;
-        let sim = autopool_backtest::simulate_v3_swap(
-            sqrt_x96,
-            pool_liquidity,
-            fee_fraction,
-            amount_in_raw,
-            zfo,
-        );
-        let expected_out = sim.amount_out / 10f64.powi(dec_out as i32);
-        swap_impact_bps = sim.price_impact_bps;
+        let expected_out = swap_plan.expected_out;
+        swap_impact_bps = swap_plan.price_impact_bps;
         let amount_out_min = (expected_out * (1.0 - slip)).max(0.0);
         let amount_out_min_raw = (amount_out_min * 10f64.powi(dec_out as i32)).round() as u128;
+        let (safe0, safe1) = if swap_plan.zero_for_one {
+            (c0 - amount_in, c1 + amount_out_min)
+        } else {
+            (c0 + amount_out_min, c1 - amount_in)
+        };
+        (mint0, mint1) = fit_to_range_ratio(
+            safe0 * (1.0 - slip),
+            safe1 * (1.0 - slip),
+            target_ratio_1_per_0,
+        );
         // Best-effort real on-chain quote via the Quoter (read-only eth_call).
-        let onchain_out = match rpc
-            .quote_exact_input_single(c.mixed_quoter, tin, tout, spacing, amount_in_u128)
-            .await
-        {
-            Ok(out_raw) => json!(out_raw as f64 / 10f64.powi(dec_out as i32)),
-            Err(e) => json!(format!("quoter unavailable: {e}")),
+        let onchain_out = if args.skip_quoter {
+            json!("skipped")
+        } else {
+            match rpc
+                .quote_exact_input_single(c.mixed_quoter, tin, tout, spacing, amount_in_u128)
+                .await
+            {
+                Ok(out_raw) => json!(out_raw as f64 / 10f64.powi(dec_out as i32)),
+                Err(e) => json!(format!("quoter unavailable: {e}")),
+            }
         };
         let calldata = autopool_evm::encode_exact_input_single(
             tin,
@@ -2349,7 +2597,7 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
             "step":"swap","contract":c.swap_router,
             "call":format!("exactInputSingle({} -> {})", tin, tout),
             "amount_in":amount_in,"expected_out_sim":expected_out,"onchain_quote_out":onchain_out,
-            "amountOutMin":amount_out_min,"price_impact_bps":sim.price_impact_bps,
+            "amountOutMin":amount_out_min,"price_impact_bps":swap_plan.price_impact_bps,
             "calldata":calldata
         }));
     }
@@ -2361,21 +2609,23 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         spacing,
         lower,
         upper,
-        (t0 * 10f64.powi(args.decimals0 as i32)).round() as u128,
-        (t1 * 10f64.powi(args.decimals1 as i32)).round() as u128,
-        (t0 * (1.0 - slip) * 10f64.powi(args.decimals0 as i32)).round() as u128,
-        (t1 * (1.0 - slip) * 10f64.powi(args.decimals1 as i32)).round() as u128,
+        (mint0 * 10f64.powi(args.decimals0 as i32)).round() as u128,
+        (mint1 * 10f64.powi(args.decimals1 as i32)).round() as u128,
+        (mint0 * (1.0 - slip) * 10f64.powi(args.decimals0 as i32)).round() as u128,
+        (mint1 * (1.0 - slip) * 10f64.powi(args.decimals1 as i32)).round() as u128,
         recipient,
         deadline,
     );
-    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(...)","tickLower":lower,"tickUpper":upper,"amount0Desired":t0,"amount1Desired":t1,"amount0Min":t0*(1.0-slip),"amount1Min":t1*(1.0-slip),"calldata":mint_calldata.clone()}));
+    actions.push(json!({"step":"mint","contract":c.nonfungible_position_manager,"call":"mint(...)","tickLower":lower,"tickUpper":upper,"amount0Desired":mint0,"amount1Desired":mint1,"amount0Min":mint0*(1.0-slip),"amount1Min":mint1*(1.0-slip),"calldata":mint_calldata.clone()}));
     if args.staked {
         actions.push(json!({"step":"stake","contract":c.gauge_factory,"call":"gauge.deposit(tokenId)","note":"stake the new NFT to earn emissions"}));
     }
 
-    // Bundle the NPM-side calls (collect + decreaseLiquidity + mint when rebalancing
-    // an existing tokenId, else just mint) into one real multicall calldata. The swap
-    // (SwapRouter) and stake (gauge) are separate contracts, so separate txs.
+    // Bundle the executable NPM-side calls into one real multicall calldata. For
+    // rebalancing, decreaseLiquidity only records owed tokens; the second collect
+    // transfers withdrawn principal into the wallet before the new mint pulls it.
+    // Burning the empty old NFT is a separate cleanup because Slipstream's NPM can
+    // reject burn in the same path even after collect has transferred principal.
     let mut npm_calls: Vec<String> = Vec::new();
     if rebalancing {
         if let Some(tid) = args.token_id {
@@ -2383,11 +2633,12 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
             npm_calls.push(autopool_evm::encode_collect(tid, recipient));
             npm_calls.push(autopool_evm::encode_decrease_liquidity(
                 tid,
-                current_liquidity.round() as u128,
+                current_liquidity_raw.unwrap_or_else(|| current_liquidity.round() as u128),
                 (c0 * (1.0 - slip) * 10f64.powi(args.decimals0 as i32)).round() as u128,
                 (c1 * (1.0 - slip) * 10f64.powi(args.decimals1 as i32)).round() as u128,
                 deadline,
             ));
+            npm_calls.push(autopool_evm::encode_collect(tid, recipient));
         }
     }
     npm_calls.push(mint_calldata);
@@ -2397,11 +2648,11 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     let gas_usd = net.estimated_rebalance_gas_usd.unwrap_or(0.0);
     let risk_token_share = {
         let t1_in_t0 = if price_human > 0.0 {
-            t1 / price_human
+            mint1 / price_human
         } else {
             0.0
         };
-        let total = t0 + t1_in_t0;
+        let total = mint0 + t1_in_t0;
         if total > 0.0 { t1_in_t0 / total } else { 0.0 }
     };
     let mut gates: Vec<(String, bool, String)> = Vec::new();
@@ -2471,7 +2722,7 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
         args.pool_address, fee_bps, state.current_tick, spacing, gas_usd, net.gas_price_gwei
     );
     println!(
-        "target band: [{lower}, {upper}]  desired token0={t0:.6} token1={t1:.6}  ({})",
+        "target band: [{lower}, {upper}]  desired token0={mint0:.6} token1={mint1:.6}  ({})",
         if rebalancing {
             "rebalance"
         } else {
