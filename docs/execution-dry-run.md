@@ -96,14 +96,30 @@ reverted`. Completing it needs either (a) parsing the revert `data` bytes, or (b
 deployment-matched **QuoterV2** address that returns normally. The offline real-state
 sim is the working swap simulation in the meantime.
 
-## What is deliberately NOT done yet
+## Multicall (done)
 
-- The `multicall` wrapper bundling the actions into one tx.
-- **Full bundle `eth_call` simulation from a funded sender** (state-override `eth_call`
-  setting the sender's token balances/allowances, or a fork) to get real gas + revert
-  reasons for `mint`/`collect`/`decreaseLiquidity`. The current gas figure is a units ×
-  gas-price estimate; the swap output is the real-state sim above.
-- On-chain Quoter revert-data parsing (above).
+The NPM-side actions are bundled into one real `multicall(bytes[])` calldata
+(`abi::encode_multicall`, selector `ac9650d8` verified): `collect + decreaseLiquidity
++ mint` when rebalancing a known `--token-id`, else just `mint`. The swap (SwapRouter)
+and stake (gauge) are different contracts, so they stay separate txs. Example: a
+WETH-AERO rebalance produces a 1,028-byte NPM multicall over the full lifecycle
+`unstake → collect → decreaseLiquidity → burn → swap → mint → stake`.
+
+## What still needs a tool I don't have (the ask)
+
+- **Full bundle `eth_call` simulation from a funded sender** — to get *real* gas +
+  revert reasons for the mint/collect/decrease bundle, I need a **mainnet fork**:
+  `anvil`/Foundry installed on the EC2 box, or a **Tenderly API key**. Raw `eth_call`
+  state-overrides can't cleanly fund the NFT mint + gauge stake by hand. This single
+  tool also unblocks the on-chain Quoter (a fork returns the v1 revert data).
+- **On-chain Quoter result** — the free Alchemy tier returns `{"code":3,"message":
+  "execution reverted"}` with **no `data` field**, so the v1 quoter's revert payload
+  can't be read. Needs an RPC that returns revert data (Foundry/Tenderly/paid tier).
+  Until then the dry-run uses the offline real-state `simulate_v3_swap` (valid for
+  within-tick swaps).
+
+Everything else — real selectors, signable swap/mint/collect/decrease calldata, the
+multicall bundle, real-state swap sim, and the risk gates — is done and never signs.
 - **The delta-hedge leg.** The deployable strategy is delta-hedged, but the short is a
   **perp on a different venue** (e.g. Hyperliquid), so it is a *separate* plan/adapter,
   not a Slipstream action.
