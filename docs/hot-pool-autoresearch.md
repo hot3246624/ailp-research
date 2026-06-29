@@ -503,6 +503,40 @@ The deployable strategy still needs either better pool selection, historical
 liquidity reconstruction, or a different range/hedge rule that clears left-tail APR
 instead of merely improving loss versus hold.
 
+### Orca SOL-CARDS Replay
+
+A later hot-pool refresh moved Orca `SOL-CARDS` into the P0 slot: about `642%` 24h
+fee APR, `100bps` fee tier, about `$62k` TVL, about `$109k` 24h volume, and no
+discovery warnings. The sample was thinner than `SOL-GRASS`, but still landed enough
+normalized rows for a first replay:
+
+```text
+sample A: scanned 770 signatures, kept 65 normalized swaps, tx_errors=0
+span:     slot 429658908..429669695, tick -11468..-10842
+```
+
+With SOL marked near `$73.33`, `narrow_half_width=384`, and snapshot active liquidity,
+the full 65-row replay again showed strong hedge protection but no deployable edge:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | -$303.18 | $0.00 | $0.00 | $0.00 | ~-22159% | $303.18 |
+| narrow_rebalance | -$402.45 | -$99.28 | $49.55 | $36.14 | ~-29415% | $404.85 |
+| hedged_narrow | -$98.71 | +$204.47 | $49.55 | $36.14 | ~-7215% | $103.97 |
+| delta_hedged | -$3.11 | +$300.06 | $49.55 | $36.14 | ~-228% | $12.01 |
+| hedged_wide | -$22.34 | +$280.84 | $14.05 | $11.64 | ~-1632% | $24.97 |
+
+The only encouraging slice was defensive: with 15-swap windows, `hedged_wide` had
+mean net about `+$1.20`, mean mechanical APR about `653%`, p05 APR about `106%`, and
+worst drawdown about `$1.88`. That is not enough: larger 25-swap windows flipped
+negative, and the lagged promotion gate returned `reject_replay` with p05 APR about
+`-887%`, `-2663%`, and `-6269%` across 15/25/40-swap families.
+
+Interpretation: this is the first Whirlpool sample that produced a positive
+short-window defensive APR read, but it is still not a strategy. It is a reason to
+collect more `SOL-CARDS` data and to build a promotion gate that can explicitly score
+`hedged_wide`/defensive policies, not just the lagged narrow hedge rule.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

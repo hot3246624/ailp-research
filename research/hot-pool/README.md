@@ -214,6 +214,23 @@ Current Whirlpool read: the hedge machinery is useful risk control, but it has n
 yet shown a stable positive-fee-alpha strategy. Reported hot-pool APR is still a
 candidate alarm, not a deployable strategy APR.
 
+Orca `SOL-CARDS` heartbeat replay:
+
+```text
+sample A: scanned 770 signatures, kept 65 normalized swaps, tx_errors=0
+span:     slot 429658908..429669695, tick -11468..-10842
+```
+
+This was the newest clean Orca P0 candidate after refreshing the queue: ~642% 24h
+fee APR, 100bps fee tier, ~$62k TVL, no discovery warnings. It is the first Whirlpool
+sample where a very defensive `hedged_wide` slice had a positive short-window read:
+15-swap windows showed mean net around `+$1.20`, mean mechanical APR around `653%`,
+p05 APR around `106%`, and worst drawdown around `$1.88`. That still does not clear
+the 500% left-tail gate, and 25-swap windows flipped negative. The lagged promotion
+gate returned `reject_replay`; p05 APR was about `-887%`, `-2663%`, and `-6269%`
+across 15/25/40-swap families. Treat `SOL-CARDS` as an interesting Whirlpool lead
+for more data, not a strategy promotion.
+
 Schema:
 
 ```text
