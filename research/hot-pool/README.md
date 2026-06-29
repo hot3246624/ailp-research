@@ -396,6 +396,15 @@ node scripts/meteora-dlmm-join-flow-snapshots.cjs \
   --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.latest.json \
   --max-slot-distance 400 \
   --active-bin-source flow-price
+
+cargo run -q -p autopool-cli -- replay-dlmm-bin-windows \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.jsonl \
+  --window-observations 15 \
+  --step-observations 5 \
+  --min-windows 5 \
+  --half-width-bins 5 \
+  --capital-usd 1000
 ```
 
 2026-06-30 live-shadow smoke: snapshot A at slot `429723287` had active bin `-6465`
@@ -406,6 +415,17 @@ about `$68,467`; `$1k` capital was about `0.10x` active-bin liquidity. Proxy rep
 showed `+$2.10` net and `$0.39` max drawdown over 19 rows, but the printed annualized
 APR is not a strategy result because the window is tiny and active liquidity still
 comes from nearest snapshots.
+
+Second refresh expanded the proxy stream to 47 joined rows from 64 flow rows and 6
+snapshots, with 17 stale rows skipped by a 500-slot gate. Joined notional was about
+`$104,159`, active-bin proxy moved `-6465..-6453`, and `$1k` capital was about `0.13x`
+average active-bin liquidity. Full proxy replay showed centered rebalance at `+$6.18`
+net, `$4.28` fees, `$0.39` max drawdown, and 1 rebalance. Rolling proxy windows now
+run through `replay-dlmm-bin-windows`: 10-row/5-step windows produced 8 windows with
+centered/static both winning 100% versus hold; 15-row/5-step windows produced 7
+windows with centered mean net about `+$2.00`, p05 mechanical APR about `4,976%`,
+and worst drawdown about `$0.39`. This remains live-shadow proxy evidence, not a
+deployable APR.
 
 Orca `HYPE-USDC` final P1 coverage replay:
 

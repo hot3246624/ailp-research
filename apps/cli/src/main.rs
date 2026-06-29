@@ -536,6 +536,30 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Replay normalized Meteora DLMM bin observations over rolling windows and
+    /// summarize policy stability. This is mainly for proxy/live-shadow evidence.
+    ReplayDlmmBinWindows {
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        bins: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        window_observations: usize,
+        #[arg(long, default_value_t = 5)]
+        step_observations: usize,
+        #[arg(long, default_value_t = 2)]
+        min_windows: usize,
+        #[arg(long, default_value_t = 5)]
+        half_width_bins: i32,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital_usd: f64,
+        #[arg(long, default_value_t = 0.002)]
+        rebalance_cost_usd: f64,
+        #[arg(long, default_value_t = 5.0)]
+        rebalance_slippage_bps: f64,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Replay normalized swaps over rolling fixed-size windows and summarize
     /// policy stability, mechanical APR, and drawdown across windows.
     ReplayNormalizedWindows {
@@ -1577,6 +1601,29 @@ async fn main() -> Result<()> {
         } => replay_dlmm_bins(
             spec,
             bins,
+            half_width_bins,
+            capital_usd,
+            rebalance_cost_usd,
+            rebalance_slippage_bps,
+            format,
+        )?,
+        Command::ReplayDlmmBinWindows {
+            spec,
+            bins,
+            window_observations,
+            step_observations,
+            min_windows,
+            half_width_bins,
+            capital_usd,
+            rebalance_cost_usd,
+            rebalance_slippage_bps,
+            format,
+        } => replay_dlmm_bin_windows(
+            spec,
+            bins,
+            window_observations,
+            step_observations,
+            min_windows,
             half_width_bins,
             capital_usd,
             rebalance_cost_usd,
@@ -5278,6 +5325,61 @@ struct DlmmReplayReport {
 }
 
 #[derive(Debug, Serialize)]
+struct DlmmWindowReplayReport {
+    label: String,
+    observations: usize,
+    window_observations: usize,
+    step_observations: usize,
+    windows: usize,
+    config: serde_json::Value,
+    caveats: Vec<String>,
+    summaries: Vec<DlmmWindowPolicySummary>,
+    rows: Vec<DlmmWindowPolicyRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DlmmWindowPolicyRow {
+    window_index: usize,
+    observation_start: usize,
+    observation_end_exclusive: usize,
+    observations: usize,
+    block_first: u64,
+    block_last: u64,
+    active_bin_first: i32,
+    active_bin_last: i32,
+    active_bin_delta: i32,
+    minutes: f64,
+    avg_active_liquidity_usd: f64,
+    capital_to_active_liquidity: Option<f64>,
+    policy: String,
+    net_pnl_usd: f64,
+    net_vs_hold_usd: f64,
+    fee_income_usd: f64,
+    net_apr_pct: Option<f64>,
+    max_drawdown_usd: f64,
+    rebalances: u32,
+    time_in_range_pct: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct DlmmWindowPolicySummary {
+    policy: String,
+    windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_pnl_usd: f64,
+    mean_net_vs_hold_usd: f64,
+    mean_fee_income_usd: f64,
+    mean_net_apr_pct: Option<f64>,
+    p05_net_apr_pct: Option<f64>,
+    p50_net_apr_pct: Option<f64>,
+    p95_net_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+    mean_rebalances: f64,
+    mean_time_in_range_pct: f64,
+    mean_capital_to_active_liquidity: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
 struct NormalizedWindowReplayReport {
     label: String,
     swaps: usize,
@@ -5785,6 +5887,56 @@ fn emit_normalized_window_report(
     Ok(())
 }
 
+fn emit_dlmm_window_report(report: DlmmWindowReplayReport, format: OutputFormat) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "dlmm window replay {} observations={} windows={} window_obs={} step_obs={}",
+        report.label,
+        report.observations,
+        report.windows,
+        report.window_observations,
+        report.step_observations
+    );
+    for caveat in &report.caveats {
+        println!("caveat: {caveat}");
+    }
+    println!("APR columns are mechanical per-window annualization summaries, not forecasts");
+    println!(
+        "{:<24} {:>4} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9}",
+        "policy",
+        "n",
+        "win%",
+        "meanNet",
+        "meanVsH",
+        "meanFee",
+        "meanAPR",
+        "p05APR",
+        "worstDD",
+        "inRange",
+        "cap/liq"
+    );
+    for summary in &report.summaries {
+        println!(
+            "{:<24} {:>4} {:>7.0}% {:>10.2} {:>10.2} {:>10.2} {:>9} {:>9} {:>9.2} {:>8.0}% {:>9}",
+            summary.policy,
+            summary.windows,
+            summary.win_rate_vs_hold_pct,
+            summary.mean_net_pnl_usd,
+            summary.mean_net_vs_hold_usd,
+            summary.mean_fee_income_usd,
+            optional_pct(summary.mean_net_apr_pct),
+            optional_pct(summary.p05_net_apr_pct),
+            summary.worst_max_drawdown_usd,
+            summary.mean_time_in_range_pct,
+            optional_f64(summary.mean_capital_to_active_liquidity),
+        );
+    }
+    Ok(())
+}
+
 fn mean_values(values: &[f64]) -> f64 {
     if values.is_empty() {
         0.0
@@ -6000,6 +6152,283 @@ fn replay_dlmm_bins(
         policies,
     };
     emit_dlmm_replay_report(report, format)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_dlmm_bin_windows(
+    spec_path: PathBuf,
+    bins_path: PathBuf,
+    window_observations: usize,
+    step_observations: usize,
+    min_windows: usize,
+    half_width_bins: i32,
+    capital_usd: f64,
+    rebalance_cost_usd: f64,
+    rebalance_slippage_bps: f64,
+    format: OutputFormat,
+) -> Result<()> {
+    if window_observations == 0 || step_observations == 0 {
+        anyhow::bail!("window_observations and step_observations must be positive");
+    }
+    let spec = read_replay_pool_spec(&spec_path)?;
+    if spec.replay_model != "dlmm_bin_replay" {
+        anyhow::bail!(
+            "unsupported replay_model `{}` in {}; dlmm bin windows require dlmm_bin_replay",
+            spec.replay_model,
+            spec_path.display()
+        );
+    }
+    let bin_step = spec
+        .bin_step
+        .with_context(|| format!("missing bin_step in {}", spec_path.display()))?;
+    let observations = load_dlmm_bin_observations(&bins_path)?;
+    if observations.len() < window_observations {
+        anyhow::bail!(
+            "need at least {} observations for one DLMM window, found {} in {}",
+            window_observations,
+            observations.len(),
+            bins_path.display()
+        );
+    }
+    let cfg = autopool_backtest::DlmmReplayConfig {
+        capital_usd,
+        fee_bps: spec.fee_bps,
+        bin_step_bps: bin_step as f64,
+        rebalance_cost_usd,
+        rebalance_slippage_bps,
+        block_seconds: spec.block_seconds,
+    };
+    let rows = build_dlmm_window_rows(
+        &observations,
+        &cfg,
+        half_width_bins,
+        window_observations,
+        step_observations,
+    );
+    let windows = rows
+        .iter()
+        .map(|row| row.window_index)
+        .max()
+        .map(|max| max + 1)
+        .unwrap_or(0);
+    if windows < min_windows {
+        anyhow::bail!(
+            "need at least {} DLMM windows, got {} (observations={}, window_observations={}, step_observations={})",
+            min_windows,
+            windows,
+            observations.len(),
+            window_observations,
+            step_observations
+        );
+    }
+    let avg_active_liquidity_usd = observations
+        .iter()
+        .map(|obs| obs.active_liquidity_usd)
+        .sum::<f64>()
+        / observations.len() as f64;
+    let capital_to_active_liquidity = if avg_active_liquidity_usd > 0.0 {
+        Some(capital_usd / avg_active_liquidity_usd)
+    } else {
+        None
+    };
+    let mut caveats = vec![
+        "DLMM rolling windows use normalized bin observations, not CLMM tick math".to_string(),
+        "APR columns are mechanical annualization of short windows, not deployable return estimates".to_string(),
+        "active_liquidity_usd must be historical active-bin state; flow/snapshot joined streams remain proxy-only".to_string(),
+    ];
+    if capital_to_active_liquidity.unwrap_or(0.0) > 0.25 {
+        caveats.push(format!(
+            "capacity warning: capital is {:.2}x average active-bin liquidity; fee share is not scalable",
+            capital_to_active_liquidity.unwrap()
+        ));
+    }
+    let report = DlmmWindowReplayReport {
+        label: format!("{} ({})", spec.symbol, spec.pool_address),
+        observations: observations.len(),
+        window_observations,
+        step_observations,
+        windows,
+        config: json!({
+            "fee_bps": cfg.fee_bps,
+            "bin_step_bps": cfg.bin_step_bps,
+            "capital_usd": cfg.capital_usd,
+            "rebalance_cost_usd": cfg.rebalance_cost_usd,
+            "rebalance_slippage_bps": cfg.rebalance_slippage_bps,
+            "block_seconds": cfg.block_seconds,
+            "half_width_bins": half_width_bins,
+            "avg_active_liquidity_usd": avg_active_liquidity_usd,
+            "capital_to_active_liquidity": capital_to_active_liquidity,
+        }),
+        caveats,
+        summaries: summarize_dlmm_window_rows(&rows),
+        rows,
+    };
+    emit_dlmm_window_report(report, format)
+}
+
+fn build_dlmm_window_rows(
+    observations: &[autopool_backtest::DlmmBinObs],
+    cfg: &autopool_backtest::DlmmReplayConfig,
+    half_width_bins: i32,
+    window_observations: usize,
+    step_observations: usize,
+) -> Vec<DlmmWindowPolicyRow> {
+    let mut rows = Vec::new();
+    let mut window_index = 0usize;
+    let mut start = 0usize;
+    while start + window_observations <= observations.len() {
+        let end = start + window_observations;
+        let window = &observations[start..end];
+        let hold = autopool_backtest::run_dlmm_bin_policy(
+            window,
+            cfg,
+            autopool_backtest::DlmmRangeMode::HoldInventory,
+            "hold_inventory",
+        )
+        .unwrap();
+        let policies = vec![
+            hold.clone(),
+            autopool_backtest::run_dlmm_bin_policy(
+                window,
+                cfg,
+                autopool_backtest::DlmmRangeMode::StaticRange { half_width_bins },
+                "static_bin_range",
+            )
+            .unwrap(),
+            autopool_backtest::run_dlmm_bin_policy(
+                window,
+                cfg,
+                autopool_backtest::DlmmRangeMode::CenteredRebalance { half_width_bins },
+                "centered_bin_rebalance",
+            )
+            .unwrap(),
+        ];
+        let first = window.first().unwrap();
+        let last = window.last().unwrap();
+        let avg_active_liquidity_usd = window
+            .iter()
+            .map(|obs| obs.active_liquidity_usd)
+            .sum::<f64>()
+            / window.len() as f64;
+        let capital_to_active_liquidity = if avg_active_liquidity_usd > 0.0 {
+            Some(cfg.capital_usd / avg_active_liquidity_usd)
+        } else {
+            None
+        };
+        let minutes = last.block.saturating_sub(first.block) as f64 * cfg.block_seconds / 60.0;
+        for policy in policies {
+            rows.push(DlmmWindowPolicyRow {
+                window_index,
+                observation_start: start,
+                observation_end_exclusive: end,
+                observations: window.len(),
+                block_first: first.block,
+                block_last: last.block,
+                active_bin_first: first.active_bin_id,
+                active_bin_last: last.active_bin_id,
+                active_bin_delta: last.active_bin_id - first.active_bin_id,
+                minutes,
+                avg_active_liquidity_usd,
+                capital_to_active_liquidity,
+                policy: policy.policy,
+                net_pnl_usd: policy.net_pnl_usd,
+                net_vs_hold_usd: policy.net_pnl_usd - hold.net_pnl_usd,
+                fee_income_usd: policy.fee_income_usd,
+                net_apr_pct: policy.net_apr_pct,
+                max_drawdown_usd: policy.max_drawdown_usd,
+                rebalances: policy.rebalances,
+                time_in_range_pct: policy.time_in_range_pct,
+            });
+        }
+        window_index += 1;
+        start += step_observations;
+    }
+    rows
+}
+
+fn summarize_dlmm_window_rows(rows: &[DlmmWindowPolicyRow]) -> Vec<DlmmWindowPolicySummary> {
+    let mut policies = rows
+        .iter()
+        .map(|row| row.policy.clone())
+        .collect::<Vec<_>>();
+    policies.sort();
+    policies.dedup();
+    policies
+        .into_iter()
+        .filter_map(|policy| {
+            let policy_rows = rows
+                .iter()
+                .filter(|row| row.policy == policy)
+                .collect::<Vec<_>>();
+            if policy_rows.is_empty() {
+                return None;
+            }
+            let windows = policy_rows.len();
+            let net_aprs = policy_rows
+                .iter()
+                .filter_map(|row| row.net_apr_pct)
+                .collect::<Vec<_>>();
+            let cap_ratios = policy_rows
+                .iter()
+                .filter_map(|row| row.capital_to_active_liquidity)
+                .collect::<Vec<_>>();
+            Some(DlmmWindowPolicySummary {
+                policy,
+                windows,
+                win_rate_vs_hold_pct: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| {
+                            if row.net_vs_hold_usd > 0.0 {
+                                100.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_pnl_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.net_pnl_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_vs_hold_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.net_vs_hold_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_fee_income_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.fee_income_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_apr_pct: mean_values_opt(&net_aprs),
+                p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
+                p50_net_apr_pct: percentile_f64(&net_aprs, 50.0),
+                p95_net_apr_pct: percentile_f64(&net_aprs, 95.0),
+                worst_max_drawdown_usd: policy_rows
+                    .iter()
+                    .map(|row| row.max_drawdown_usd)
+                    .fold(0.0, f64::max),
+                mean_rebalances: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.rebalances as f64)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_time_in_range_pct: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.time_in_range_pct)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_capital_to_active_liquidity: mean_values_opt(&cap_ratios),
+            })
+        })
+        .collect()
 }
 
 fn replay_normalized_windows(

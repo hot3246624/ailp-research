@@ -838,6 +838,15 @@ cargo run -q -p autopool-cli -- replay-dlmm-bins \
   --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.jsonl \
   --half-width-bins 5 \
   --capital-usd 1000
+
+cargo run -q -p autopool-cli -- replay-dlmm-bin-windows \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.jsonl \
+  --window-observations 15 \
+  --step-observations 5 \
+  --min-windows 5 \
+  --half-width-bins 5 \
+  --capital-usd 1000
 ```
 
 2026-06-30 live-shadow smoke:
@@ -857,6 +866,26 @@ only 19 swaps over roughly 140 seconds, and active liquidity is from nearest sna
 rather than historical bin-array state. This result matters because the data plumbing
 finally separates real non-overlapping flow from active-liquidity approximation and
 keeps old flow out via a slot-distance gate.
+
+Second live-shadow refresh expanded the proxy stream:
+
+```text
+snapshot C: slot 429728059, active bin -6454, active liq ~$5,777
+flow scan:  scanned 194 signatures, decoded 27 swaps, tx_errors=0
+snapshot D: slot 429728324, active bin -6453, active liq ~$5,748
+join gate:  47 joined rows, 17 stale rows skipped, max distance 417 slots, avg 208 slots
+flow:       ~$104,159 joined notional, active-bin proxy -6465..-6453
+capacity:   $1k capital / ~$7,562 avg active-liq ~= 0.13x
+full proxy: centered +$6.18 net, $4.28 fees, $0.39 maxDD, 1 rebalance
+```
+
+Rolling proxy windows now run through `replay-dlmm-bin-windows`. On 10-row/5-step
+windows (`8` windows), centered/static both had `100%` win rate versus hold and p05
+mechanical APR around `12.6k%`; on 15-row/5-step windows (`7` windows), centered had
+`100%` win rate, mean net about `+$2.00`, p05 mechanical APR about `4,976%`, and worst
+drawdown about `$0.39`. This is a stronger live-shadow signal than the prior full-only
+smoke, but still not deployable: the sample is minutes-long, active liquidity is
+nearest-snapshot proxy, and the active-bin liquidity fell sharply as price moved.
 
 ### Orca HYPE-USDC Replay
 
