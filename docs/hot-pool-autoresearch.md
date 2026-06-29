@@ -998,6 +998,34 @@ That is not a strategy rejection; it is a near-slot data availability rejection 
 the strict live-shadow gate. The runner now exits cleanly when joined rows cannot
 produce enough rolling windows.
 
+JUP 400-slot preliminary run:
+
+```text
+flow scan:       scanned 28 signatures, decoded 25 swaps, tx_errors=0
+join gate:       50 flow rows, 6 snapshots, 27 joined, 23 stale skipped
+slot distance:   max 331, avg 324, max allowed 400
+full proxy:      centered/static +$0.28 net, 100% in range, 0 drawdown
+rolling gate:    3 windows, centered/static pass_proxy_gate
+```
+
+This is only scout evidence. The join is wider than the strict 250-slot gate, the
+sample has only 3 rolling windows, active bin stayed flat at `-305`, and the positive
+PnL is only about `$0.14` mean per window before mechanical annualization. JUP remains
+a live-shadow candidate, not a strategy-approved pool.
+
+MET-USDC and HYPE-USDC broadening:
+
+```text
+MET-USDC 20bps: 25 decoded swaps, active-liq ~$998, 0 joined under 250-slot gate
+HYPE-USDC 20bps: active-liq ~$33.5k, 25 decoded swaps, 1 joined under 250-slot gate
+HYPE 400-slot scout: 23 joined, 2 windows, full proxy centered -$0.06 net, rolling scout passes with only 2 windows
+```
+
+MET is capacity-poor for `$1k` capital at the active bin. HYPE has better capacity
+than JUP and SOL, but the 250-slot gate still lacks enough near-slot rows; the 400-slot
+scout is internally mixed because the full 23-row proxy loses slightly while the two
+rolling windows pass. Treat HYPE as the next pool to keep sampling, not as promoted.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

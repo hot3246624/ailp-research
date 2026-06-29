@@ -482,6 +482,19 @@ and active-bin liquidity around `$25k`, but every flow row sat outside the 250-s
 join gate. A second small run also produced 0 joined rows and now exits cleanly with
 `replay skipped`; this is near-slot data insufficiency, not a strategy rejection.
 
+JUP 400-slot preliminary evidence joined 27 rows from 50 flow rows and 6 snapshots,
+with average slot distance about 324. Full proxy centered/static were only `+$0.28`
+net, but 3 rolling windows printed `pass_proxy_gate` because active bin stayed flat at
+`-305`, drawdown was zero, and mechanical annualization magnified tiny fee income.
+This keeps JUP on the watchlist but does not promote it.
+
+Broader Meteora checks: `MET-USDC` 20bps decoded 25 swaps but had active-bin liquidity
+around `$998` and 0 joined rows under the 250-slot gate, so capacity is poor for `$1k`.
+The higher-TVL `HYPE-USDC` 20bps pool had active-liq around `$33.5k`; strict 250-slot
+join admitted only 1 row, while 400-slot scout joined 23 rows. HYPE full proxy was
+slightly negative (`-$0.06` centered) but 2 rolling scout windows passed. HYPE is the
+next pool worth continued sampling; it is not promoted.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
