@@ -420,12 +420,16 @@ Second refresh expanded the proxy stream to 47 joined rows from 64 flow rows and
 snapshots, with 17 stale rows skipped by a 500-slot gate. Joined notional was about
 `$104,159`, active-bin proxy moved `-6465..-6453`, and `$1k` capital was about `0.13x`
 average active-bin liquidity. Full proxy replay showed centered rebalance at `+$6.18`
-net, `$4.28` fees, `$0.39` max drawdown, and 1 rebalance. Rolling proxy windows now
-run through `replay-dlmm-bin-windows`: 10-row/5-step windows produced 8 windows with
-centered/static both winning 100% versus hold; 15-row/5-step windows produced 7
-windows with centered mean net about `+$2.00`, p05 mechanical APR about `4,976%`,
-and worst drawdown about `$0.39`. This remains live-shadow proxy evidence, not a
-deployable APR.
+net, `$4.28` fees, `$0.39` max drawdown, and 1 rebalance.
+
+Rolling proxy windows now run through `replay-dlmm-bin-windows` with a promotion-style
+proxy gate: p05 mechanical net APR >= `500%`, positive mean edge versus hold, win rate
+versus hold >= `60%`, worst drawdown <= `5%` of capital, and mean capital/active-liq
+<= `0.25x`. On 15-row/5-step windows (`7` windows), `centered_bin_rebalance` and
+`static_bin_range` now print `pass_proxy_gate`; hold prints `reject_proxy` with
+`win_rate` and `left_tail_apr` failures. Centered mean net was about `+$2.00`, p05
+mechanical APR about `4,976%`, worst drawdown about `$0.39`, and cap/active-liq about
+`0.14x`. This remains live-shadow proxy evidence, not a deployable APR.
 
 Orca `HYPE-USDC` final P1 coverage replay:
 

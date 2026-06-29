@@ -557,6 +557,17 @@ enum Command {
         rebalance_cost_usd: f64,
         #[arg(long, default_value_t = 5.0)]
         rebalance_slippage_bps: f64,
+        #[arg(long, default_value_t = 500.0)]
+        min_p05_net_apr_pct: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_mean_vs_hold_usd: f64,
+        #[arg(long, default_value_t = 60.0)]
+        min_win_rate_vs_hold_pct: f64,
+        /// Max worst drawdown as share of deployed capital.
+        #[arg(long, default_value_t = 0.05)]
+        max_drawdown_pct: f64,
+        #[arg(long, default_value_t = 0.25)]
+        max_capital_to_active_liquidity: f64,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -1617,6 +1628,11 @@ async fn main() -> Result<()> {
             capital_usd,
             rebalance_cost_usd,
             rebalance_slippage_bps,
+            min_p05_net_apr_pct,
+            min_mean_vs_hold_usd,
+            min_win_rate_vs_hold_pct,
+            max_drawdown_pct,
+            max_capital_to_active_liquidity,
             format,
         } => replay_dlmm_bin_windows(
             spec,
@@ -1628,6 +1644,13 @@ async fn main() -> Result<()> {
             capital_usd,
             rebalance_cost_usd,
             rebalance_slippage_bps,
+            DlmmWindowGateThresholds {
+                min_p05_net_apr_pct,
+                min_mean_vs_hold_usd,
+                min_win_rate_vs_hold_pct,
+                max_worst_drawdown_usd: capital_usd * max_drawdown_pct,
+                max_capital_to_active_liquidity,
+            },
             format,
         )?,
         Command::ReplayNormalizedWindows {
@@ -5332,6 +5355,7 @@ struct DlmmWindowReplayReport {
     step_observations: usize,
     windows: usize,
     config: serde_json::Value,
+    gate: DlmmWindowGateThresholds,
     caveats: Vec<String>,
     summaries: Vec<DlmmWindowPolicySummary>,
     rows: Vec<DlmmWindowPolicyRow>,
@@ -5365,6 +5389,8 @@ struct DlmmWindowPolicyRow {
 struct DlmmWindowPolicySummary {
     policy: String,
     windows: usize,
+    passes_gate: bool,
+    fail_reasons: Vec<String>,
     win_rate_vs_hold_pct: f64,
     mean_net_pnl_usd: f64,
     mean_net_vs_hold_usd: f64,
@@ -5377,6 +5403,15 @@ struct DlmmWindowPolicySummary {
     mean_rebalances: f64,
     mean_time_in_range_pct: f64,
     mean_capital_to_active_liquidity: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct DlmmWindowGateThresholds {
+    min_p05_net_apr_pct: f64,
+    min_mean_vs_hold_usd: f64,
+    min_win_rate_vs_hold_pct: f64,
+    max_worst_drawdown_usd: f64,
+    max_capital_to_active_liquidity: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -5905,8 +5940,17 @@ fn emit_dlmm_window_report(report: DlmmWindowReplayReport, format: OutputFormat)
     }
     println!("APR columns are mechanical per-window annualization summaries, not forecasts");
     println!(
-        "{:<24} {:>4} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9}",
+        "gate: p05APR>={:.0}% meanVsH>={:.2} win%>={:.0}% worstDD<=${:.2} cap/liq<={:.2}x",
+        report.gate.min_p05_net_apr_pct,
+        report.gate.min_mean_vs_hold_usd,
+        report.gate.min_win_rate_vs_hold_pct,
+        report.gate.max_worst_drawdown_usd,
+        report.gate.max_capital_to_active_liquidity,
+    );
+    println!(
+        "{:<24} {:<16} {:>4} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9}",
         "policy",
+        "verdict",
         "n",
         "win%",
         "meanNet",
@@ -5919,9 +5963,15 @@ fn emit_dlmm_window_report(report: DlmmWindowReplayReport, format: OutputFormat)
         "cap/liq"
     );
     for summary in &report.summaries {
+        let verdict = if summary.passes_gate {
+            "pass_proxy_gate"
+        } else {
+            "reject_proxy"
+        };
         println!(
-            "{:<24} {:>4} {:>7.0}% {:>10.2} {:>10.2} {:>10.2} {:>9} {:>9} {:>9.2} {:>8.0}% {:>9}",
+            "{:<24} {:<16} {:>4} {:>7.0}% {:>10.2} {:>10.2} {:>10.2} {:>9} {:>9} {:>9.2} {:>8.0}% {:>9}",
             summary.policy,
+            verdict,
             summary.windows,
             summary.win_rate_vs_hold_pct,
             summary.mean_net_pnl_usd,
@@ -6165,6 +6215,7 @@ fn replay_dlmm_bin_windows(
     capital_usd: f64,
     rebalance_cost_usd: f64,
     rebalance_slippage_bps: f64,
+    gate: DlmmWindowGateThresholds,
     format: OutputFormat,
 ) -> Result<()> {
     if window_observations == 0 || step_observations == 0 {
@@ -6259,8 +6310,9 @@ fn replay_dlmm_bin_windows(
             "avg_active_liquidity_usd": avg_active_liquidity_usd,
             "capital_to_active_liquidity": capital_to_active_liquidity,
         }),
+        gate,
         caveats,
-        summaries: summarize_dlmm_window_rows(&rows),
+        summaries: summarize_dlmm_window_rows(&rows, &gate),
         rows,
     };
     emit_dlmm_window_report(report, format)
@@ -6346,7 +6398,10 @@ fn build_dlmm_window_rows(
     rows
 }
 
-fn summarize_dlmm_window_rows(rows: &[DlmmWindowPolicyRow]) -> Vec<DlmmWindowPolicySummary> {
+fn summarize_dlmm_window_rows(
+    rows: &[DlmmWindowPolicyRow],
+    gate: &DlmmWindowGateThresholds,
+) -> Vec<DlmmWindowPolicySummary> {
     let mut policies = rows
         .iter()
         .map(|row| row.policy.clone())
@@ -6372,63 +6427,114 @@ fn summarize_dlmm_window_rows(rows: &[DlmmWindowPolicyRow]) -> Vec<DlmmWindowPol
                 .iter()
                 .filter_map(|row| row.capital_to_active_liquidity)
                 .collect::<Vec<_>>();
+            let win_rate_vs_hold_pct = mean_values(
+                &policy_rows
+                    .iter()
+                    .map(|row| {
+                        if row.net_vs_hold_usd > 0.0 {
+                            100.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let mean_net_pnl_usd = mean_values(
+                &policy_rows
+                    .iter()
+                    .map(|row| row.net_pnl_usd)
+                    .collect::<Vec<_>>(),
+            );
+            let mean_net_vs_hold_usd = mean_values(
+                &policy_rows
+                    .iter()
+                    .map(|row| row.net_vs_hold_usd)
+                    .collect::<Vec<_>>(),
+            );
+            let mean_fee_income_usd = mean_values(
+                &policy_rows
+                    .iter()
+                    .map(|row| row.fee_income_usd)
+                    .collect::<Vec<_>>(),
+            );
+            let mean_net_apr_pct = mean_values_opt(&net_aprs);
+            let p05_net_apr_pct = percentile_f64(&net_aprs, 5.0);
+            let p50_net_apr_pct = percentile_f64(&net_aprs, 50.0);
+            let p95_net_apr_pct = percentile_f64(&net_aprs, 95.0);
+            let worst_max_drawdown_usd = policy_rows
+                .iter()
+                .map(|row| row.max_drawdown_usd)
+                .fold(0.0, f64::max);
+            let mean_rebalances = mean_values(
+                &policy_rows
+                    .iter()
+                    .map(|row| row.rebalances as f64)
+                    .collect::<Vec<_>>(),
+            );
+            let mean_time_in_range_pct = mean_values(
+                &policy_rows
+                    .iter()
+                    .map(|row| row.time_in_range_pct)
+                    .collect::<Vec<_>>(),
+            );
+            let mean_capital_to_active_liquidity = mean_values_opt(&cap_ratios);
+            let fail_reasons = dlmm_window_gate_fail_reasons(
+                win_rate_vs_hold_pct,
+                mean_net_vs_hold_usd,
+                p05_net_apr_pct,
+                worst_max_drawdown_usd,
+                mean_capital_to_active_liquidity,
+                gate,
+            );
             Some(DlmmWindowPolicySummary {
                 policy,
                 windows,
-                win_rate_vs_hold_pct: mean_values(
-                    &policy_rows
-                        .iter()
-                        .map(|row| {
-                            if row.net_vs_hold_usd > 0.0 {
-                                100.0
-                            } else {
-                                0.0
-                            }
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                mean_net_pnl_usd: mean_values(
-                    &policy_rows
-                        .iter()
-                        .map(|row| row.net_pnl_usd)
-                        .collect::<Vec<_>>(),
-                ),
-                mean_net_vs_hold_usd: mean_values(
-                    &policy_rows
-                        .iter()
-                        .map(|row| row.net_vs_hold_usd)
-                        .collect::<Vec<_>>(),
-                ),
-                mean_fee_income_usd: mean_values(
-                    &policy_rows
-                        .iter()
-                        .map(|row| row.fee_income_usd)
-                        .collect::<Vec<_>>(),
-                ),
-                mean_net_apr_pct: mean_values_opt(&net_aprs),
-                p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
-                p50_net_apr_pct: percentile_f64(&net_aprs, 50.0),
-                p95_net_apr_pct: percentile_f64(&net_aprs, 95.0),
-                worst_max_drawdown_usd: policy_rows
-                    .iter()
-                    .map(|row| row.max_drawdown_usd)
-                    .fold(0.0, f64::max),
-                mean_rebalances: mean_values(
-                    &policy_rows
-                        .iter()
-                        .map(|row| row.rebalances as f64)
-                        .collect::<Vec<_>>(),
-                ),
-                mean_time_in_range_pct: mean_values(
-                    &policy_rows
-                        .iter()
-                        .map(|row| row.time_in_range_pct)
-                        .collect::<Vec<_>>(),
-                ),
-                mean_capital_to_active_liquidity: mean_values_opt(&cap_ratios),
+                passes_gate: fail_reasons.is_empty(),
+                fail_reasons,
+                win_rate_vs_hold_pct,
+                mean_net_pnl_usd,
+                mean_net_vs_hold_usd,
+                mean_fee_income_usd,
+                mean_net_apr_pct,
+                p05_net_apr_pct,
+                p50_net_apr_pct,
+                p95_net_apr_pct,
+                worst_max_drawdown_usd,
+                mean_rebalances,
+                mean_time_in_range_pct,
+                mean_capital_to_active_liquidity,
             })
         })
         .collect()
+}
+
+fn dlmm_window_gate_fail_reasons(
+    win_rate_vs_hold_pct: f64,
+    mean_net_vs_hold_usd: f64,
+    p05_net_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+    mean_capital_to_active_liquidity: Option<f64>,
+    gate: &DlmmWindowGateThresholds,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if win_rate_vs_hold_pct < gate.min_win_rate_vs_hold_pct {
+        reasons.push("win_rate".to_string());
+    }
+    if mean_net_vs_hold_usd < gate.min_mean_vs_hold_usd {
+        reasons.push("mean_vs_hold".to_string());
+    }
+    if p05_net_apr_pct.unwrap_or(f64::NEG_INFINITY) < gate.min_p05_net_apr_pct {
+        reasons.push("left_tail_apr".to_string());
+    }
+    if worst_max_drawdown_usd > gate.max_worst_drawdown_usd {
+        reasons.push("drawdown".to_string());
+    }
+    if mean_capital_to_active_liquidity.unwrap_or(f64::INFINITY)
+        > gate.max_capital_to_active_liquidity
+    {
+        reasons.push("capacity".to_string());
+    }
+    reasons
 }
 
 fn replay_normalized_windows(
@@ -9922,6 +10028,35 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("p05_apr"))
+        );
+    }
+
+    #[test]
+    fn dlmm_window_gate_reports_capacity_and_tail_failures() {
+        let gate = DlmmWindowGateThresholds {
+            min_p05_net_apr_pct: 500.0,
+            min_mean_vs_hold_usd: 0.0,
+            min_win_rate_vs_hold_pct: 60.0,
+            max_worst_drawdown_usd: 50.0,
+            max_capital_to_active_liquidity: 0.25,
+        };
+
+        assert!(
+            dlmm_window_gate_fail_reasons(75.0, 1.0, Some(600.0), 10.0, Some(0.10), &gate,)
+                .is_empty()
+        );
+
+        let reasons =
+            dlmm_window_gate_fail_reasons(50.0, -1.0, Some(100.0), 75.0, Some(0.50), &gate);
+        assert_eq!(
+            reasons,
+            vec![
+                "win_rate".to_string(),
+                "mean_vs_hold".to_string(),
+                "left_tail_apr".to_string(),
+                "drawdown".to_string(),
+                "capacity".to_string(),
+            ]
         );
     }
 

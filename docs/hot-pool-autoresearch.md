@@ -879,13 +879,20 @@ capacity:   $1k capital / ~$7,562 avg active-liq ~= 0.13x
 full proxy: centered +$6.18 net, $4.28 fees, $0.39 maxDD, 1 rebalance
 ```
 
-Rolling proxy windows now run through `replay-dlmm-bin-windows`. On 10-row/5-step
-windows (`8` windows), centered/static both had `100%` win rate versus hold and p05
-mechanical APR around `12.6k%`; on 15-row/5-step windows (`7` windows), centered had
-`100%` win rate, mean net about `+$2.00`, p05 mechanical APR about `4,976%`, and worst
-drawdown about `$0.39`. This is a stronger live-shadow signal than the prior full-only
-smoke, but still not deployable: the sample is minutes-long, active liquidity is
-nearest-snapshot proxy, and the active-bin liquidity fell sharply as price moved.
+Rolling proxy windows now run through `replay-dlmm-bin-windows`, including a
+promotion-style proxy gate. The default gate requires p05 mechanical net APR >= `500%`,
+positive mean edge versus hold, win rate versus hold >= `60%`, worst drawdown <= `5%`
+of capital, and mean capital/active-liquidity <= `0.25x`.
+
+On 10-row/5-step windows (`8` windows), centered/static both had `100%` win rate versus
+hold and p05 mechanical APR around `12.6k%`; on 15-row/5-step windows (`7` windows),
+centered had `100%` win rate, mean net about `+$2.00`, p05 mechanical APR about
+`4,976%`, and worst drawdown about `$0.39`. With `$1k` capital, the 15-row run now
+marks `centered_bin_rebalance` and `static_bin_range` as `pass_proxy_gate`; hold is
+`reject_proxy` due to `win_rate` and `left_tail_apr`. This is a stronger live-shadow
+signal than the prior full-only smoke, but still not deployable: the sample is
+minutes-long, active liquidity is nearest-snapshot proxy, and the active-bin liquidity
+fell sharply as price moved.
 
 ### Orca HYPE-USDC Replay
 
