@@ -360,27 +360,29 @@ JSONL files and rewrites a stable sorted replay stream. Merging the original sam
 the fresh refresh, and one older paginated refresh produced 231 input rows, 171
 unique normalized swaps, and 60 duplicates across overlapping samples.
 
-Next cursor extension (`before=4TXQ...KWbp`) added 28 normalized swaps and extended
-the span to block/slot `429588437..429604170`. The four-file merge has 259 input
-rows, 182 unique normalized swaps, and 77 duplicates. This mostly extends the segment
-backward a little and adds density around the existing regime; it is still not a
-long independent sample.
+Next cursor extensions added 28 then 19 normalized swaps and extended the span to
+block/slot `429588129..429604170`. The five-file merge has 278 input rows, 201
+unique normalized swaps, and 77 duplicates. This mostly extends the segment backward
+a little and adds density around the existing regime; hit rate fell sharply in the
+latest older page, so the CARDS burst appears bounded.
 
-Current best read on the 182-row merged segment:
+Current best read on the 201-row merged segment:
 
 | combined sample | lagged rule map | windows | win vs hold | mean vs hold | p05 APR | worst DD |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 25 swaps / 10 step | range=1.00, volatile=1.00 | 15 | 60% | +$0.87 | ~541% | $10.49 |
-| 40 swaps / 15 step | range=1.00, volatile=1.00 | 9 | 67% | +$7.74 | ~-810% | $14.08 |
-| 60 swaps / 20 step | range=1.00, volatile=1.00 | 6 | 67% | +$11.55 | ~-185% | $15.30 |
+| 25 swaps / 10 step | range=1.00, volatile=1.00 | 17 | 59% | -$2.80 | ~660% | $9.99 |
+| 40 swaps / 15 step | range=1.00, volatile=1.00 | 10 | 50% | -$4.16 | ~-1162% | $13.31 |
+| 60 swaps / 20 step | range=1.00, volatile=1.00 | 7 | 57% | +$3.97 | ~-21% | $15.23 |
+| 80 swaps / 25 step | range=1.00, volatile=1.00 | 4 | 75% | -$7.00 | ~1216% | $18.26 |
 
 Interpretation: the conservative 1.00 range/volatile hedge is now the better default
 for the lagged rule, but the evidence is still small, uses overlapping windows, and
 mostly densifies one short wall-clock regime rather than extending far back in time.
-The 25-swap view remains promising, but the 40- and 60-swap views show negative
-left tails. Treat the rule as a candidate state machine, not a deployable strategy.
-The next bottleneck remains more normalized Raydium windows across older cursors and
-then a true shadow monitor, not more in-sample rule tweaking.
+The 25-swap view keeps positive p05 APR but loses to hold on average; the 40- and
+60-swap views show negative left tails; the 80-swap view has too few windows and
+still loses to hold on average. Treat the rule as a candidate state machine, not a
+deployable strategy. The next bottleneck remains broader pool coverage or a true
+shadow monitor, not more in-sample CARDS-only rule tweaking.
 
 ## Autoresearch Rules Adapted To AILP
 

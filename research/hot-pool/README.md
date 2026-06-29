@@ -140,12 +140,12 @@ The current hedge-grid command also prints a `lagged_regime_rule` row. It uses t
 prior window's regime to choose the next window's hedge fraction, avoiding direct
 lookahead. The default rule is conservative in range-like states:
 `range=1.00`, `volatile=1.00`, `money_trend=0.25`, `risk_trend=1.00`. On the latest
-182-row merged CARDS-USDC sample, 25-swap/10-step windows showed 60% win rate vs
-hold, mean vs hold about +$0.87, p05 APR about +541%, and worst drawdown about
-$10.49. The 40-swap/15-step and 60-swap/20-step views kept positive mean vs hold but
-had negative p05 APR, so this is still candidate evidence rather than a deployable
-rule. Caveat: this remains a small, overlapping-window sample inside one short
-wall-clock regime.
+201-row merged CARDS-USDC sample, 25-swap/10-step windows showed 59% win rate vs
+hold, mean vs hold about -$2.80, p05 APR about +660%, and worst drawdown about
+$9.99. The 40-swap/15-step and 60-swap/20-step views had negative p05 APR, and the
+80-swap/25-step view had only 4 lagged windows while still losing to hold on average.
+This is still candidate evidence rather than a deployable rule. Caveat: this remains
+a small, overlapping-window sample inside one short wall-clock regime.
 
 Schema:
 
