@@ -779,6 +779,47 @@ The Rust DLMM replay accepts the stream and emits the expected caveats, but this
 not promotion evidence: the volume fields are overlapping rolling windows, and the
 position is still roughly equal to active-bin liquidity.
 
+### Meteora SOL-USDC Swap Flow Probe
+
+The first real non-overlapping Meteora swap-flow sampler is now wired:
+
+```bash
+scripts/meteora-dlmm-swap-flow.sh \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.latest.json \
+  --limit 25 \
+  --signature-scan-limit 120 \
+  --max-signature-pages 2 \
+  --append
+```
+
+2026-06-30 probe result:
+
+```text
+scanned signatures: 99
+decoded swap txs:   17
+tx errors:          0
+flow notional:      ~$40,048
+directions:         11 USDC->SOL, 6 SOL->USDC
+avg-exec bin proxy: -6466..-6463
+next cursor:        3Lsoxn3oMZ7eSsT88TB1GpRent8pmM8ug3u1D86JKskc6zxFMHWikWhrEWXVdvLKodtKkTqWxQJP6yUN1rMaVgV3
+```
+
+This is better evidence than rolling Data API volume because each row comes from
+pool-owned reserve deltas in one successful swap transaction. The hard blocker is
+also now concrete: sampled `LBUZ...` Meteora swap logs did not emit parseable Anchor
+`Swap` / `Swap2Evt` event payloads for the pool, and the decoded `swap` instruction
+contains only `amountIn` / `minAmountOut`, not historical post-swap active bin or
+active-bin liquidity. Therefore replay-grade DLMM observations now need one of:
+
+- join recent swap-flow rows to repeated SDK active-bin snapshots for a bounded
+  live shadow monitor;
+- use an archival/indexed account-state source for historical `lbPair` and bin-array
+  state at each swap slot;
+- add a documented approximation that maps average execution price to a bin id, but
+  gate it as proxy-only until active-bin liquidity is reconstructed.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

@@ -365,6 +365,27 @@ Append smoke on 2026-06-30 produced two SOL-USDC rows over slots
 the stream, but the rows use overlapping rolling `30m` volume and are not promotion
 evidence.
 
+Non-overlapping Meteora swap flow is now wired separately:
+
+```bash
+scripts/meteora-dlmm-swap-flow.sh \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.latest.json \
+  --limit 25 \
+  --signature-scan-limit 120 \
+  --max-signature-pages 2 \
+  --append
+```
+
+2026-06-30 probe: scanned 99 signatures, decoded 17 swap txs, 0 tx errors,
+about `$40,048` non-overlapping flow notional, and average-execution bin proxy
+`-6466..-6463`. This does not yet produce replay-grade DLMM observations because
+sampled Meteora swap logs did not expose parseable pool `Swap` / `Swap2Evt` events,
+and decoded `swap` instructions only contain `amountIn` / `minAmountOut`. We now
+need to join this flow stream to repeated active-bin snapshots or archival bin-array
+state.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
