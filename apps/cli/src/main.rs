@@ -178,6 +178,34 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Rank hot-pool research candidates using the autoresearch protocol. This treats
+    /// very high APR as a signal to validate, not a deployable return promise.
+    HotPoolCandidates {
+        #[arg(long = "venue", value_enum)]
+        venues: Vec<SolanaDiscoverVenue>,
+        #[arg(long, default_value_t = 50_000.0)]
+        min_tvl_usd: f64,
+        #[arg(long, default_value_t = 25_000.0)]
+        min_volume_usd_24h: f64,
+        #[arg(long, default_value_t = 100.0)]
+        min_fee_apr: f64,
+        #[arg(long, default_value_t = 10_000.0)]
+        max_fee_apr: f64,
+        /// Headline APR level treated as an alarm threshold and sanity benchmark.
+        #[arg(long, default_value_t = 2_000.0)]
+        target_fee_apr: f64,
+        #[arg(long, default_value_t = 0.5)]
+        min_volume_tvl_24h: f64,
+        #[arg(long, default_value_t = 200)]
+        page_size: usize,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        /// Optional JSON output path for the ranked hot-pool research queue.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     SampleBaseNetwork {
         #[arg(long, env = "BASE_RPC_URL")]
         rpc_url: String,
@@ -747,6 +775,34 @@ async fn main() -> Result<()> {
                 min_fee_apr,
                 max_fee_apr,
                 verified_only,
+                page_size,
+                limit,
+                output,
+                format,
+            })
+            .await?
+        }
+        Command::HotPoolCandidates {
+            venues,
+            min_tvl_usd,
+            min_volume_usd_24h,
+            min_fee_apr,
+            max_fee_apr,
+            target_fee_apr,
+            min_volume_tvl_24h,
+            page_size,
+            limit,
+            output,
+            format,
+        } => {
+            hot_pool_candidates(HotPoolCandidateArgs {
+                venues,
+                min_tvl_usd,
+                min_volume_usd_24h,
+                min_fee_apr,
+                max_fee_apr,
+                target_fee_apr,
+                min_volume_tvl_24h,
                 page_size,
                 limit,
                 output,
@@ -1609,6 +1665,260 @@ async fn solana_discover(args: SolanaDiscoverArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct HotPoolCandidateArgs {
+    venues: Vec<SolanaDiscoverVenue>,
+    min_tvl_usd: f64,
+    min_volume_usd_24h: f64,
+    min_fee_apr: f64,
+    max_fee_apr: f64,
+    target_fee_apr: f64,
+    min_volume_tvl_24h: f64,
+    page_size: usize,
+    limit: usize,
+    output: Option<PathBuf>,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct HotPoolCandidateRow {
+    venue: String,
+    symbol: String,
+    pool_address: String,
+    fee_bps: Option<f64>,
+    tvl_usd: f64,
+    volume_usd_24h: f64,
+    volume_tvl_24h: f64,
+    fee_apr_24h: f64,
+    formula_fee_apr_24h: Option<f64>,
+    reported_to_formula_apr: Option<f64>,
+    target_fee_apr: f64,
+    required_volume_tvl_for_target: Option<f64>,
+    target_progress: Option<f64>,
+    hot_score: f64,
+    autoresearch_status: String,
+    experiment_priority: String,
+    next_step: String,
+    warnings: Vec<String>,
+}
+
+async fn hot_pool_candidates(args: HotPoolCandidateArgs) -> Result<()> {
+    let venues = if args.venues.is_empty() {
+        vec![
+            SolanaVenue::OrcaWhirlpool,
+            SolanaVenue::RaydiumClmm,
+            SolanaVenue::MeteoraDlmm,
+        ]
+    } else {
+        args.venues.iter().copied().map(Into::into).collect()
+    };
+    let options = DiscoveryOptions {
+        min_tvl_usd: args.min_tvl_usd,
+        page_size: args.page_size,
+    };
+    let client = SolanaDiscoveryClient::default();
+    let mut rows = client
+        .discover_many(&venues, &options)
+        .await?
+        .into_iter()
+        .filter_map(|candidate| hot_pool_candidate_row(candidate, &args))
+        .filter(|row| row.autoresearch_status != "discard")
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| right.hot_score.total_cmp(&left.hot_score));
+    let limited_rows = rows.into_iter().take(args.limit).collect::<Vec<_>>();
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_string_pretty(&limited_rows)?)
+            .with_context(|| format!("writing hot-pool candidate queue {}", output.display()))?;
+    }
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&limited_rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "hot-pool candidates venues={:?} filters: tvl>={:.0} vol24h>={:.0} fee_apr={:.1}%..{:.1}% vol/tvl>={:.2} target={:.0}%",
+        venues.iter().map(|venue| venue.label()).collect::<Vec<_>>(),
+        args.min_tvl_usd,
+        args.min_volume_usd_24h,
+        args.min_fee_apr,
+        args.max_fee_apr,
+        args.min_volume_tvl_24h,
+        args.target_fee_apr
+    );
+    println!(
+        "{:<8} {:<22} {:>7} {:>9} {:>10} {:>7} {:>8} {:>8} {:<18} {:<20}  warnings",
+        "venue",
+        "symbol",
+        "fee",
+        "tvl",
+        "vol24h",
+        "v/tvl",
+        "fee_apr",
+        "score",
+        "priority",
+        "next_step"
+    );
+    for row in limited_rows {
+        println!(
+            "{:<8} {:<22} {:>7} {:>9.0} {:>10.0} {:>7.2} {:>7.1}% {:>8.1} {:<18} {:<20}  {}",
+            row.venue,
+            row.symbol,
+            format_opt_f64(row.fee_bps, 1),
+            row.tvl_usd,
+            row.volume_usd_24h,
+            row.volume_tvl_24h,
+            row.fee_apr_24h,
+            row.hot_score,
+            row.experiment_priority,
+            row.next_step,
+            row.warnings.join(",")
+        );
+    }
+
+    Ok(())
+}
+
+fn hot_pool_candidate_row(
+    candidate: SolanaPoolCandidate,
+    args: &HotPoolCandidateArgs,
+) -> Option<HotPoolCandidateRow> {
+    let fee_apr = candidate.fee_apr_24h?;
+    let volume = candidate.volume_usd_24h?;
+    if candidate.tvl_usd < args.min_tvl_usd
+        || volume < args.min_volume_usd_24h
+        || fee_apr < args.min_fee_apr
+        || fee_apr > args.max_fee_apr
+    {
+        return None;
+    }
+    let volume_tvl = if candidate.tvl_usd > 0.0 {
+        volume / candidate.tvl_usd
+    } else {
+        0.0
+    };
+    if volume_tvl < args.min_volume_tvl_24h {
+        return None;
+    }
+    let required_volume_tvl_for_target = candidate
+        .fee_bps
+        .and_then(|fee_bps| required_volume_tvl_for_apr(args.target_fee_apr, fee_bps));
+    let target_progress = required_volume_tvl_for_target.and_then(|required| {
+        if required > 0.0 {
+            Some(volume_tvl / required)
+        } else {
+            None
+        }
+    });
+    let formula_fee_apr = candidate
+        .fee_bps
+        .map(|fee_bps| formula_fee_apr_from_volume_tvl(volume_tvl, fee_bps));
+    let reported_to_formula_apr = formula_fee_apr.and_then(|formula| {
+        if formula > 0.0 {
+            Some(fee_apr / formula)
+        } else {
+            None
+        }
+    });
+    let mut warnings = candidate.warnings.clone();
+    if let (Some(formula), Some(ratio)) = (formula_fee_apr, reported_to_formula_apr) {
+        if fee_apr > 100.0 && ratio > 5.0 && fee_apr - formula > 100.0 {
+            warnings.push("fee_apr_formula_mismatch".to_string());
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    let warning_penalty = hot_warning_penalty(&warnings);
+    let hot_score = fee_apr
+        * (1.0 + volume_tvl).ln().max(0.0)
+        * (1.0 + candidate.tvl_usd / 100_000.0).ln().max(0.0)
+        * warning_penalty;
+    let (experiment_priority, next_step) = hot_pool_priority(&warnings, fee_apr, target_progress);
+
+    Some(HotPoolCandidateRow {
+        venue: candidate.venue.label().to_string(),
+        symbol: candidate.symbol,
+        pool_address: candidate.pool_address,
+        fee_bps: candidate.fee_bps,
+        tvl_usd: candidate.tvl_usd,
+        volume_usd_24h: volume,
+        volume_tvl_24h: volume_tvl,
+        fee_apr_24h: fee_apr,
+        formula_fee_apr_24h: formula_fee_apr,
+        reported_to_formula_apr,
+        target_fee_apr: args.target_fee_apr,
+        required_volume_tvl_for_target,
+        target_progress,
+        hot_score,
+        autoresearch_status: "needs_validation".to_string(),
+        experiment_priority,
+        next_step,
+        warnings,
+    })
+}
+
+fn formula_fee_apr_from_volume_tvl(volume_tvl_24h: f64, fee_bps: f64) -> f64 {
+    volume_tvl_24h.max(0.0) * (fee_bps.max(0.0) / 10_000.0) * 365.0 * 100.0
+}
+
+fn required_volume_tvl_for_apr(target_fee_apr: f64, fee_bps: f64) -> Option<f64> {
+    let fee_fraction = fee_bps / 10_000.0;
+    if target_fee_apr <= 0.0 || fee_fraction <= 0.0 {
+        return None;
+    }
+    Some((target_fee_apr / 100.0) / (fee_fraction * 365.0))
+}
+
+fn hot_warning_penalty(warnings: &[String]) -> f64 {
+    warnings.iter().fold(1.0_f64, |penalty, warning| {
+        let factor = match warning.as_str() {
+            "fee_apr_outlier" => 0.25,
+            "fee_apr_formula_mismatch" => 0.2,
+            "unverified_or_warning" => 0.35,
+            "long_tail_inventory" => 0.55,
+            "meteora_daily_ratio_disagrees_with_apy" => 0.65,
+            "high_turnover" => 0.9,
+            _ => 0.8,
+        };
+        penalty * factor
+    })
+}
+
+fn hot_pool_priority(
+    warnings: &[String],
+    fee_apr: f64,
+    target_progress: Option<f64>,
+) -> (String, String) {
+    let has_warning = |needle: &str| warnings.iter().any(|warning| warning == needle);
+    if has_warning("fee_apr_outlier")
+        || has_warning("fee_apr_formula_mismatch")
+        || has_warning("unverified_or_warning")
+    {
+        return (
+            "P2_validate_api".to_string(),
+            "verify_api_first".to_string(),
+        );
+    }
+    if has_warning("meteora_daily_ratio_disagrees_with_apy") || has_warning("long_tail_inventory") {
+        return (
+            "P1_verify_replay".to_string(),
+            "freeze_state_replay".to_string(),
+        );
+    }
+    if fee_apr >= 500.0 || target_progress.unwrap_or(0.0) >= 0.5 {
+        return ("P0_replay_now".to_string(), "replay_baselines".to_string());
+    }
+    (
+        "P1_replay_queue".to_string(),
+        "replay_baselines".to_string(),
+    )
 }
 
 fn solana_spacing_label(row: &SolanaPoolCandidate) -> String {
@@ -4338,5 +4648,13 @@ mod tests {
             risk_token_inventory_share(1.0, 1.0, 0.0, RiskTokenSide::Token1),
             0.0
         );
+    }
+
+    #[test]
+    fn hot_pool_formula_apr_matches_fee_times_turnover() {
+        let apr = formula_fee_apr_from_volume_tvl(2.0, 100.0);
+        assert!((apr - 730.0).abs() < 1e-9);
+        let required = required_volume_tvl_for_apr(2_000.0, 100.0).unwrap();
+        assert!((required - 5.47945205479452).abs() < 1e-9);
     }
 }

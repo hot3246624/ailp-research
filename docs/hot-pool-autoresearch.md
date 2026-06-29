@@ -68,6 +68,50 @@ Conclusion: the user's intuition is directionally right for **gross opportunity
 discovery**, but 2,000%+ should be treated as an anomaly/long-tail candidate until
 replay proves net edge.
 
+## Candidate Queue Command
+
+Use the hot-pool queue builder before spending time on replay:
+
+```bash
+cargo run -p autopool-cli -- hot-pool-candidates \
+  --min-tvl-usd 50000 \
+  --min-volume-usd-24h 25000 \
+  --min-fee-apr 100 \
+  --max-fee-apr 5000 \
+  --target-fee-apr 2000 \
+  --min-volume-tvl-24h 0.5 \
+  --page-size 120 \
+  --limit 30 \
+  --output data/hot-pool/candidates/latest.json
+```
+
+The command ranks protocol-API candidates and assigns:
+
+- `P1_replay_queue`: clean enough to replay from protocol/RPC data;
+- `P1_verify_replay`: promising, but first freeze pool state or validate API fields;
+- `P2_validate_api`: APR/token/API mismatch; do not replay until independently checked.
+
+It also computes a formula sanity check:
+
+```text
+formula_fee_apr = volume_tvl_24h * fee_bps / 10_000 * 365 * 100
+```
+
+If reported APR is much larger than this formula, the row gets
+`fee_apr_formula_mismatch` and is demoted to API validation. This already caught a
+Meteora `JLP-USDC` row that reported ~985% APR even though 3 bps fee and ~0.88x
+daily volume/TVL imply only about 9.6% fee APR from the simple formula.
+
+Recent cleaner replay candidates:
+
+| priority | venue | symbol | fee APR | volume/TVL | note |
+| --- | --- | ---: | ---: | ---: | --- |
+| P1 | Raydium | CARDS-USDC | ~222% | ~1.52x | clean protocol row |
+| P1 | Orca | SOL-PUMP | ~264% | ~4.5x | high turnover |
+| P1 | Raydium | WSOL-CX | ~122% | ~1.34x | clean protocol row |
+
+These are not deployable yet; they are the next replay queue.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

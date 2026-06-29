@@ -131,7 +131,9 @@ for replay/RPC enrichment.
 `docs/hot-pool-autoresearch.md` defines the strategy-development protocol for the
 highest-upside hypothesis: hot, high-fee, high-flow pools may show 2,000%+ gross
 fee APR, but every idea must beat hold/passive-wide/narrow baselines after LVR,
-churn, slippage, hedge cost, capacity, and operational risk.
+churn, slippage, hedge cost, capacity, and operational risk. The `hot-pool-candidates`
+command now turns protocol API scans into a ranked replay/API-validation queue and
+demotes rows whose reported APR fails the simple fee×turnover sanity check.
 
 ## External References
 

@@ -11,6 +11,18 @@ Suggested local results log:
 research/hot-pool/results.tsv
 ```
 
+Candidate queue:
+
+```bash
+cargo run -p autopool-cli -- hot-pool-candidates \
+  --min-tvl-usd 50000 \
+  --min-volume-usd-24h 25000 \
+  --min-fee-apr 100 \
+  --max-fee-apr 5000 \
+  --target-fee-apr 2000 \
+  --output data/hot-pool/candidates/latest.json
+```
+
 Schema:
 
 ```text
