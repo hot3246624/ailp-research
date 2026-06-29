@@ -663,6 +663,46 @@ The next strategy work should target this failure mode: preserve more of the
 `delta_hedged` mean edge while using `hedged_wide`-style tail control around trend
 windows.
 
+### Orca HYPE-USDC Replay
+
+`HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
+pass: about `123%` 24h fee APR, `16bps` fee tier, about `$59k` TVL, about `$126k` 24h
+volume, and volume/TVL around `2.12`. It is small, but it completes the current
+Whirlpool coverage set before moving back to strategy or DLMM work.
+
+Sampling quality was high:
+
+```text
+sample A: scanned 121 signatures, kept 120 normalized swaps, tx_errors=0
+span:     slot 429687986..429691923, tick span 27496..27423 after numeraire inversion
+window:   about 26.2 minutes
+```
+
+This sample was a directional up/beta segment rather than a fee-alpha segment. With
+`narrow_half_width=384`, `wide_half_width=2500`, `$10k` capital, and snapshot active
+liquidity, hold dominated the hedged LP policies:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | +$36.49 | $0.00 | $0.00 | $0.00 | ~7307% | $19.18 |
+| narrow_rebalance | +$35.56 | -$0.92 | $2.63 | $2.12 | ~7122% | $18.93 |
+| vol_scaled_rebalance | +$33.25 | -$3.24 | $3.84 | $2.82 | ~6659% | $18.95 |
+| delta_hedged | -$0.86 | -$37.35 | $2.63 | $2.12 | ~-172% | $2.60 |
+| hedged_wide | +$0.05 | -$36.44 | $0.61 | $0.53 | ~10% | $0.36 |
+
+Promotion gates rejected every view. The lagged rule failed 25/40/60/80-swap windows
+with win rates about `33%`, `20%`, `33%`, and `0%`, negative mean edge versus hold,
+and p05 APR about `-882%`, `-452%`, `-754%`, and `224%` on the thin 80-swap view.
+Direct `--gate-policy delta-hedged` rejected with p05 APR about `-859%`, `-413%`,
+`-721%`, and `234%`; `--gate-policy hedged-wide` rejected with p05 APR about `-75%`,
+`-13%`, `-79%`, and `71%`.
+
+Interpretation: this is not an alpha lead. It is a clear trend-risk case: hedging
+protects drawdown but gives up beta, and the resulting fee edge is not enough to beat
+hold. Together with the SOL-Fartcoin result, it argues that the next useful strategy
+iteration needs regime-aware beta participation, not just narrower ranges or heavier
+hedges.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

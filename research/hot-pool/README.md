@@ -282,6 +282,23 @@ also rejected; `hedged_wide` improved left tail to about `-245%`, `-106%`, `-97%
 and `-263%`, but mean net became small. Treat this as a promising rejection: there is
 fee-alpha signal, but no stable 500%+ left-tail strategy yet.
 
+Orca `HYPE-USDC` final P1 coverage replay:
+
+```text
+sample A: scanned 121 signatures, kept 120 normalized swaps, tx_errors=0
+span:     slot 429687986..429691923, about 26.2 minutes, tick 27496..27423 after inversion
+```
+
+This was the remaining replayable Orca P1 candidate: ~123% 24h fee APR, 16bps fee
+tier, ~$59k TVL, ~$126k 24h volume, volume/TVL near 2.12. It was a trend-risk sample,
+not an alpha lead. Full replay had hold at about `+$36.49`, narrow LP at `+$35.56`,
+`delta_hedged` at about `-$0.86`, and `hedged_wide` near flat. Promotion rejected all
+views: lagged p05 APR was about `-882%`, `-452%`, `-754%`, and `224%` across
+25/40/60/80-swap windows, with negative mean edge versus hold; direct `delta_hedged`
+and `hedged_wide` gates also rejected. This completes the current Orca Whirlpool P1
+coverage pass. Next useful work is regime-aware strategy improvement, historical
+active-liquidity reconstruction, or Meteora DLMM bin replay.
+
 Schema:
 
 ```text
