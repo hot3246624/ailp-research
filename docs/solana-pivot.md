@@ -158,5 +158,14 @@ The Solana search should be:
    tick/range for CLMM, bin/range for DLMM.
 6. Only after replay edge is confirmed: build execution simulation.
 
+Current implementation boundary:
+
+- `hot-pool-experiment-plan` writes replay specs and blocks pools without the right
+  adapter.
+- Orca Whirlpool and Raydium CLMM should emit normalized `SwapObs` JSONL first;
+  this can reuse the existing tick/range replay engine.
+- Meteora DLMM needs a bin replay engine and should stay out of `SwapObs`/v3 math
+  until bin liquidity and swap accounting are modeled.
+
 Bottom line: Base remains the execution training ground. Solana is now the main
 candidate-discovery frontier.

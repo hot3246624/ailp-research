@@ -206,6 +206,41 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Convert the hot-pool candidate queue into concrete replay experiments.
+    /// This does not invent results: pools without normalized swap/bin data stay
+    /// blocked with explicit data requirements.
+    HotPoolExperimentPlan {
+        /// JSON emitted by `hot-pool-candidates`.
+        #[arg(long, default_value = "data/hot-pool/candidates/latest.json")]
+        input: PathBuf,
+        /// Root where normalized Solana replay streams will live.
+        #[arg(long, default_value = "data/solana/hot-pool")]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Include P2/API-validation rows in the plan. By default only replayable
+        /// or freeze-state candidates are planned.
+        #[arg(long, default_value_t = false)]
+        include_p2: bool,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital_usd: f64,
+        #[arg(long, default_value_t = 300)]
+        narrow_half_width: i32,
+        #[arg(long, default_value_t = 3_000)]
+        wide_half_width: i32,
+        #[arg(long, default_value_t = 0.05)]
+        max_drawdown_pct: f64,
+        #[arg(long, default_value_t = 12)]
+        max_rebalances_per_day: u32,
+        /// Optional JSON output path for the experiment manifest.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Also write per-pool replay spec sidecars under `data_dir/specs`.
+        #[arg(long, default_value_t = false)]
+        write_specs: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     SampleBaseNetwork {
         #[arg(long, env = "BASE_RPC_URL")]
         rpc_url: String,
@@ -335,6 +370,20 @@ enum Command {
         symbol: Option<String>,
         #[command(flatten)]
         params: ReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Replay a normalized swap stream (`autopool_backtest::SwapObs` JSONL) with a
+    /// pool spec sidecar. This is the adapter boundary for Solana CLMM decoders.
+    ReplayNormalizedSwaps {
+        #[arg(long)]
+        spec: PathBuf,
+        /// JSONL file of normalized SwapObs rows. Defaults to `swaps.jsonl` next to
+        /// the spec file.
+        #[arg(long)]
+        swaps: Option<PathBuf>,
+        #[command(flatten)]
+        params: NormalizedReplayParams,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -613,6 +662,14 @@ struct ReplayParams {
     /// Blocks between a trigger and execution (you cannot rebalance instantly).
     #[arg(long, default_value_t = 0)]
     action_delay_blocks: u64,
+    /// Seconds per block/slot in the replay stream. Base uses ~2s; Solana
+    /// normalized streams should use slot time, commonly ~0.4s.
+    #[arg(long, default_value_t = 2.0)]
+    block_seconds: f64,
+    /// Which token side is the volatile/risk inventory after any --invert
+    /// normalization.
+    #[arg(long, value_enum, default_value_t = RiskTokenSide::Token1)]
+    risk_token_side: RiskTokenSide,
     /// Funding cost (bps/day) on the short-hedge notional.
     #[arg(long, default_value_t = 0.0)]
     funding_bps_per_day: f64,
@@ -671,11 +728,48 @@ impl ReplayParams {
     fn exec_config(&self) -> autopool_backtest::ExecConfig {
         autopool_backtest::ExecConfig {
             action_delay_blocks: self.action_delay_blocks,
-            block_seconds: 2.0,
+            block_seconds: self.block_seconds,
             funding_bps_per_day: self.funding_bps_per_day,
-            risk_asset_is_token1: true,
+            risk_asset_is_token1: self.risk_token_side == RiskTokenSide::Token1,
         }
     }
+}
+
+#[derive(Debug, clap::Args)]
+struct NormalizedReplayParams {
+    /// USD value of the replay numeraire token. If omitted, the spec must provide
+    /// it (stablecoin-numeraire specs use 1.0).
+    #[arg(long)]
+    token0_usd: Option<f64>,
+    #[arg(long, default_value_t = 10_000.0)]
+    capital_usd: f64,
+    #[arg(long, default_value_t = 0.005)]
+    rebalance_gas_usd: f64,
+    #[arg(long, default_value_t = 5.0)]
+    rebalance_slippage_bps: f64,
+    #[arg(long, default_value_t = 300)]
+    narrow_half_width: i32,
+    #[arg(long, default_value_t = 3_000)]
+    wide_half_width: i32,
+    #[arg(long, default_value_t = 1.5)]
+    vol_k: f64,
+    #[arg(long, default_value_t = 2)]
+    action_delay_blocks: u64,
+    #[arg(long)]
+    block_seconds: Option<f64>,
+    #[arg(long, value_enum)]
+    risk_token_side: Option<RiskTokenSide>,
+    #[arg(long, default_value_t = 0.0)]
+    funding_bps_per_day: f64,
+    #[arg(long, default_value_t = 1.0)]
+    hedge_fraction: f64,
+    #[arg(long, default_value_t = 6.0)]
+    trend_exit_threshold: f64,
+    /// Annual reward APR as a fraction, e.g. 0.20 for 20%.
+    #[arg(long)]
+    reward_apr: Option<f64>,
+    #[arg(long, default_value_t = 0.0)]
+    reward_haircut: f64,
 }
 
 #[tokio::main]
@@ -810,6 +904,33 @@ async fn main() -> Result<()> {
             })
             .await?
         }
+        Command::HotPoolExperimentPlan {
+            input,
+            data_dir,
+            limit,
+            include_p2,
+            capital_usd,
+            narrow_half_width,
+            wide_half_width,
+            max_drawdown_pct,
+            max_rebalances_per_day,
+            output,
+            write_specs,
+            format,
+        } => hot_pool_experiment_plan(HotPoolExperimentArgs {
+            input,
+            data_dir,
+            limit,
+            include_p2,
+            capital_usd,
+            narrow_half_width,
+            wide_half_width,
+            max_drawdown_pct,
+            max_rebalances_per_day,
+            output,
+            write_specs,
+            format,
+        })?,
         Command::SampleBaseNetwork {
             rpc_url,
             rebalance_gas_units,
@@ -928,6 +1049,12 @@ async fn main() -> Result<()> {
             params,
             format,
         } => replay_events(data_dir, pool_address, symbol, &params, format)?,
+        Command::ReplayNormalizedSwaps {
+            spec,
+            swaps,
+            params,
+            format,
+        } => replay_normalized_swaps(spec, swaps, &params, format)?,
         Command::ReplayScenario {
             scenario,
             start_tick,
@@ -1682,18 +1809,42 @@ struct HotPoolCandidateArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HotPoolTokenRow {
+    address: String,
+    symbol: String,
+    name: Option<String>,
+    decimals: Option<u8>,
+    verified: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HotPoolCandidateRow {
     venue: String,
+    #[serde(default)]
+    pool_kind: String,
     symbol: String,
     pool_address: String,
+    #[serde(default)]
+    tokens: Vec<HotPoolTokenRow>,
     fee_bps: Option<f64>,
+    tick_spacing: Option<i32>,
+    bin_step: Option<i32>,
     tvl_usd: f64,
     volume_usd_24h: f64,
     volume_tvl_24h: f64,
     fee_apr_24h: f64,
+    fee_apr_7d: Option<f64>,
+    reward_apr_pct: Option<f64>,
+    total_apr: Option<f64>,
     formula_fee_apr_24h: Option<f64>,
     reported_to_formula_apr: Option<f64>,
+    current_price: Option<f64>,
+    current_tick: Option<i32>,
+    active_liquidity: Option<String>,
+    updated_slot: Option<u64>,
+    #[serde(default)]
+    verified: bool,
     target_fee_apr: f64,
     required_volume_tvl_for_target: Option<f64>,
     target_progress: Option<f64>,
@@ -1702,6 +1853,82 @@ struct HotPoolCandidateRow {
     experiment_priority: String,
     next_step: String,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HotPoolExperimentArgs {
+    input: PathBuf,
+    data_dir: PathBuf,
+    limit: usize,
+    include_p2: bool,
+    capital_usd: f64,
+    narrow_half_width: i32,
+    wide_half_width: i32,
+    max_drawdown_pct: f64,
+    max_rebalances_per_day: u32,
+    output: Option<PathBuf>,
+    write_specs: bool,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayPoolSpec {
+    chain: String,
+    venue: String,
+    pool_kind: String,
+    pool_address: String,
+    symbol: String,
+    token0: Option<HotPoolTokenRow>,
+    token1: Option<HotPoolTokenRow>,
+    fee_bps: f64,
+    tick_spacing: Option<i32>,
+    bin_step: Option<i32>,
+    replay_model: String,
+    invert_for_numeraire: bool,
+    token0_usd: Option<f64>,
+    block_seconds: f64,
+    risk_token_side: String,
+    reward_apr_fraction: Option<f64>,
+    active_liquidity: Option<String>,
+    source_priority: String,
+    source_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HotPoolPromotionGates {
+    min_windows: usize,
+    min_win_rate_vs_hold_and_wide: f64,
+    require_positive_fee_minus_lvr: bool,
+    max_drawdown_usd: f64,
+    max_rebalances_per_day: u32,
+    require_capacity_check: bool,
+    require_api_cross_check: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HotPoolExperimentRow {
+    experiment_id: String,
+    venue: String,
+    symbol: String,
+    pool_address: String,
+    priority: String,
+    status: String,
+    next_step: String,
+    replay_model: String,
+    normalized_swaps_path: String,
+    spec_path: String,
+    normalized_swaps: usize,
+    candidate_fee_apr_24h: f64,
+    formula_fee_apr_24h: Option<f64>,
+    volume_tvl_24h: f64,
+    target_progress: Option<f64>,
+    capital_usd: f64,
+    baseline_policies: Vec<String>,
+    data_requirements: Vec<String>,
+    reject_reasons: Vec<String>,
+    promotion_gates: HotPoolPromotionGates,
+    replay_command: Option<String>,
+    spec: ReplayPoolSpec,
 }
 
 async fn hot_pool_candidates(args: HotPoolCandidateArgs) -> Result<()> {
@@ -1844,15 +2071,37 @@ fn hot_pool_candidate_row(
 
     Some(HotPoolCandidateRow {
         venue: candidate.venue.label().to_string(),
+        pool_kind: candidate.pool_kind,
         symbol: candidate.symbol,
         pool_address: candidate.pool_address,
+        tokens: candidate
+            .tokens
+            .into_iter()
+            .map(|token| HotPoolTokenRow {
+                address: token.address,
+                symbol: token.symbol,
+                name: token.name,
+                decimals: token.decimals,
+                verified: token.verified,
+            })
+            .collect(),
         fee_bps: candidate.fee_bps,
+        tick_spacing: candidate.tick_spacing,
+        bin_step: candidate.bin_step,
         tvl_usd: candidate.tvl_usd,
         volume_usd_24h: volume,
         volume_tvl_24h: volume_tvl,
         fee_apr_24h: fee_apr,
+        fee_apr_7d: candidate.fee_apr_7d,
+        reward_apr_pct: candidate.reward_apr,
+        total_apr: candidate.total_apr,
         formula_fee_apr_24h: formula_fee_apr,
         reported_to_formula_apr,
+        current_price: candidate.current_price,
+        current_tick: candidate.current_tick,
+        active_liquidity: candidate.active_liquidity,
+        updated_slot: candidate.updated_slot,
+        verified: candidate.verified,
         target_fee_apr: args.target_fee_apr,
         required_volume_tvl_for_target,
         target_progress,
@@ -1919,6 +2168,444 @@ fn hot_pool_priority(
         "P1_replay_queue".to_string(),
         "replay_baselines".to_string(),
     )
+}
+
+fn hot_pool_experiment_plan(args: HotPoolExperimentArgs) -> Result<()> {
+    let input = fs::read_to_string(&args.input)
+        .with_context(|| format!("reading hot-pool candidates {}", args.input.display()))?;
+    let mut candidates = serde_json::from_str::<Vec<HotPoolCandidateRow>>(&input)
+        .with_context(|| format!("parsing hot-pool candidates {}", args.input.display()))?;
+    if !args.include_p2 {
+        candidates.retain(|row| !row.experiment_priority.starts_with("P2"));
+    }
+
+    let mut rows = Vec::new();
+    for candidate in candidates.into_iter().take(args.limit) {
+        rows.push(hot_pool_experiment_row(&candidate, &args)?);
+    }
+
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_string_pretty(&rows)?)
+            .with_context(|| format!("writing hot-pool experiment plan {}", output.display()))?;
+    }
+
+    if args.write_specs {
+        let spec_dir = args.data_dir.join("specs");
+        fs::create_dir_all(&spec_dir)
+            .with_context(|| format!("creating spec directory {}", spec_dir.display()))?;
+        for row in &rows {
+            fs::write(
+                Path::new(&row.spec_path),
+                serde_json::to_string_pretty(&row.spec)?,
+            )
+            .with_context(|| format!("writing replay spec {}", row.spec_path))?;
+        }
+    }
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "hot-pool experiment plan input={} planned={} include_p2={} capital=${:.0}",
+        args.input.display(),
+        rows.len(),
+        args.include_p2,
+        args.capital_usd
+    );
+    println!(
+        "{:<8} {:<22} {:<18} {:<31} {:>6} {:>8} {:<22}  next_step",
+        "venue", "symbol", "priority", "status", "swaps", "feeAPR", "model"
+    );
+    for row in &rows {
+        println!(
+            "{:<8} {:<22} {:<18} {:<31} {:>6} {:>7.1}% {:<22}  {}",
+            row.venue,
+            row.symbol,
+            row.priority,
+            row.status,
+            row.normalized_swaps,
+            row.candidate_fee_apr_24h,
+            row.replay_model,
+            row.next_step
+        );
+    }
+
+    Ok(())
+}
+
+fn hot_pool_experiment_row(
+    candidate: &HotPoolCandidateRow,
+    args: &HotPoolExperimentArgs,
+) -> Result<HotPoolExperimentRow> {
+    let experiment_id = hot_pool_experiment_id(candidate);
+    let normalized_swaps_path = args
+        .data_dir
+        .join("swaps")
+        .join(candidate.pool_address.to_ascii_lowercase())
+        .join("swaps.jsonl");
+    let spec_path = args
+        .data_dir
+        .join("specs")
+        .join(format!("{experiment_id}.json"));
+    let normalized_swaps = count_nonempty_lines_if_exists(&normalized_swaps_path)?;
+    let replay_model = hot_pool_replay_model(candidate);
+    let spec = replay_spec_from_candidate(candidate, &replay_model);
+    let reject_reasons = hot_pool_reject_reasons(candidate);
+    let data_requirements =
+        hot_pool_data_requirements(candidate, &replay_model, normalized_swaps, &reject_reasons);
+    let status = hot_pool_experiment_status(
+        candidate,
+        &replay_model,
+        normalized_swaps,
+        &data_requirements,
+        &reject_reasons,
+    );
+    let next_step = hot_pool_next_step(&status);
+    let replay_command = (status == "ready_for_replay").then(|| {
+        format!(
+            "cargo run -p autopool-cli -- replay-normalized-swaps --spec {} --swaps {} --capital-usd {:.0} --narrow-half-width {} --wide-half-width {}",
+            spec_path.display(),
+            normalized_swaps_path.display(),
+            args.capital_usd,
+            args.narrow_half_width,
+            args.wide_half_width
+        )
+    });
+
+    Ok(HotPoolExperimentRow {
+        experiment_id,
+        venue: candidate.venue.clone(),
+        symbol: candidate.symbol.clone(),
+        pool_address: candidate.pool_address.clone(),
+        priority: candidate.experiment_priority.clone(),
+        status,
+        next_step,
+        replay_model,
+        normalized_swaps_path: normalized_swaps_path.display().to_string(),
+        spec_path: spec_path.display().to_string(),
+        normalized_swaps,
+        candidate_fee_apr_24h: candidate.fee_apr_24h,
+        formula_fee_apr_24h: candidate.formula_fee_apr_24h,
+        volume_tvl_24h: candidate.volume_tvl_24h,
+        target_progress: candidate.target_progress,
+        capital_usd: args.capital_usd,
+        baseline_policies: hot_pool_baseline_policies(),
+        data_requirements,
+        reject_reasons,
+        promotion_gates: HotPoolPromotionGates {
+            min_windows: 5,
+            min_win_rate_vs_hold_and_wide: 0.70,
+            require_positive_fee_minus_lvr: true,
+            max_drawdown_usd: args.capital_usd * args.max_drawdown_pct,
+            max_rebalances_per_day: args.max_rebalances_per_day,
+            require_capacity_check: true,
+            require_api_cross_check: true,
+        },
+        replay_command,
+        spec,
+    })
+}
+
+fn replay_spec_from_candidate(
+    candidate: &HotPoolCandidateRow,
+    replay_model: &str,
+) -> ReplayPoolSpec {
+    let stable_index = stable_token_index(&candidate.tokens);
+    let invert_for_numeraire = stable_index == Some(1);
+    ReplayPoolSpec {
+        chain: "solana".to_string(),
+        venue: candidate.venue.clone(),
+        pool_kind: candidate.pool_kind.clone(),
+        pool_address: candidate.pool_address.clone(),
+        symbol: candidate.symbol.clone(),
+        token0: candidate.tokens.first().cloned(),
+        token1: candidate.tokens.get(1).cloned(),
+        fee_bps: candidate.fee_bps.unwrap_or_default(),
+        tick_spacing: candidate.tick_spacing,
+        bin_step: candidate.bin_step,
+        replay_model: replay_model.to_string(),
+        invert_for_numeraire,
+        token0_usd: stable_index.map(|_| 1.0),
+        block_seconds: 0.4,
+        risk_token_side: RiskTokenSide::Token1.label().to_string(),
+        reward_apr_fraction: candidate.reward_apr_pct.map(|pct| pct / 100.0),
+        active_liquidity: candidate.active_liquidity.clone(),
+        source_priority: candidate.experiment_priority.clone(),
+        source_warnings: candidate.warnings.clone(),
+    }
+}
+
+fn hot_pool_replay_model(candidate: &HotPoolCandidateRow) -> String {
+    let venue = candidate.venue.to_ascii_lowercase();
+    let kind = candidate.pool_kind.to_ascii_lowercase();
+    if venue == "meteora" || kind.contains("dlmm") || candidate.bin_step.is_some() {
+        "dlmm_bin_replay".to_string()
+    } else {
+        "clmm_tick_replay".to_string()
+    }
+}
+
+fn hot_pool_reject_reasons(candidate: &HotPoolCandidateRow) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for warning in &candidate.warnings {
+        match warning.as_str() {
+            "fee_apr_formula_mismatch" => reasons.push(
+                "reported APR fails fee*turnover sanity check; verify provider math first"
+                    .to_string(),
+            ),
+            "fee_apr_outlier" => {
+                reasons.push("reported APR is an outlier; cross-check before replay".to_string())
+            }
+            "unverified_or_warning" => {
+                reasons.push("protocol row is unverified or carries API warnings".to_string())
+            }
+            _ => {}
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn hot_pool_data_requirements(
+    candidate: &HotPoolCandidateRow,
+    replay_model: &str,
+    normalized_swaps: usize,
+    reject_reasons: &[String],
+) -> Vec<String> {
+    let mut requirements = Vec::new();
+    if !reject_reasons.is_empty() {
+        requirements.push("independent_api_cross_check".to_string());
+    }
+    if candidate.tokens.len() < 2
+        || candidate
+            .tokens
+            .iter()
+            .any(|token| token.decimals.is_none())
+    {
+        requirements.push("token_mints_and_decimals".to_string());
+    }
+    if candidate.fee_bps.unwrap_or_default() <= 0.0 {
+        requirements.push("fee_tier_bps".to_string());
+    }
+    if replay_model == "dlmm_bin_replay" {
+        requirements.push("dlmm_bin_replay_engine".to_string());
+        requirements.push("bin_liquidity_snapshots".to_string());
+        requirements.push("dlmm_swap_decoder".to_string());
+    } else {
+        if candidate.tick_spacing.is_none() {
+            requirements.push("tick_spacing".to_string());
+        }
+        if normalized_swaps == 0 {
+            requirements.push("normalized_clmm_swap_stream".to_string());
+        }
+        requirements.push("active_liquidity_per_swap_or_snapshot".to_string());
+    }
+    requirements.sort();
+    requirements.dedup();
+    requirements
+}
+
+fn hot_pool_experiment_status(
+    candidate: &HotPoolCandidateRow,
+    replay_model: &str,
+    normalized_swaps: usize,
+    data_requirements: &[String],
+    reject_reasons: &[String],
+) -> String {
+    if candidate.experiment_priority.starts_with("P2") || !reject_reasons.is_empty() {
+        return "blocked_api_validation".to_string();
+    }
+    if replay_model == "dlmm_bin_replay" {
+        return "blocked_needs_bin_replay".to_string();
+    }
+    if data_requirements.iter().any(|requirement| {
+        matches!(
+            requirement.as_str(),
+            "token_mints_and_decimals" | "fee_tier_bps" | "tick_spacing"
+        )
+    }) {
+        return "blocked_missing_replay_metadata".to_string();
+    }
+    if normalized_swaps == 0 {
+        return "blocked_missing_normalized_swaps".to_string();
+    }
+    "ready_for_replay".to_string()
+}
+
+fn hot_pool_next_step(status: &str) -> String {
+    match status {
+        "blocked_api_validation" => "verify_provider_apr_and_fee_math".to_string(),
+        "blocked_needs_bin_replay" => "implement_dlmm_bin_replay_adapter".to_string(),
+        "blocked_missing_replay_metadata" => "refresh_protocol_state_metadata".to_string(),
+        "blocked_missing_normalized_swaps" => "collect_and_decode_clmm_swaps".to_string(),
+        "ready_for_replay" => "run_baseline_replay_battery".to_string(),
+        _ => "investigate".to_string(),
+    }
+}
+
+fn hot_pool_baseline_policies() -> Vec<String> {
+    [
+        "hold_50_50",
+        "passive_wide",
+        "narrow_static",
+        "narrow_rebalance",
+        "vol_scaled_rebalance",
+        "hard_exit_stop",
+        "hedged_narrow",
+        "adaptive_regime",
+    ]
+    .iter()
+    .map(|policy| (*policy).to_string())
+    .collect()
+}
+
+fn hot_pool_experiment_id(candidate: &HotPoolCandidateRow) -> String {
+    let address = candidate.pool_address.trim_start_matches("0x");
+    let prefix = &address[..address.len().min(8)];
+    format!(
+        "{}-{}-{}",
+        candidate.venue.to_ascii_lowercase(),
+        symbol_key(&candidate.symbol).to_ascii_lowercase(),
+        prefix.to_ascii_lowercase()
+    )
+}
+
+fn stable_token_index(tokens: &[HotPoolTokenRow]) -> Option<usize> {
+    tokens
+        .iter()
+        .position(|token| is_stable_symbol(&token.symbol))
+}
+
+fn is_stable_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol.to_ascii_uppercase().as_str(),
+        "USDC" | "USDT" | "USDG" | "USDS" | "PYUSD" | "FDUSD" | "DAI"
+    )
+}
+
+fn count_nonempty_lines_if_exists(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = 0usize;
+    for line in reader.lines() {
+        if !line?.trim().is_empty() {
+            lines += 1;
+        }
+    }
+    Ok(lines)
+}
+
+impl NormalizedReplayParams {
+    fn to_replay_params(&self, spec: &ReplayPoolSpec) -> Result<ReplayParams> {
+        if spec.fee_bps <= 0.0 {
+            anyhow::bail!(
+                "replay spec {} has invalid fee_bps={}",
+                spec.symbol,
+                spec.fee_bps
+            );
+        }
+        let natural_decimals0 = spec
+            .token0
+            .as_ref()
+            .and_then(|token| token.decimals)
+            .with_context(|| format!("replay spec {} missing token0 decimals", spec.symbol))?;
+        let natural_decimals1 = spec
+            .token1
+            .as_ref()
+            .and_then(|token| token.decimals)
+            .with_context(|| format!("replay spec {} missing token1 decimals", spec.symbol))?;
+        let (decimals0, decimals1) = if spec.invert_for_numeraire {
+            (natural_decimals1, natural_decimals0)
+        } else {
+            (natural_decimals0, natural_decimals1)
+        };
+        let token0_usd = self.token0_usd.or(spec.token0_usd).with_context(|| {
+            format!(
+                "replay spec {} has no token0_usd anchor; pass --token0-usd",
+                spec.symbol
+            )
+        })?;
+        let risk_token_side = self
+            .risk_token_side
+            .unwrap_or_else(|| risk_token_side_from_label(&spec.risk_token_side));
+
+        Ok(ReplayParams {
+            fee_bps: spec.fee_bps,
+            decimals0,
+            decimals1,
+            token0_usd,
+            capital_usd: self.capital_usd,
+            rebalance_gas_usd: self.rebalance_gas_usd,
+            rebalance_slippage_bps: self.rebalance_slippage_bps,
+            narrow_half_width: self.narrow_half_width,
+            wide_half_width: self.wide_half_width,
+            vol_k: self.vol_k,
+            action_delay_blocks: self.action_delay_blocks,
+            block_seconds: self.block_seconds.unwrap_or(spec.block_seconds),
+            risk_token_side,
+            funding_bps_per_day: self.funding_bps_per_day,
+            hedge_fraction: self.hedge_fraction,
+            trend_exit_threshold: self.trend_exit_threshold,
+            reward_apr: self
+                .reward_apr
+                .or(spec.reward_apr_fraction)
+                .unwrap_or_default(),
+            reward_haircut: self.reward_haircut,
+            invert: spec.invert_for_numeraire,
+        })
+    }
+}
+
+fn risk_token_side_from_label(label: &str) -> RiskTokenSide {
+    if label.eq_ignore_ascii_case("token0") {
+        RiskTokenSide::Token0
+    } else {
+        RiskTokenSide::Token1
+    }
+}
+
+fn read_replay_pool_spec(path: &Path) -> Result<ReplayPoolSpec> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading replay spec {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing replay spec {}", path.display()))
+}
+
+fn load_normalized_swaps(path: &Path) -> Result<Vec<autopool_backtest::SwapObs>> {
+    let file = File::open(path)
+        .with_context(|| format!("opening normalized swap stream {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut swaps = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let swap =
+            serde_json::from_str::<autopool_backtest::SwapObs>(&line).with_context(|| {
+                format!(
+                    "failed to parse normalized swap {} line {}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+        swaps.push(swap);
+    }
+    swaps.sort_by(|left, right| {
+        left.block
+            .cmp(&right.block)
+            .then_with(|| left.log_index.cmp(&right.log_index))
+    });
+    Ok(swaps)
 }
 
 fn solana_spacing_label(row: &SolanaPoolCandidate) -> String {
@@ -2797,6 +3484,8 @@ fn params_json(params: &ReplayParams) -> serde_json::Value {
         "wide_half_width": params.wide_half_width,
         "vol_k": params.vol_k,
         "action_delay_blocks": params.action_delay_blocks,
+        "block_seconds": params.block_seconds,
+        "risk_token_side": params.risk_token_side.label(),
         "funding_bps_per_day": params.funding_bps_per_day,
         "hedge_fraction": params.hedge_fraction,
         "trend_exit_threshold": params.trend_exit_threshold,
@@ -2842,12 +3531,14 @@ fn emit_replay_report(
         optional_i32(report.tick_last),
     );
     println!(
-        "config: fee={:.2}bps capital=${:.0} token0=${:.0} gas=${:.3}/reb delay={}blk fund={}bps/d hedge={} narrow=±{} wide=±{}",
+        "config: fee={:.2}bps capital=${:.0} token0=${:.0} gas=${:.3}/reb delay={}blk block_s={:.2} risk={} fund={}bps/d hedge={} narrow=±{} wide=±{}",
         params.fee_bps,
         params.capital_usd,
         params.token0_usd,
         params.rebalance_gas_usd,
         params.action_delay_blocks,
+        params.block_seconds,
+        params.risk_token_side.label(),
         params.funding_bps_per_day,
         params.hedge_fraction,
         params.narrow_half_width,
@@ -2910,6 +3601,51 @@ fn replay_events(
         policies,
     };
     emit_replay_report(report, params, format)
+}
+
+fn replay_normalized_swaps(
+    spec_path: PathBuf,
+    swaps_path: Option<PathBuf>,
+    overrides: &NormalizedReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    let spec = read_replay_pool_spec(&spec_path)?;
+    if spec.replay_model != "clmm_tick_replay" {
+        anyhow::bail!(
+            "unsupported replay_model `{}` in {}; normalized replay currently supports clmm_tick_replay only",
+            spec.replay_model,
+            spec_path.display()
+        );
+    }
+    let swaps_path = swaps_path.unwrap_or_else(|| {
+        spec_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("swaps.jsonl")
+    });
+    let params = overrides.to_replay_params(&spec)?;
+    let mut swaps = load_normalized_swaps(&swaps_path)?;
+    if params.invert {
+        for swap in &mut swaps {
+            *swap = swap.inverted();
+        }
+    }
+    if swaps.is_empty() {
+        anyhow::bail!("no normalized swaps found in {}", swaps_path.display());
+    }
+
+    let policies = run_battery(&params, &swaps);
+    let report = ReplayReport {
+        label: format!("{} ({})", spec.symbol, spec.pool_address),
+        swaps: swaps.len(),
+        block_first: swaps.first().map(|swap| swap.block),
+        block_last: swaps.last().map(|swap| swap.block),
+        tick_first: swaps.first().map(|swap| swap.tick),
+        tick_last: swaps.last().map(|swap| swap.tick),
+        config: params_json(&params),
+        policies,
+    };
+    emit_replay_report(report, &params, format)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4656,5 +5392,90 @@ mod tests {
         assert!((apr - 730.0).abs() < 1e-9);
         let required = required_volume_tvl_for_apr(2_000.0, 100.0).unwrap();
         assert!((required - 5.47945205479452).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hot_pool_spec_inverts_when_stable_is_token1() {
+        let candidate = hot_pool_candidate_fixture("raydium", "clmm", Some(60), None, vec![]);
+        let spec = replay_spec_from_candidate(&candidate, &hot_pool_replay_model(&candidate));
+
+        assert_eq!(spec.replay_model, "clmm_tick_replay");
+        assert!(spec.invert_for_numeraire);
+        assert_eq!(spec.token0_usd, Some(1.0));
+        assert_eq!(spec.risk_token_side, "token1");
+    }
+
+    #[test]
+    fn hot_pool_plan_blocks_meteora_dlmm_from_tick_replay() {
+        let candidate = hot_pool_candidate_fixture(
+            "meteora",
+            "dlmm",
+            None,
+            Some(20),
+            vec!["meteora_daily_ratio_disagrees_with_apy".to_string()],
+        );
+        let model = hot_pool_replay_model(&candidate);
+        let requirements = hot_pool_data_requirements(&candidate, &model, 0, &[]);
+        let status = hot_pool_experiment_status(&candidate, &model, 0, &requirements, &[]);
+
+        assert_eq!(model, "dlmm_bin_replay");
+        assert_eq!(status, "blocked_needs_bin_replay");
+        assert!(requirements.contains(&"dlmm_bin_replay_engine".to_string()));
+    }
+
+    fn hot_pool_candidate_fixture(
+        venue: &str,
+        pool_kind: &str,
+        tick_spacing: Option<i32>,
+        bin_step: Option<i32>,
+        warnings: Vec<String>,
+    ) -> HotPoolCandidateRow {
+        HotPoolCandidateRow {
+            venue: venue.to_string(),
+            pool_kind: pool_kind.to_string(),
+            symbol: "CARDS-USDC".to_string(),
+            pool_address: "HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD".to_string(),
+            tokens: vec![
+                HotPoolTokenRow {
+                    address: "CARDS".to_string(),
+                    symbol: "CARDS".to_string(),
+                    name: Some("Collector Crypt".to_string()),
+                    decimals: Some(6),
+                    verified: None,
+                },
+                HotPoolTokenRow {
+                    address: "USDC".to_string(),
+                    symbol: "USDC".to_string(),
+                    name: Some("USD Coin".to_string()),
+                    decimals: Some(6),
+                    verified: None,
+                },
+            ],
+            fee_bps: Some(40.0),
+            tick_spacing,
+            bin_step,
+            tvl_usd: 3_600_000.0,
+            volume_usd_24h: 5_500_000.0,
+            volume_tvl_24h: 1.5,
+            fee_apr_24h: 219.0,
+            fee_apr_7d: Some(180.0),
+            reward_apr_pct: Some(0.0),
+            total_apr: Some(219.0),
+            formula_fee_apr_24h: Some(219.0),
+            reported_to_formula_apr: Some(1.0),
+            current_price: Some(1.0),
+            current_tick: Some(0),
+            active_liquidity: Some("1000000".to_string()),
+            updated_slot: Some(0),
+            verified: true,
+            target_fee_apr: 2_000.0,
+            required_volume_tvl_for_target: Some(13.7),
+            target_progress: Some(0.11),
+            hot_score: 700.0,
+            autoresearch_status: "needs_validation".to_string(),
+            experiment_priority: "P1_replay_queue".to_string(),
+            next_step: "replay_baselines".to_string(),
+            warnings,
+        }
     }
 }

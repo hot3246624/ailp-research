@@ -112,6 +112,40 @@ Recent cleaner replay candidates:
 
 These are not deployable yet; they are the next replay queue.
 
+## Experiment Plan Command
+
+Convert the candidate queue into replay work items:
+
+```bash
+cargo run -p autopool-cli -- hot-pool-experiment-plan \
+  --input data/hot-pool/candidates/latest.json \
+  --data-dir data/solana/hot-pool \
+  --limit 12 \
+  --output data/hot-pool/experiments/latest.json \
+  --write-specs
+```
+
+The plan command does not create backtest results. It assigns each pool to a
+replay model and blocks invalid transitions:
+
+- `clmm_tick_replay`: Orca Whirlpool / Raydium CLMM; needs normalized `SwapObs`
+  JSONL at the manifest path before replay can run.
+- `dlmm_bin_replay`: Meteora DLMM; blocked until we implement bin-liquidity replay.
+- `blocked_api_validation`: reported APR fails provider/fee-turnover sanity checks.
+
+Once a CLMM decoder emits normalized swaps, run:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-swaps \
+  --spec data/solana/hot-pool/specs/<experiment>.json \
+  --swaps data/solana/hot-pool/swaps/<pool>/swaps.jsonl
+```
+
+Latest live scan result: clean CLMM rows are currently `Raydium CARDS-USDC`,
+`Orca SOL-PUMP`, and `Raydium WSOL-CX`; all remain blocked on normalized swap
+collection, not on strategy math. Meteora dominates the visible hot queue, but it
+is DLMM/bin-based and must not be evaluated with the v3 tick engine.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

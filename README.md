@@ -134,6 +134,11 @@ fee APR, but every idea must beat hold/passive-wide/narrow baselines after LVR,
 churn, slippage, hedge cost, capacity, and operational risk. The `hot-pool-candidates`
 command now turns protocol API scans into a ranked replay/API-validation queue and
 demotes rows whose reported APR fails the simple fee×turnover sanity check.
+`hot-pool-experiment-plan` converts that queue into replay manifests: Orca/Raydium
+CLMM pools are routed to normalized-swap collection, while Meteora DLMM pools are
+blocked behind a separate bin-replay adapter instead of being forced through v3
+tick math. `replay-normalized-swaps` is the generic adapter boundary once a Solana
+CLMM decoder emits `SwapObs` JSONL.
 
 ## External References
 

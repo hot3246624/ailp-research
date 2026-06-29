@@ -23,6 +23,25 @@ cargo run -p autopool-cli -- hot-pool-candidates \
   --output data/hot-pool/candidates/latest.json
 ```
 
+Experiment manifest:
+
+```bash
+cargo run -p autopool-cli -- hot-pool-experiment-plan \
+  --input data/hot-pool/candidates/latest.json \
+  --data-dir data/solana/hot-pool \
+  --limit 12 \
+  --output data/hot-pool/experiments/latest.json \
+  --write-specs
+```
+
+Replay normalized CLMM swaps after a Solana decoder writes `SwapObs` JSONL:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-swaps \
+  --spec data/solana/hot-pool/specs/<experiment>.json \
+  --swaps data/solana/hot-pool/swaps/<pool>/swaps.jsonl
+```
+
 Schema:
 
 ```text
