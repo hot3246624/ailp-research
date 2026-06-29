@@ -617,6 +617,52 @@ verdict. It does show that enormous volume is not enough by itself. Low fee tier
 leave the fee-LVR edge too thin for the 500% left-tail gate once rolling windows and
 hold-edge checks are applied.
 
+### Orca SOL-Fartcoin Replay
+
+After covering the larger and cleaner Whirlpool candidates, the next pass tested a
+higher-risk meme pair to see whether volatility plus a 16bps fee tier creates better
+fee alpha than SOL-USDC. The refreshed Orca queue showed `SOL-Fartcoin` around
+`116%` 24h fee APR, about `$527k` TVL, about `$1.05m` 24h volume, and volume/TVL near
+`2.00`.
+
+Sampling landed cleanly:
+
+```text
+sample A: scanned 192 signatures, kept 160 normalized swaps, tx_errors=0
+span:     slot 429680775..429687571, tick span roughly -6715..-6567
+window:   about 45.3 minutes
+```
+
+With SOL marked near `$73.47`, `narrow_half_width=384`, `wide_half_width=2500`, and
+snapshot active liquidity, the full replay was the best Whirlpool risk-pair result
+so far but still not deployable:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | -$27.84 | $0.00 | $0.00 | $0.00 | ~-3230% | $73.98 |
+| narrow_rebalance | -$19.88 | +$7.97 | $10.04 | $6.32 | ~-2306% | $71.06 |
+| vol_scaled_rebalance | -$14.28 | +$13.57 | $17.70 | $10.29 | ~-1656% | $69.24 |
+| delta_hedged | +$8.00 | +$35.84 | $10.04 | $6.32 | ~928% | $2.60 |
+| hedged_wide | +$1.49 | +$29.34 | $1.83 | $1.22 | ~173% | $0.39 |
+
+Rolling windows exposed the same left-tail failure. `delta_hedged` had positive mean
+net and a 64% win rate on 25-swap windows, but p05 APR was about `-1710%`.
+`hedged_wide` reduced drawdown and left-tail loss, with p05 APR about `-245%`, but
+the mean net was only about `+$0.13` per 25-swap window.
+
+Promotion gates all rejected. The lagged rule failed 25/40/60/80-swap windows with
+p05 APR about `-1865%`, `-875%`, `-789%`, and `-1892%`. Direct
+`--gate-policy delta-hedged` rejected with p05 APR about `-1710%`, `-813%`, `-605%`,
+and `-653%`; `--gate-policy hedged-wide` rejected with p05 APR about `-245%`, `-106%`,
+`-97%`, and `-263%`.
+
+Interpretation: treat this as a promising rejection, not a promotion. Compared with
+SOL-USDC and SOL-ORCA, the hedge layer is closer to extracting real fee alpha, but
+the current policy still cannot turn volatility into a stable 500%+ left-tail APR.
+The next strategy work should target this failure mode: preserve more of the
+`delta_hedged` mean edge while using `hedged_wide`-style tail control around trend
+windows.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

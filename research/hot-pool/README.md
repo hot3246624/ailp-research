@@ -265,6 +265,23 @@ rejected it. The lagged gate p05 APR was about `-2854%`, `-1144%`, `-728%`, and
 also rejected. This is not a long-regime verdict, but it is evidence that enormous
 volume with a 4bps fee tier is not enough by itself.
 
+Orca `SOL-Fartcoin` risk-pair replay:
+
+```text
+sample A: scanned 192 signatures, kept 160 normalized swaps, tx_errors=0
+span:     slot 429680775..429687571, about 45.3 minutes, tick roughly -6715..-6567
+```
+
+This was the next broader Whirlpool risk sample: ~116% 24h fee APR, 16bps fee tier,
+~$527k TVL, ~$1.05m 24h volume, volume/TVL near 2.00. It is the best Whirlpool
+risk-pair replay so far but still rejected. Full replay had `delta_hedged` at about
+`+$8.00` net, `+$35.84` versus hold, ~$2.60 max drawdown, and about 928% mechanical
+window APR. Rolling gates exposed the tail: lagged p05 APR was about `-1865%`,
+`-875%`, `-789%`, and `-1892%` across 25/40/60/80-swap windows. Direct `delta_hedged`
+also rejected; `hedged_wide` improved left tail to about `-245%`, `-106%`, `-97%`,
+and `-263%`, but mean net became small. Treat this as a promising rejection: there is
+fee-alpha signal, but no stable 500%+ left-tail strategy yet.
+
 Schema:
 
 ```text
