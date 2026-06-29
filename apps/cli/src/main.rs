@@ -515,6 +515,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Merge normalized SwapObs JSONL files, dedupe repeated sampled swaps, sort
+    /// by block, and write a stable combined replay stream.
+    MergeNormalizedSwaps {
+        /// Input normalized SwapObs JSONL. Repeat for multiple samples.
+        #[arg(long = "input", required = true)]
+        inputs: Vec<PathBuf>,
+        /// Output normalized SwapObs JSONL.
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Stress-test the range policies against a synthetic price scenario
     /// (calm / pump / crash / chop) when collected data lacks that regime.
     ReplayScenario {
@@ -1358,6 +1370,11 @@ async fn main() -> Result<()> {
             &params,
             format,
         )?,
+        Command::MergeNormalizedSwaps {
+            inputs,
+            output,
+            format,
+        } => merge_normalized_swaps(inputs, output, format)?,
         Command::ReplayScenario {
             scenario,
             start_tick,
@@ -3022,6 +3039,12 @@ async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()>
         samples.len(),
         transaction_errors
     );
+    if let Some(last_sample) = samples.last() {
+        println!(
+            "next_before_signature={} oldest_kept_slot={}",
+            last_sample.signature, last_sample.slot
+        );
+    }
     if let Some(normalized_rows) = normalized_rows {
         println!(
             "normalized SwapObs rows written={} path={}",
@@ -4902,6 +4925,19 @@ struct HedgeGridRuleRow {
     worst_max_drawdown_usd: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct MergeNormalizedSwapsReport {
+    inputs: Vec<String>,
+    output: String,
+    input_rows: usize,
+    unique_rows: usize,
+    duplicate_rows: usize,
+    block_first: Option<u64>,
+    block_last: Option<u64>,
+    tick_first: Option<i32>,
+    tick_last: Option<i32>,
+}
+
 #[derive(Debug, Clone)]
 struct WindowRegimeLabel {
     tick_first: i32,
@@ -5315,6 +5351,99 @@ fn replay_normalized_windows(
         overrides,
     )?;
     emit_normalized_window_report(report, format)
+}
+
+fn merge_normalized_swaps(
+    inputs: Vec<PathBuf>,
+    output: PathBuf,
+    format: OutputFormat,
+) -> Result<()> {
+    if inputs.is_empty() {
+        anyhow::bail!("pass at least one --input");
+    }
+    let mut seen = BTreeSet::new();
+    let mut merged = Vec::new();
+    let mut input_rows = 0usize;
+    for input in &inputs {
+        let swaps = load_normalized_swaps(input)?;
+        input_rows += swaps.len();
+        for swap in swaps {
+            if seen.insert(normalized_swap_key(&swap)) {
+                merged.push(swap);
+            }
+        }
+    }
+    merged.sort_by(|left, right| {
+        left.block
+            .cmp(&right.block)
+            .then_with(|| left.log_index.cmp(&right.log_index))
+            .then_with(|| left.tick.cmp(&right.tick))
+    });
+    for (index, swap) in merged.iter_mut().enumerate() {
+        swap.log_index = index as u64;
+    }
+    write_swap_obs_jsonl(&output, &merged)?;
+
+    let report = MergeNormalizedSwapsReport {
+        inputs: inputs
+            .iter()
+            .map(|input| input.display().to_string())
+            .collect(),
+        output: output.display().to_string(),
+        input_rows,
+        unique_rows: merged.len(),
+        duplicate_rows: input_rows.saturating_sub(merged.len()),
+        block_first: merged.first().map(|swap| swap.block),
+        block_last: merged.last().map(|swap| swap.block),
+        tick_first: merged.first().map(|swap| swap.tick),
+        tick_last: merged.last().map(|swap| swap.tick),
+    };
+
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "merged normalized swaps inputs={} input_rows={} unique_rows={} duplicates={} output={}",
+        report.inputs.len(),
+        report.input_rows,
+        report.unique_rows,
+        report.duplicate_rows,
+        report.output
+    );
+    println!(
+        "span blocks={}..{} ticks={}..{}",
+        optional_u64(report.block_first),
+        optional_u64(report.block_last),
+        optional_i32(report.tick_first),
+        optional_i32(report.tick_last),
+    );
+    Ok(())
+}
+
+fn normalized_swap_key(swap: &autopool_backtest::SwapObs) -> (u64, u64, u64, u64, u64, i32) {
+    (
+        swap.block,
+        swap.amount0.to_bits(),
+        swap.amount1.to_bits(),
+        swap.sqrt_price_x96.to_bits(),
+        swap.liquidity.to_bits(),
+        swap.tick,
+    )
+}
+
+fn write_swap_obs_jsonl(path: &Path, swaps: &[autopool_backtest::SwapObs]) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating output directory {}", parent.display()))?;
+    }
+    let mut file = File::create(path)
+        .with_context(|| format!("creating normalized swaps {}", path.display()))?;
+    for swap in swaps {
+        writeln!(file, "{}", serde_json::to_string(swap)?)
+            .with_context(|| format!("writing normalized swaps {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn build_normalized_window_report(
@@ -7818,6 +7947,30 @@ mod tests {
         assert_eq!(summary[0].mean_net_pnl_usd, 9.0);
         assert_eq!(summary[0].mean_net_vs_hold_usd, 7.0);
         assert_eq!(summary[0].p05_net_apr_pct, Some(900.0));
+    }
+
+    #[test]
+    fn normalized_swap_key_dedupes_across_local_log_indices() {
+        let mut left = swap_obs_fixture(10, 1, 100);
+        let mut right = left;
+        right.log_index = 99;
+
+        assert_eq!(normalized_swap_key(&left), normalized_swap_key(&right));
+
+        left.amount0 = 2.0;
+        assert_ne!(normalized_swap_key(&left), normalized_swap_key(&right));
+    }
+
+    fn swap_obs_fixture(block: u64, log_index: u64, tick: i32) -> autopool_backtest::SwapObs {
+        autopool_backtest::SwapObs {
+            block,
+            log_index,
+            amount0: 1.0,
+            amount1: -1.0,
+            sqrt_price_x96: 1.0,
+            liquidity: 1.0,
+            tick,
+        }
     }
 
     fn hedge_window_row(

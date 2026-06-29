@@ -73,7 +73,19 @@ cargo run -p autopool-cli -- sample-solana-pool-swaps \
 
 For Raydium CLMM this also decodes `SwapEvent` into a normalized swap preview
 containing signed amounts, `sqrt_price_x96`, active liquidity, and tick. Use
-`--max-signature-pages` plus `--min-normalized-swaps` for larger replay windows.
+`--max-signature-pages` plus `--min-normalized-swaps` for larger replay windows. The
+sampler prints progress every 50 scanned signatures and ends with a
+`next_before_signature` cursor for continuing older pagination.
+
+Merge overlapping normalized samples into a stable replay stream:
+
+```bash
+cargo run -p autopool-cli -- merge-normalized-swaps \
+  --input data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl \
+  --input data/solana/hot-pool/swaps/raydium-cards-usdc/swaps-refresh.jsonl \
+  --input data/solana/hot-pool/swaps/raydium-cards-usdc/swaps-older.jsonl \
+  --output data/solana/hot-pool/swaps/raydium-cards-usdc/swaps-merged-3.jsonl
+```
 
 Latest `CARDS-USDC` real replay check: after adding a 20 second Solana HTTP timeout
 to bound public-RPC scans, 185 signatures -> 77 target swaps -> 77 normalized rows,
@@ -126,11 +138,13 @@ setting: the next useful step is regime-conditioned hedge sizing over more windo
 
 The current hedge-grid command also prints a `lagged_regime_rule` row. It uses the
 prior window's regime to choose the next window's hedge fraction, avoiding direct
-lookahead. The default rule is now conservative in range-like states:
+lookahead. The default rule is conservative in range-like states:
 `range=1.00`, `volatile=1.00`, `money_trend=0.25`, `risk_trend=1.00`. On the latest
-157-row combined CARDS-USDC sample, 25-swap/10-step windows showed 77% win rate vs
-hold, mean vs hold about +$9.31, p05 APR about +476%, and worst drawdown about
-$7.15. Caveat: this is still a small, overlapping-window sample.
+171-row merged CARDS-USDC sample, 25-swap/10-step windows showed 71% win rate vs
+hold, mean vs hold about +$1.53, p05 APR about +612%, and worst drawdown about
+$9.99. The 40-swap/15-step view was weaker: 62% win rate, mean vs hold about +$5.61,
+p05 APR about -6%, and worst drawdown about $13.31. Caveat: this is still a small,
+overlapping-window sample inside one short wall-clock regime.
 
 Schema:
 
