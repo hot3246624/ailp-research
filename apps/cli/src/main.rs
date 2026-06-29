@@ -22,6 +22,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const SOLANA_HTTP_TIMEOUT_SECS: u64 = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -3016,7 +3018,10 @@ impl SolanaLightRpc {
     fn new(rpc_url: String) -> Self {
         Self {
             rpc_url,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(SOLANA_HTTP_TIMEOUT_SECS))
+                .build()
+                .expect("SolanaLightRpc timeout config should be valid"),
         }
     }
 

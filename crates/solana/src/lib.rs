@@ -3,12 +3,14 @@ use autopool_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
 const ORCA_BASE_URL: &str = "https://api.orca.so";
 const RAYDIUM_BASE_URL: &str = "https://api-v3.raydium.io";
 const METEORA_BASE_URL: &str = "https://dlmm.datapi.meteora.ag";
+const SOLANA_HTTP_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Error)]
 pub enum SolanaDiscoveryError {
@@ -164,7 +166,10 @@ impl SolanaDiscoveryClient {
         meteora_base_url: &str,
     ) -> Result<Self, SolanaDiscoveryError> {
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(SOLANA_HTTP_TIMEOUT_SECS))
+                .build()
+                .expect("SolanaDiscoveryClient timeout config should be valid"),
             orca_base_url: Url::parse(orca_base_url)?,
             raydium_base_url: Url::parse(raydium_base_url)?,
             meteora_base_url: Url::parse(meteora_base_url)?,

@@ -261,39 +261,45 @@ routed Jupiter transaction where the first Raydium invocation belonged to anothe
 pool; the sampler now scans all Raydium swap invocations and keeps the event whose
 `pool_state` matches the requested pool.
 
-Latest real replay check: scanning 58 recent `CARDS-USDC` signatures landed 50 target
-pool swaps, decoded 50/50 normalized rows with zero transaction errors, and replayed
-a 47.5 minute window. Mechanical annualization is not a forecast, but it gives the
-current hot-pool magnitude:
+Latest real replay check: after adding a 20 second Solana HTTP timeout so public-RPC
+sampling stays bounded, scanning 185 recent `CARDS-USDC` signatures across 4 pages
+landed 77 target pool swaps, decoded 77/77 normalized rows with zero transaction
+errors, and replayed a ~46.5 minute wall-clock segment (~45.9 replay minutes at the
+current 0.4 second slot model). Mechanical annualization is not a forecast, but it
+gives the current hot-pool magnitude:
 
 | policy | net PnL | vs hold | fees | fee-LVR | net APR window | fee-LVR APR window | max DD |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| hedged_narrow / delta_hedged | $8.23 | $31.65 | $10.08 | $7.59 | ~910% | ~839% | $0.33 |
-| vol_scaled / adaptive | -$7.83 | $15.59 | $19.24 | $14.29 | ~-866% | ~1580% | $22.32 |
-| hedged_wide | $0.92 | $24.34 | $1.12 | $0.86 | ~102% | ~95% | $0.03 |
+| vol_scaled / adaptive | $78.22 | $16.62 | $42.10 | $23.08 | ~8966% | ~2645% | $1.82 |
+| narrow_static | $70.86 | $9.27 | $22.05 | $12.51 | ~8123% | ~1434% | $11.32 |
+| delta_hedged | $13.19 | -$48.41 | $22.05 | $12.51 | ~1512% | ~1434% | $3.07 |
+| hedged_wide | $1.10 | -$60.50 | $2.45 | $1.43 | ~126% | ~164% | $0.79 |
 
-Interpretation: the fee engine is hot enough to justify continued work, but inventory
-direction dominates unhedged PnL even in a short window. The next useful milestone is
-multi-window replay that tests whether hedged narrow/vol-scaled variants repeatedly
-beat hold and passive wide after churn and capacity constraints.
+Interpretation: the fee engine is still hot enough to justify continued work, but this
+segment was also strongly directionally favorable to unhedged inventory. The better
+headline PnL versus the prior 50-row sample does **not** mean the strategy got safer;
+it means this specific window carried upside beta while staying in range.
 
-Latest multi-window check: a public-RPC slow scan landed 72 normalized `CARDS-USDC`
-rows. The full 16.2 minute segment showed `vol_scaled/adaptive` net PnL of about
-`$50.43` on `$10k`, with `$20.82` fee-LVR and `$73.08` max drawdown. Rolling
-25-swap windows with 10-swap steps produced 5 windows:
+Latest larger-window check: the same 77-row file was replayed as rolling 40-swap
+windows with 15-swap steps, producing 3 windows. This is a bounded replay-quality
+step versus the earlier 25-swap windows because it tests longer occupancy and reduces
+the chance that one burst of routed retail flow dominates the result:
 
 | policy | win rate vs hold | mean net | mean net APR window | p05 net APR window | mean fee-LVR APR window | worst DD |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| vol_scaled_rebalance | 60% | $14.95 | ~11251% | ~-54401% | ~8887% | $73.08 |
-| adaptive_regime | 40% | $9.89 | ~5739% | ~-57569% | ~9907% | $73.08 |
-| hedged_narrow | 40% | $1.45 | ~1809% | ~-589% | ~4831% | $9.01 |
-| hedged_wide | 40% | $0.19 | ~232% | ~-23% | ~555% | $0.96 |
+| vol_scaled_rebalance | 66.7% | $26.16 | ~10464% | ~656% | ~3249% | $17.85 |
+| adaptive_regime | 66.7% | $26.16 | ~10464% | ~656% | ~3249% | $17.85 |
+| delta_hedged | 66.7% | $6.13 | ~1479% | ~1060% | ~1754% | $3.07 |
+| hedged_narrow | 66.7% | $4.91 | ~885% | ~-543% | ~1754% | $4.68 |
+| hedged_wide | 66.7% | $0.57 | ~108% | ~-36% | ~200% | $0.48 |
 
-Interpretation: hot flow is real, but the strategy is not yet stable enough for
-capital. Fixed full hedging protects drawdown but can underperform badly during a
-fast upside move; unhedged/vol-scaled variants capture fees and beta but carry
-large inventory drawdown. The next research target is regime-aware hedge sizing and
-promotion gates based on multi-window win rate and left-tail APR, not headline APR.
+Interpretation: this is better than the prior 25-swap study because the left tail is
+less absurd, but it is still not promotion-grade evidence. The sample only produced 3
+windows, most policies never had to rebalance, and the same directional move helped
+all inventory-long variants. Fixed hedging keeps drawdown small and now has a positive
+left tail for `delta_hedged`, but it still lags hold on the full 77-row segment.
+Unhedged/adaptive variants look economically attractive only if later windows confirm
+the result outside this single short regime.
 
 ## Autoresearch Rules Adapted To AILP
 

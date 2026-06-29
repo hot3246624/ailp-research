@@ -75,10 +75,11 @@ For Raydium CLMM this also decodes `SwapEvent` into a normalized swap preview
 containing signed amounts, `sqrt_price_x96`, active liquidity, and tick. Use
 `--max-signature-pages` plus `--min-normalized-swaps` for larger replay windows.
 
-Latest `CARDS-USDC` real replay check: 58 signatures -> 50 target swaps -> 50
-normalized rows, replay window ~47.5 minutes. Hedged narrow/delta hedged produced
-about $8.23 net on $10k with $0.33 max drawdown; vol-scaled/adaptive captured more
-fee-LVR but stayed net negative because inventory drift dominated the short window.
+Latest `CARDS-USDC` real replay check: after adding a 20 second Solana HTTP timeout
+to bound public-RPC scans, 185 signatures -> 77 target swaps -> 77 normalized rows,
+wall-clock span ~46.5 minutes. `vol_scaled_rebalance` / `adaptive_regime` produced
+about $78.22 net on $10k with $23.08 fee-LVR and $1.82 max drawdown, while
+`delta_hedged` stayed positive at about $13.19 net with much lower directional risk.
 
 Rolling window replay:
 
@@ -91,9 +92,11 @@ cargo run -p autopool-cli -- replay-normalized-windows \
   --min-windows 4
 ```
 
-Latest 72-row check produced 5 rolling windows. `vol_scaled_rebalance` won vs hold
-in 60% of windows with high fee-LVR APR but a very poor p05 net APR; fixed hedging
-kept drawdown small but underperformed in upside-beta windows.
+Latest larger-window check used the 77-row file with 40-swap windows and 15-swap
+steps, producing 3 windows. `vol_scaled_rebalance` / `adaptive_regime` won vs hold
+in 66.7% of windows with positive p05 net APR (~656%), while `delta_hedged` won in
+66.7% with much lower worst drawdown (~$3.07). Caveat: this is still one short
+directional regime, so the left tail is less bad than before but not yet deployable.
 
 Schema:
 
