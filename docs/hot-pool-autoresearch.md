@@ -403,13 +403,15 @@ cargo run -p autopool-cli -- replay-promotion-gate \
   --max-drawdown-pct 0.05
 ```
 
-Default windows are 25:10, 40:15, 60:20, and 80:25 swaps. A candidate only promotes
-to `candidate_shadow` when every window family clears win-rate, mean edge over hold,
-left-tail net APR, and drawdown gates. On the 201-row CARDS-USDC merged replay, the
-current lagged regime rule returns `reject_replay`: short windows nearly work on
-left-tail APR but lose to hold on average, while longer windows expose unstable
-left tails. This is the intended behavior for the current research stage: headline
-APR is a detector, not a deployment claim.
+Default windows are 25:10, 40:15, 60:20, and 80:25 swaps. The default gate policy is
+`lagged-regime-rule`; the command can also gate defensive controls directly with
+`--gate-policy hedged-wide` or `--gate-policy delta-hedged`. A candidate only
+promotes to `candidate_shadow` when every window family clears win-rate, mean edge
+over hold, left-tail net APR, and drawdown gates. On the 201-row CARDS-USDC merged
+replay, the current lagged regime rule returns `reject_replay`: short windows nearly
+work on left-tail APR but lose to hold on average, while longer windows expose
+unstable left tails. This is the intended behavior for the current research stage:
+headline APR is a detector, not a deployment claim.
 
 Latest scout/proxy read: the active hot-pool surface has shifted toward Meteora DLMM
 and Orca Whirlpool candidates. Meteora proxy APRs can be much higher than the current
@@ -529,13 +531,15 @@ the full 65-row replay again showed strong hedge protection but no deployable ed
 The only encouraging slice was defensive: with 15-swap windows, `hedged_wide` had
 mean net about `+$1.20`, mean mechanical APR about `653%`, p05 APR about `106%`, and
 worst drawdown about `$1.88`. That is not enough: larger 25-swap windows flipped
-negative, and the lagged promotion gate returned `reject_replay` with p05 APR about
-`-887%`, `-2663%`, and `-6269%` across 15/25/40-swap families.
+negative. The promotion gate can now evaluate defensive policies directly; on this
+sample `--gate-policy hedged-wide` still returned `reject_replay` with p05 APR about
+`106%`, `-545%`, and `-1665%` across 15/25/40-swap families. `--gate-policy
+delta-hedged` also rejected, with p05 APR about `-802%`, `-2214%`, and `-574%`.
 
 Interpretation: this is the first Whirlpool sample that produced a positive
 short-window defensive APR read, but it is still not a strategy. It is a reason to
-collect more `SOL-CARDS` data and to build a promotion gate that can explicitly score
-`hedged_wide`/defensive policies, not just the lagged narrow hedge rule.
+collect more `SOL-CARDS` data and keep gating `hedged_wide`/defensive policies
+directly, not a reason to promote the pool.
 
 ## Autoresearch Rules Adapted To AILP
 

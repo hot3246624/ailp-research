@@ -226,10 +226,10 @@ fee APR, 100bps fee tier, ~$62k TVL, no discovery warnings. It is the first Whir
 sample where a very defensive `hedged_wide` slice had a positive short-window read:
 15-swap windows showed mean net around `+$1.20`, mean mechanical APR around `653%`,
 p05 APR around `106%`, and worst drawdown around `$1.88`. That still does not clear
-the 500% left-tail gate, and 25-swap windows flipped negative. The lagged promotion
-gate returned `reject_replay`; p05 APR was about `-887%`, `-2663%`, and `-6269%`
-across 15/25/40-swap families. Treat `SOL-CARDS` as an interesting Whirlpool lead
-for more data, not a strategy promotion.
+the 500% left-tail gate, and 25-swap windows flipped negative. The promotion gate now
+supports `--gate-policy hedged-wide`; it still returned `reject_replay` with p05 APR
+about `106%`, `-545%`, and `-1665%` across 15/25/40-swap families. Treat
+`SOL-CARDS` as an interesting Whirlpool lead for more data, not a strategy promotion.
 
 Schema:
 

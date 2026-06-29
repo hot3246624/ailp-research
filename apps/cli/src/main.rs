@@ -77,6 +77,23 @@ impl RiskTokenSide {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+enum PromotionGatePolicy {
+    LaggedRegimeRule,
+    HedgedWide,
+    DeltaHedged,
+}
+
+impl PromotionGatePolicy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LaggedRegimeRule => "lagged_regime_rule",
+            Self::HedgedWide => "hedged_wide",
+            Self::DeltaHedged => "delta_hedged",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "autopool")]
 #[command(about = "AILP research CLI for autonomous DEX LP range management")]
@@ -532,6 +549,10 @@ enum Command {
         /// Window config as `window_swaps:step_swaps:min_windows`. Repeatable.
         #[arg(long = "window-config")]
         window_configs: Vec<String>,
+        /// Policy to gate. The default preserves the no-lookahead lagged regime rule;
+        /// defensive policies let us test `hedged_wide` / `delta_hedged` directly.
+        #[arg(long = "gate-policy", value_enum, default_value_t = PromotionGatePolicy::LaggedRegimeRule)]
+        gate_policy: PromotionGatePolicy,
         /// Hedge fractions to test. Repeat the flag, e.g. --grid-hedge-fraction 0.25.
         #[arg(long = "grid-hedge-fraction", default_values_t = vec![0.0, 0.25, 0.5, 0.75, 1.0])]
         hedge_fractions: Vec<f64>,
@@ -1412,6 +1433,7 @@ async fn main() -> Result<()> {
             spec,
             swaps,
             window_configs,
+            gate_policy,
             hedge_fractions,
             regime_rule,
             min_p05_net_apr_pct,
@@ -1424,6 +1446,7 @@ async fn main() -> Result<()> {
             spec,
             swaps,
             window_configs,
+            gate_policy,
             hedge_fractions,
             regime_rule.into(),
             PromotionGateThresholds {
@@ -5951,6 +5974,7 @@ fn replay_promotion_gate(
     spec_path: PathBuf,
     swaps_path: Option<PathBuf>,
     window_configs: Vec<String>,
+    gate_policy: PromotionGatePolicy,
     hedge_fractions: Vec<f64>,
     regime_rule: RegimeHedgeRule,
     thresholds: PromotionGateThresholds,
@@ -5967,24 +5991,47 @@ fn replay_promotion_gate(
     let mut label = String::new();
     let mut swaps = 0usize;
     for config in configs {
-        let (row_label, row_swaps, rule_row) = evaluate_lagged_rule_window(
-            &spec_path,
-            swaps_path.clone(),
-            config,
-            &hedge_fractions,
-            &regime_rule,
-            overrides,
-        )?;
+        let (row_label, row_swaps, row) = match gate_policy {
+            PromotionGatePolicy::LaggedRegimeRule => {
+                let (row_label, row_swaps, rule_row) = evaluate_lagged_rule_window(
+                    &spec_path,
+                    swaps_path.clone(),
+                    config,
+                    &hedge_fractions,
+                    &regime_rule,
+                    overrides,
+                )?;
+                (
+                    row_label,
+                    row_swaps,
+                    promotion_window_row(config, rule_row, &thresholds, max_worst_drawdown_usd),
+                )
+            }
+            PromotionGatePolicy::HedgedWide | PromotionGatePolicy::DeltaHedged => {
+                let (row_label, row_swaps, summary) = evaluate_fixed_policy_window(
+                    &spec_path,
+                    swaps_path.clone(),
+                    config,
+                    gate_policy.label(),
+                    overrides,
+                )?;
+                (
+                    row_label,
+                    row_swaps,
+                    promotion_window_row_from_summary(
+                        config,
+                        summary,
+                        &thresholds,
+                        max_worst_drawdown_usd,
+                    ),
+                )
+            }
+        };
         if label.is_empty() {
             label = row_label;
             swaps = row_swaps;
         }
-        rows.push(promotion_window_row(
-            config,
-            rule_row,
-            &thresholds,
-            max_worst_drawdown_usd,
-        ));
+        rows.push(row);
     }
     let mut reasons = Vec::new();
     for row in &rows {
@@ -6012,8 +6059,12 @@ fn replay_promotion_gate(
     let report = PromotionGateReport {
         label,
         swaps,
-        policy: "lagged_regime_rule".to_string(),
-        hedge_map: regime_rule.describe(),
+        policy: gate_policy.label().to_string(),
+        hedge_map: if gate_policy == PromotionGatePolicy::LaggedRegimeRule {
+            regime_rule.describe()
+        } else {
+            "-".to_string()
+        },
         thresholds,
         max_worst_drawdown_usd,
         verdict,
@@ -6132,32 +6183,107 @@ fn evaluate_lagged_rule_window(
     Ok((label, swaps, rule_row))
 }
 
+fn evaluate_fixed_policy_window(
+    spec_path: &Path,
+    swaps_path: Option<PathBuf>,
+    config: PromotionWindowConfig,
+    policy: &str,
+    overrides: &NormalizedReplayParams,
+) -> Result<(String, usize, WindowPolicySummary)> {
+    let report = build_normalized_window_report(
+        spec_path,
+        swaps_path,
+        config.window_swaps,
+        config.step_swaps,
+        config.min_windows,
+        overrides,
+    )?;
+    let summary = report
+        .summaries
+        .into_iter()
+        .find(|summary| summary.policy == policy)
+        .with_context(|| {
+            format!(
+                "policy `{policy}` not found for config {}:{}",
+                config.window_swaps, config.step_swaps
+            )
+        })?;
+    Ok((report.label, report.swaps, summary))
+}
+
 fn promotion_window_row(
     config: PromotionWindowConfig,
     row: HedgeGridRuleRow,
     thresholds: &PromotionGateThresholds,
     max_worst_drawdown_usd: f64,
 ) -> PromotionGateWindowRow {
+    promotion_window_row_from_metrics(
+        config,
+        row.windows,
+        row.skipped_windows,
+        row.win_rate_vs_hold_pct,
+        row.mean_net_pnl_usd,
+        row.mean_net_vs_hold_usd,
+        row.mean_net_apr_pct,
+        row.p05_net_apr_pct,
+        row.worst_max_drawdown_usd,
+        thresholds,
+        max_worst_drawdown_usd,
+    )
+}
+
+fn promotion_window_row_from_summary(
+    config: PromotionWindowConfig,
+    summary: WindowPolicySummary,
+    thresholds: &PromotionGateThresholds,
+    max_worst_drawdown_usd: f64,
+) -> PromotionGateWindowRow {
+    promotion_window_row_from_metrics(
+        config,
+        summary.windows,
+        0,
+        summary.win_rate_vs_hold_pct,
+        summary.mean_net_pnl_usd,
+        summary.mean_net_vs_hold_usd,
+        summary.mean_net_apr_pct,
+        summary.p05_net_apr_pct,
+        summary.worst_max_drawdown_usd,
+        thresholds,
+        max_worst_drawdown_usd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promotion_window_row_from_metrics(
+    config: PromotionWindowConfig,
+    windows: usize,
+    skipped_windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_pnl_usd: f64,
+    mean_net_vs_hold_usd: f64,
+    mean_net_apr_pct: Option<f64>,
+    p05_net_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+    thresholds: &PromotionGateThresholds,
+    max_worst_drawdown_usd: f64,
+) -> PromotionGateWindowRow {
     let mut reasons = Vec::new();
-    if row.windows < config.min_windows {
-        reasons.push(format!(
-            "windows {} < min {}",
-            row.windows, config.min_windows
-        ));
+    if windows < config.min_windows {
+        reasons.push(format!("windows {} < min {}", windows, config.min_windows));
     }
-    if row.win_rate_vs_hold_pct < thresholds.min_win_rate_vs_hold_pct {
+    if win_rate_vs_hold_pct < thresholds.min_win_rate_vs_hold_pct {
         reasons.push(format!(
             "win_rate {:.0}% < {:.0}%",
-            row.win_rate_vs_hold_pct, thresholds.min_win_rate_vs_hold_pct
+            win_rate_vs_hold_pct, thresholds.min_win_rate_vs_hold_pct
         ));
     }
-    if row.mean_net_vs_hold_usd < thresholds.min_mean_vs_hold_usd {
+    if mean_net_vs_hold_usd < thresholds.min_mean_vs_hold_usd {
         reasons.push(format!(
             "mean_vs_hold {:.2} < {:.2}",
-            row.mean_net_vs_hold_usd, thresholds.min_mean_vs_hold_usd
+            mean_net_vs_hold_usd, thresholds.min_mean_vs_hold_usd
         ));
     }
-    match row.p05_net_apr_pct {
+    match p05_net_apr_pct {
         Some(p05) if p05 >= thresholds.min_p05_net_apr_pct => {}
         Some(p05) => reasons.push(format!(
             "p05_apr {:.0}% < {:.0}%",
@@ -6165,24 +6291,24 @@ fn promotion_window_row(
         )),
         None => reasons.push("missing_p05_apr".to_string()),
     }
-    if row.worst_max_drawdown_usd > max_worst_drawdown_usd {
+    if worst_max_drawdown_usd > max_worst_drawdown_usd {
         reasons.push(format!(
             "worst_dd {:.2} > {:.2}",
-            row.worst_max_drawdown_usd, max_worst_drawdown_usd
+            worst_max_drawdown_usd, max_worst_drawdown_usd
         ));
     }
     PromotionGateWindowRow {
         window_swaps: config.window_swaps,
         step_swaps: config.step_swaps,
         min_windows: config.min_windows,
-        windows: row.windows,
-        skipped_windows: row.skipped_windows,
-        win_rate_vs_hold_pct: row.win_rate_vs_hold_pct,
-        mean_net_pnl_usd: row.mean_net_pnl_usd,
-        mean_net_vs_hold_usd: row.mean_net_vs_hold_usd,
-        mean_net_apr_pct: row.mean_net_apr_pct,
-        p05_net_apr_pct: row.p05_net_apr_pct,
-        worst_max_drawdown_usd: row.worst_max_drawdown_usd,
+        windows,
+        skipped_windows,
+        win_rate_vs_hold_pct,
+        mean_net_pnl_usd,
+        mean_net_vs_hold_usd,
+        mean_net_apr_pct,
+        p05_net_apr_pct,
+        worst_max_drawdown_usd,
         passed: reasons.is_empty(),
         reasons,
     }
@@ -8570,6 +8696,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn promotion_window_row_from_summary_gates_defensive_policy() {
+        let thresholds = PromotionGateThresholds {
+            min_p05_net_apr_pct: 500.0,
+            min_mean_vs_hold_usd: 0.0,
+            min_win_rate_vs_hold_pct: 60.0,
+            max_drawdown_pct: 0.05,
+        };
+        let config = PromotionWindowConfig {
+            window_swaps: 15,
+            step_swaps: 5,
+            min_windows: 3,
+        };
+        let passing = promotion_window_row_from_summary(
+            config,
+            window_summary_fixture("hedged_wide", 4, 75.0, 1.0, 650.0, 20.0),
+            &thresholds,
+            500.0,
+        );
+        let failing = promotion_window_row_from_summary(
+            config,
+            window_summary_fixture("hedged_wide", 4, 75.0, 1.0, 106.0, 20.0),
+            &thresholds,
+            500.0,
+        );
+
+        assert!(passing.passed);
+        assert!(!failing.passed);
+        assert!(
+            failing
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("p05_apr"))
+        );
+    }
+
     fn hedge_rule_row_fixture(
         windows: usize,
         win_rate_vs_hold_pct: f64,
@@ -8588,6 +8750,31 @@ mod tests {
             mean_net_apr_pct: Some(700.0),
             p05_net_apr_pct: Some(p05_net_apr_pct),
             worst_max_drawdown_usd,
+        }
+    }
+
+    fn window_summary_fixture(
+        policy: &str,
+        windows: usize,
+        win_rate_vs_hold_pct: f64,
+        mean_net_vs_hold_usd: f64,
+        p05_net_apr_pct: f64,
+        worst_max_drawdown_usd: f64,
+    ) -> WindowPolicySummary {
+        WindowPolicySummary {
+            policy: policy.to_string(),
+            windows,
+            win_rate_vs_hold_pct,
+            mean_net_pnl_usd: 1.0,
+            mean_net_vs_hold_usd,
+            mean_fee_minus_lvr_usd: 1.0,
+            mean_net_apr_pct: Some(700.0),
+            p05_net_apr_pct: Some(p05_net_apr_pct),
+            p50_net_apr_pct: Some(700.0),
+            p95_net_apr_pct: Some(900.0),
+            mean_fee_lvr_apr_pct: Some(500.0),
+            worst_max_drawdown_usd,
+            mean_rebalances: 0.0,
         }
     }
 
