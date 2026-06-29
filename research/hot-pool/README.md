@@ -147,6 +147,33 @@ $9.99. The 40-swap/15-step and 60-swap/20-step views had negative p05 APR, and t
 This is still candidate evidence rather than a deployable rule. Caveat: this remains
 a small, overlapping-window sample inside one short wall-clock regime.
 
+Promotion gate:
+
+```bash
+cargo run -p autopool-cli -- replay-promotion-gate \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps-merged-5.jsonl \
+  --min-p05-net-apr-pct 500 \
+  --min-mean-vs-hold-usd 0 \
+  --min-win-rate-vs-hold-pct 60 \
+  --max-drawdown-pct 0.05
+```
+
+Current CARDS-USDC promotion verdict: `reject_replay`. The 25-swap/10-step view
+misses the win-rate and mean-vs-hold gates; 40-swap/15-step misses win-rate,
+mean-vs-hold, and left-tail APR; 60-swap/20-step misses win-rate and left-tail APR;
+80-swap/25-step has a high p05 APR but still loses to hold on average. This encodes
+the current business goal directly: a pool/policy must show about 500%+ left-tail
+net APR and a stable edge over hold before shadow monitoring.
+
+The latest scout also says the best near-term opportunities are not Raydium-only.
+Current hot candidates are mostly Meteora DLMM and Orca Whirlpool pools. Meteora
+proxy APRs are often much higher, but they require a DLMM replay adapter before they
+are actionable. Orca `SOL-PUMP` remains P0 for replay, but still needs Whirlpool
+liquidity reconstruction. Raydium infrastructure is now useful for EVM/Solana style
+execution research, but current Raydium hot candidates are either CARDS rejected by
+the gate or WSOL-CX rejected as severe-risk until replay proves otherwise.
+
 Schema:
 
 ```text

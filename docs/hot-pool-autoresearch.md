@@ -384,6 +384,35 @@ still loses to hold on average. Treat the rule as a candidate state machine, not
 deployable strategy. The next bottleneck remains broader pool coverage or a true
 shadow monitor, not more in-sample CARDS-only rule tweaking.
 
+### Promotion gate
+
+The replay stack now has a strict deployability gate:
+
+```bash
+cargo run -p autopool-cli -- replay-promotion-gate \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps-merged-5.jsonl \
+  --min-p05-net-apr-pct 500 \
+  --min-mean-vs-hold-usd 0 \
+  --min-win-rate-vs-hold-pct 60 \
+  --max-drawdown-pct 0.05
+```
+
+Default windows are 25:10, 40:15, 60:20, and 80:25 swaps. A candidate only promotes
+to `candidate_shadow` when every window family clears win-rate, mean edge over hold,
+left-tail net APR, and drawdown gates. On the 201-row CARDS-USDC merged replay, the
+current lagged regime rule returns `reject_replay`: short windows nearly work on
+left-tail APR but lose to hold on average, while longer windows expose unstable
+left tails. This is the intended behavior for the current research stage: headline
+APR is a detector, not a deployment claim.
+
+Latest scout/proxy read: the active hot-pool surface has shifted toward Meteora DLMM
+and Orca Whirlpool candidates. Meteora proxy APRs can be much higher than the current
+Raydium set, but they are not actionable until DLMM bin/liquidity replay exists. Orca
+`SOL-PUMP` remains the most practical non-Raydium P0, pending Whirlpool replay. Raydium
+is no longer the bottleneck for process quality; it is mainly a solved adapter path
+with no currently promoted hot pool.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

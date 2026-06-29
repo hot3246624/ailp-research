@@ -515,6 +515,38 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Apply strict replay promotion gates across multiple rolling-window sizes.
+    /// This is the deployability filter: a hot pool must beat hold with positive
+    /// left-tail net APR across short and longer windows before shadow monitoring.
+    ReplayPromotionGate {
+        #[arg(long)]
+        spec: PathBuf,
+        /// JSONL file of normalized SwapObs rows. Defaults to `swaps.jsonl` next to
+        /// the spec file.
+        #[arg(long)]
+        swaps: Option<PathBuf>,
+        /// Window config as `window_swaps:step_swaps:min_windows`. Repeatable.
+        #[arg(long = "window-config")]
+        window_configs: Vec<String>,
+        /// Hedge fractions to test. Repeat the flag, e.g. --grid-hedge-fraction 0.25.
+        #[arg(long = "grid-hedge-fraction", default_values_t = vec![0.0, 0.25, 0.5, 0.75, 1.0])]
+        hedge_fractions: Vec<f64>,
+        #[command(flatten)]
+        regime_rule: RegimeHedgeRuleArgs,
+        #[arg(long, default_value_t = 500.0)]
+        min_p05_net_apr_pct: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_mean_vs_hold_usd: f64,
+        #[arg(long, default_value_t = 60.0)]
+        min_win_rate_vs_hold_pct: f64,
+        /// Max worst drawdown as share of deployed capital.
+        #[arg(long, default_value_t = 0.05)]
+        max_drawdown_pct: f64,
+        #[command(flatten)]
+        params: NormalizedReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Merge normalized SwapObs JSONL files, dedupe repeated sampled swaps, sort
     /// by block, and write a stable combined replay stream.
     MergeNormalizedSwaps {
@@ -1367,6 +1399,33 @@ async fn main() -> Result<()> {
             min_windows,
             hedge_fractions,
             regime_rule.into(),
+            &params,
+            format,
+        )?,
+        Command::ReplayPromotionGate {
+            spec,
+            swaps,
+            window_configs,
+            hedge_fractions,
+            regime_rule,
+            min_p05_net_apr_pct,
+            min_mean_vs_hold_usd,
+            min_win_rate_vs_hold_pct,
+            max_drawdown_pct,
+            params,
+            format,
+        } => replay_promotion_gate(
+            spec,
+            swaps,
+            window_configs,
+            hedge_fractions,
+            regime_rule.into(),
+            PromotionGateThresholds {
+                min_p05_net_apr_pct,
+                min_mean_vs_hold_usd,
+                min_win_rate_vs_hold_pct,
+                max_drawdown_pct,
+            },
             &params,
             format,
         )?,
@@ -4925,6 +4984,51 @@ struct HedgeGridRuleRow {
     worst_max_drawdown_usd: f64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct PromotionGateThresholds {
+    min_p05_net_apr_pct: f64,
+    min_mean_vs_hold_usd: f64,
+    min_win_rate_vs_hold_pct: f64,
+    max_drawdown_pct: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct PromotionWindowConfig {
+    window_swaps: usize,
+    step_swaps: usize,
+    min_windows: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PromotionGateReport {
+    label: String,
+    swaps: usize,
+    policy: String,
+    hedge_map: String,
+    thresholds: PromotionGateThresholds,
+    max_worst_drawdown_usd: f64,
+    verdict: String,
+    reasons: Vec<String>,
+    rows: Vec<PromotionGateWindowRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct PromotionGateWindowRow {
+    window_swaps: usize,
+    step_swaps: usize,
+    min_windows: usize,
+    windows: usize,
+    skipped_windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_pnl_usd: f64,
+    mean_net_vs_hold_usd: f64,
+    mean_net_apr_pct: Option<f64>,
+    p05_net_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+    passed: bool,
+    reasons: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct MergeNormalizedSwapsReport {
     inputs: Vec<String>,
@@ -5697,6 +5801,292 @@ fn replay_normalized_hedge_grid(
         rule_rows: summarize_lagged_regime_rule_rows(&regime_source_rows, &regime_rule),
     };
     emit_hedge_grid_report(report, format)
+}
+
+fn replay_promotion_gate(
+    spec_path: PathBuf,
+    swaps_path: Option<PathBuf>,
+    window_configs: Vec<String>,
+    hedge_fractions: Vec<f64>,
+    regime_rule: RegimeHedgeRule,
+    thresholds: PromotionGateThresholds,
+    overrides: &NormalizedReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    let configs = parse_promotion_window_configs(&window_configs)?;
+    let params = {
+        let spec = read_replay_pool_spec(&spec_path)?;
+        overrides.to_replay_params(&spec)?
+    };
+    let max_worst_drawdown_usd = params.capital_usd * thresholds.max_drawdown_pct;
+    let mut rows = Vec::new();
+    let mut label = String::new();
+    let mut swaps = 0usize;
+    for config in configs {
+        let (row_label, row_swaps, rule_row) = evaluate_lagged_rule_window(
+            &spec_path,
+            swaps_path.clone(),
+            config,
+            &hedge_fractions,
+            &regime_rule,
+            overrides,
+        )?;
+        if label.is_empty() {
+            label = row_label;
+            swaps = row_swaps;
+        }
+        rows.push(promotion_window_row(
+            config,
+            rule_row,
+            &thresholds,
+            max_worst_drawdown_usd,
+        ));
+    }
+    let mut reasons = Vec::new();
+    for row in &rows {
+        if !row.passed {
+            reasons.push(format!(
+                "{}:{} failed ({})",
+                row.window_swaps,
+                row.step_swaps,
+                row.reasons.join("; ")
+            ));
+        }
+    }
+    let verdict = if rows.iter().all(|row| row.passed) {
+        "candidate_shadow"
+    } else if rows.iter().any(|row| row.mean_net_vs_hold_usd < 0.0)
+        || rows
+            .iter()
+            .any(|row| row.p05_net_apr_pct.unwrap_or(f64::NEG_INFINITY) < 0.0)
+    {
+        "reject_replay"
+    } else {
+        "needs_more_data"
+    }
+    .to_string();
+    let report = PromotionGateReport {
+        label,
+        swaps,
+        policy: "lagged_regime_rule".to_string(),
+        hedge_map: regime_rule.describe(),
+        thresholds,
+        max_worst_drawdown_usd,
+        verdict,
+        reasons,
+        rows,
+    };
+    emit_promotion_gate_report(report, format)
+}
+
+fn default_promotion_window_configs() -> Vec<PromotionWindowConfig> {
+    vec![
+        PromotionWindowConfig {
+            window_swaps: 25,
+            step_swaps: 10,
+            min_windows: 4,
+        },
+        PromotionWindowConfig {
+            window_swaps: 40,
+            step_swaps: 15,
+            min_windows: 4,
+        },
+        PromotionWindowConfig {
+            window_swaps: 60,
+            step_swaps: 20,
+            min_windows: 3,
+        },
+        PromotionWindowConfig {
+            window_swaps: 80,
+            step_swaps: 25,
+            min_windows: 3,
+        },
+    ]
+}
+
+fn parse_promotion_window_configs(raw: &[String]) -> Result<Vec<PromotionWindowConfig>> {
+    if raw.is_empty() {
+        return Ok(default_promotion_window_configs());
+    }
+    raw.iter()
+        .map(|item| {
+            let parts = item.split(':').collect::<Vec<_>>();
+            if parts.len() != 3 {
+                anyhow::bail!(
+                    "invalid --window-config `{item}`; expected window_swaps:step_swaps:min_windows"
+                );
+            }
+            let window_swaps = parts[0]
+                .parse::<usize>()
+                .with_context(|| format!("invalid window_swaps in `{item}`"))?;
+            let step_swaps = parts[1]
+                .parse::<usize>()
+                .with_context(|| format!("invalid step_swaps in `{item}`"))?;
+            let min_windows = parts[2]
+                .parse::<usize>()
+                .with_context(|| format!("invalid min_windows in `{item}`"))?;
+            if window_swaps == 0 || step_swaps == 0 || min_windows == 0 {
+                anyhow::bail!("window config values must be positive in `{item}`");
+            }
+            Ok(PromotionWindowConfig {
+                window_swaps,
+                step_swaps,
+                min_windows,
+            })
+        })
+        .collect()
+}
+
+fn evaluate_lagged_rule_window(
+    spec_path: &Path,
+    swaps_path: Option<PathBuf>,
+    config: PromotionWindowConfig,
+    hedge_fractions: &[f64],
+    regime_rule: &RegimeHedgeRule,
+    overrides: &NormalizedReplayParams,
+) -> Result<(String, usize, HedgeGridRuleRow)> {
+    let mut fractions = hedge_fractions.to_vec();
+    fractions.extend(regime_rule.fractions());
+    fractions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    fractions.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    let mut regime_source_rows = Vec::new();
+    let mut label = String::new();
+    let mut swaps = 0usize;
+    for hedge_fraction in fractions {
+        if !(0.0..=1.5).contains(&hedge_fraction) {
+            anyhow::bail!("hedge fraction {hedge_fraction} outside supported range 0.0..=1.5");
+        }
+        let report = build_normalized_window_report(
+            spec_path,
+            swaps_path.clone(),
+            config.window_swaps,
+            config.step_swaps,
+            config.min_windows,
+            &overrides.with_hedge_fraction(hedge_fraction),
+        )?;
+        if label.is_empty() {
+            label = report.label.clone();
+            swaps = report.swaps;
+        }
+        for window_row in report
+            .rows
+            .iter()
+            .filter(|row| row.policy == "hedged_narrow")
+        {
+            regime_source_rows.push((hedge_fraction, window_row.clone()));
+        }
+    }
+    let rule_row = summarize_lagged_regime_rule_rows(&regime_source_rows, regime_rule)
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "no lagged regime windows for config {}:{}",
+                config.window_swaps, config.step_swaps
+            )
+        })?;
+    Ok((label, swaps, rule_row))
+}
+
+fn promotion_window_row(
+    config: PromotionWindowConfig,
+    row: HedgeGridRuleRow,
+    thresholds: &PromotionGateThresholds,
+    max_worst_drawdown_usd: f64,
+) -> PromotionGateWindowRow {
+    let mut reasons = Vec::new();
+    if row.windows < config.min_windows {
+        reasons.push(format!(
+            "windows {} < min {}",
+            row.windows, config.min_windows
+        ));
+    }
+    if row.win_rate_vs_hold_pct < thresholds.min_win_rate_vs_hold_pct {
+        reasons.push(format!(
+            "win_rate {:.0}% < {:.0}%",
+            row.win_rate_vs_hold_pct, thresholds.min_win_rate_vs_hold_pct
+        ));
+    }
+    if row.mean_net_vs_hold_usd < thresholds.min_mean_vs_hold_usd {
+        reasons.push(format!(
+            "mean_vs_hold {:.2} < {:.2}",
+            row.mean_net_vs_hold_usd, thresholds.min_mean_vs_hold_usd
+        ));
+    }
+    match row.p05_net_apr_pct {
+        Some(p05) if p05 >= thresholds.min_p05_net_apr_pct => {}
+        Some(p05) => reasons.push(format!(
+            "p05_apr {:.0}% < {:.0}%",
+            p05, thresholds.min_p05_net_apr_pct
+        )),
+        None => reasons.push("missing_p05_apr".to_string()),
+    }
+    if row.worst_max_drawdown_usd > max_worst_drawdown_usd {
+        reasons.push(format!(
+            "worst_dd {:.2} > {:.2}",
+            row.worst_max_drawdown_usd, max_worst_drawdown_usd
+        ));
+    }
+    PromotionGateWindowRow {
+        window_swaps: config.window_swaps,
+        step_swaps: config.step_swaps,
+        min_windows: config.min_windows,
+        windows: row.windows,
+        skipped_windows: row.skipped_windows,
+        win_rate_vs_hold_pct: row.win_rate_vs_hold_pct,
+        mean_net_pnl_usd: row.mean_net_pnl_usd,
+        mean_net_vs_hold_usd: row.mean_net_vs_hold_usd,
+        mean_net_apr_pct: row.mean_net_apr_pct,
+        p05_net_apr_pct: row.p05_net_apr_pct,
+        worst_max_drawdown_usd: row.worst_max_drawdown_usd,
+        passed: reasons.is_empty(),
+        reasons,
+    }
+}
+
+fn emit_promotion_gate_report(report: PromotionGateReport, format: OutputFormat) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "promotion gate {} swaps={} policy={} verdict={} hedge_map={}",
+        report.label, report.swaps, report.policy, report.verdict, report.hedge_map
+    );
+    println!(
+        "thresholds: win>={:.0}% meanVsH>={:.2} p05APR>={:.0}% worstDD<={:.2}",
+        report.thresholds.min_win_rate_vs_hold_pct,
+        report.thresholds.min_mean_vs_hold_usd,
+        report.thresholds.min_p05_net_apr_pct,
+        report.max_worst_drawdown_usd
+    );
+    println!(
+        "{:<9} {:>4} {:>5} {:>8} {:>10} {:>10} {:>10} {:>9} {:<5}  reasons",
+        "window", "n", "skip", "win%", "meanNet", "meanVsH", "p05APR", "worstDD", "pass"
+    );
+    for row in &report.rows {
+        println!(
+            "{:<9} {:>4} {:>5} {:>7.0}% {:>10.2} {:>10.2} {:>9} {:>9.2} {:<5}  {}",
+            format!("{}:{}", row.window_swaps, row.step_swaps),
+            row.windows,
+            row.skipped_windows,
+            row.win_rate_vs_hold_pct,
+            row.mean_net_pnl_usd,
+            row.mean_net_vs_hold_usd,
+            optional_pct(row.p05_net_apr_pct),
+            row.worst_max_drawdown_usd,
+            if row.passed { "yes" } else { "no" },
+            if row.reasons.is_empty() {
+                "-".to_string()
+            } else {
+                row.reasons.join("; ")
+            }
+        );
+    }
+    if !report.reasons.is_empty() {
+        println!("gate reasons: {}", report.reasons.join(" | "));
+    }
+    Ok(())
 }
 
 impl NormalizedReplayParams {
@@ -7959,6 +8349,76 @@ mod tests {
 
         left.amount0 = 2.0;
         assert_ne!(normalized_swap_key(&left), normalized_swap_key(&right));
+    }
+
+    #[test]
+    fn parses_promotion_window_configs() {
+        let configs =
+            parse_promotion_window_configs(&["25:10:4".to_string(), "80:25:3".to_string()])
+                .expect("valid configs");
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].window_swaps, 25);
+        assert_eq!(configs[0].step_swaps, 10);
+        assert_eq!(configs[0].min_windows, 4);
+        assert_eq!(configs[1].window_swaps, 80);
+    }
+
+    #[test]
+    fn promotion_window_row_requires_left_tail_and_hold_edge() {
+        let thresholds = PromotionGateThresholds {
+            min_p05_net_apr_pct: 500.0,
+            min_mean_vs_hold_usd: 0.0,
+            min_win_rate_vs_hold_pct: 60.0,
+            max_drawdown_pct: 0.05,
+        };
+        let config = PromotionWindowConfig {
+            window_swaps: 40,
+            step_swaps: 15,
+            min_windows: 4,
+        };
+        let passing = promotion_window_row(
+            config,
+            hedge_rule_row_fixture(4, 75.0, 1.0, 600.0, 20.0),
+            &thresholds,
+            500.0,
+        );
+        let failing = promotion_window_row(
+            config,
+            hedge_rule_row_fixture(4, 75.0, -1.0, 600.0, 20.0),
+            &thresholds,
+            500.0,
+        );
+
+        assert!(passing.passed);
+        assert!(!failing.passed);
+        assert!(
+            failing
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("mean_vs_hold"))
+        );
+    }
+
+    fn hedge_rule_row_fixture(
+        windows: usize,
+        win_rate_vs_hold_pct: f64,
+        mean_net_vs_hold_usd: f64,
+        p05_net_apr_pct: f64,
+        worst_max_drawdown_usd: f64,
+    ) -> HedgeGridRuleRow {
+        HedgeGridRuleRow {
+            rule: "lagged_regime_rule".to_string(),
+            hedge_map: "range=1.00".to_string(),
+            windows,
+            skipped_windows: 1,
+            win_rate_vs_hold_pct,
+            mean_net_pnl_usd: 1.0,
+            mean_net_vs_hold_usd,
+            mean_net_apr_pct: Some(700.0),
+            p05_net_apr_pct: Some(p05_net_apr_pct),
+            worst_max_drawdown_usd,
+        }
     }
 
     fn swap_obs_fixture(block: u64, log_index: u64, tick: i32) -> autopool_backtest::SwapObs {
