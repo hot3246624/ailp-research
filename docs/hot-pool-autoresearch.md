@@ -186,6 +186,64 @@ Current CLMM proxy results:
 Meteora may show 1000%+ gross APR rows, but proxy risk is `unknown` until the DLMM
 bin replay engine exists.
 
+## Real Swap Sampling
+
+Before decoding program events into normalized `SwapObs`, verify that public Solana
+RPC can land recent successful pool swaps:
+
+```bash
+cargo run -p autopool-cli -- sample-solana-pool-swaps \
+  --pool-address HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD \
+  --program-id CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK \
+  --token0-mint CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp \
+  --token1-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+  --limit 8 \
+  --signature-scan-limit 30 \
+  --output data/solana/swaps/raydium-cards-usdc-sample.json \
+  --normalized-output data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl
+```
+
+Replay the decoded Raydium rows:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-swaps \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl
+```
+
+```bash
+cargo run -p autopool-cli -- sample-solana-pool-swaps \
+  --pool-address BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW \
+  --program-id whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc \
+  --token0-mint So11111111111111111111111111111111111111112 \
+  --token1-mint pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn \
+  --limit 8 \
+  --signature-scan-limit 50 \
+  --output data/solana/swaps/orca-sol-pump-sample.json
+```
+
+This command extracts:
+
+- successful `Swap` / `SwapV2` transactions for the target program;
+- target-program `Program data` payloads;
+- signed pool-owned token vault deltas for both pool mints.
+- Raydium CLMM `SwapEvent` fields and a normalized `SwapObs` preview when the
+  program is `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`.
+
+Current result: both Raydium `CARDS-USDC` and Orca `SOL-PUMP` produce clean recent
+swap samples with one program-data payload per swap. Raydium CLMM now decodes into
+post-swap sqrt price, tick, active liquidity, and signed amount preview; the next
+step is collecting a larger multi-window JSONL sample and comparing
+`replay-normalized-swaps` results against proxy APR and passive baselines. Orca needs
+a separate liquidity reconstruction step before it can be replayed with comparable
+precision.
+
+First smoke test: scanning 80 recent `CARDS-USDC` pool signatures landed 20 swaps,
+decoded 19 Raydium `SwapEvent` rows into `SwapObs` JSONL, and `replay-normalized-swaps`
+successfully ran the existing policy battery over those rows. This is not enough
+history for APR claims, but it proves the real-data business loop:
+RPC swaps -> Raydium event decode -> normalized swap JSONL -> replay.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

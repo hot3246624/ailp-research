@@ -147,6 +147,12 @@ protocol pool stats -> range-width assumption -> fee capture -> churn cost -> AP
 and risk grade. The latest proxy pass puts `Raydium CARDS-USDC` around 1000% net
 APR at 2.5% half-width with medium risk, and `Orca SOL-PUMP` around 425% with low
 risk; both still require real swap/tick replay before shadow trading.
+`sample-solana-pool-swaps` is the first real Solana landing layer: it reads recent
+pool transactions through JSON-RPC, filters successful target-program swaps, stores
+raw `Program data`, and computes signed pool vault deltas for the two pool mints.
+For Raydium CLMM it now decodes `SwapEvent` into post-swap sqrt price, active
+liquidity, tick, and normalized `SwapObs` JSONL. Orca follows after liquidity can
+be reconstructed, while Meteora remains a separate DLMM/bin replay track.
 
 ## External References
 

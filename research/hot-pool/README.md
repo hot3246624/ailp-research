@@ -55,6 +55,23 @@ cargo run -p autopool-cli -- solana-proxy-replay \
   --output data/solana/proxy/latest.json
 ```
 
+Recent real swap landing sample:
+
+```bash
+cargo run -p autopool-cli -- sample-solana-pool-swaps \
+  --pool-address HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD \
+  --program-id CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK \
+  --token0-mint CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp \
+  --token1-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
+  --limit 8 \
+  --signature-scan-limit 30 \
+  --output data/solana/swaps/raydium-cards-usdc-sample.json \
+  --normalized-output data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl
+```
+
+For Raydium CLMM this also decodes `SwapEvent` into a normalized swap preview
+containing signed amounts, `sqrt_price_x96`, active liquidity, and tick.
+
 Schema:
 
 ```text

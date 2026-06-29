@@ -165,10 +165,16 @@ Current implementation boundary:
 - `solana-proxy-replay` runs the first Solana business-flow estimate from protocol
   pool stats: range-width assumption, fee capture, churn cost, net APR proxy, and
   risk grade.
-- Orca Whirlpool and Raydium CLMM should emit normalized `SwapObs` JSONL first;
-  this can reuse the existing tick/range replay engine.
+- `sample-solana-pool-swaps` proves that recent Raydium and Orca swaps can be
+  landed from public Solana JSON-RPC with target-program `Program data` and signed
+  pool vault deltas.
+- Raydium CLMM now decodes `SwapEvent` into post-swap sqrt price, active liquidity,
+  tick, and `SwapObs` JSONL. The next step is larger multi-window replay. Orca
+  Whirlpool follows after liquidity can be reconstructed or sourced from account
+  history.
 - Meteora DLMM needs a bin replay engine and should stay out of `SwapObs`/v3 math
   until bin liquidity and swap accounting are modeled.
 
 Bottom line: Base remains the execution training ground. Solana is now the main
-candidate-discovery frontier.
+candidate-discovery frontier, and Raydium CLMM is the fastest path from proxy APR
+to real hot-pool replay.

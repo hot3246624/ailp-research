@@ -12,6 +12,7 @@ use autopool_solana::{
     DiscoveryOptions, SolanaDiscoveryClient, SolanaPoolCandidate, SolanaToken, SolanaVenue,
 };
 use autopool_strategy::WeightedRiskModel;
+use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -281,6 +282,35 @@ enum Command {
         /// Optional JSON output path for the proxy replay rows.
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Sample recent successful Solana CLMM pool swaps from JSON-RPC and extract
+    /// pool-owned token balance deltas plus raw program data. This is the data
+    /// landing layer before decoding program events into normalized SwapObs.
+    SampleSolanaPoolSwaps {
+        #[arg(long, default_value = "https://solana-rpc.publicnode.com")]
+        rpc_url: String,
+        #[arg(long)]
+        pool_address: String,
+        #[arg(long)]
+        program_id: String,
+        #[arg(long)]
+        token0_mint: String,
+        #[arg(long)]
+        token1_mint: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        #[arg(long, default_value_t = 100)]
+        signature_scan_limit: usize,
+        #[arg(long, default_value_t = 150)]
+        request_sleep_ms: u64,
+        /// Optional JSON output path for sampled swap rows.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Optional JSONL output path for decoded Raydium CLMM SwapObs rows.
+        #[arg(long)]
+        normalized_output: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -1008,6 +1038,34 @@ async fn main() -> Result<()> {
                 rebalance_tx_cost_usd,
                 max_rebalances_per_day,
                 output,
+                format,
+            })
+            .await?
+        }
+        Command::SampleSolanaPoolSwaps {
+            rpc_url,
+            pool_address,
+            program_id,
+            token0_mint,
+            token1_mint,
+            limit,
+            signature_scan_limit,
+            request_sleep_ms,
+            output,
+            normalized_output,
+            format,
+        } => {
+            sample_solana_pool_swaps(SampleSolanaPoolSwapsArgs {
+                rpc_url,
+                pool_address,
+                program_id,
+                token0_mint,
+                token1_mint,
+                limit,
+                signature_scan_limit,
+                request_sleep_ms,
+                output,
+                normalized_output,
                 format,
             })
             .await?
@@ -2621,6 +2679,529 @@ fn proxy_verdict(net_apr: f64, risk_grade: &str, candidate: &SolanaPoolCandidate
         "medium" | "low" if net_apr >= 200.0 => "candidate_replay".to_string(),
         _ => "weak_after_risk".to_string(),
     }
+}
+
+const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const RAYDIUM_CLMM_SWAP_EVENT_LEN: usize = 221;
+const TWO_POW_32_F64: f64 = 4_294_967_296.0;
+
+#[derive(Debug, Clone)]
+struct SampleSolanaPoolSwapsArgs {
+    rpc_url: String,
+    pool_address: String,
+    program_id: String,
+    token0_mint: String,
+    token1_mint: String,
+    limit: usize,
+    signature_scan_limit: usize,
+    request_sleep_ms: u64,
+    output: Option<PathBuf>,
+    normalized_output: Option<PathBuf>,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SolanaPoolSwapSample {
+    signature: String,
+    slot: u64,
+    block_time: Option<i64>,
+    instruction: String,
+    token0_mint: String,
+    token1_mint: String,
+    token0_pool_delta_raw: i128,
+    token1_pool_delta_raw: i128,
+    token0_decimals: Option<u8>,
+    token1_decimals: Option<u8>,
+    token0_in: bool,
+    token1_in: bool,
+    program_data_count: usize,
+    program_data_base64: Vec<String>,
+    raydium_clmm_event: Option<RaydiumClmmSwapEvent>,
+    normalized_swap_preview: Option<SolanaSwapObsPreview>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RaydiumClmmSwapEvent {
+    pool_state: String,
+    sender: String,
+    token_account_0: String,
+    token_account_1: String,
+    amount_0: u64,
+    transfer_fee_0: u64,
+    amount_1: u64,
+    transfer_fee_1: u64,
+    zero_for_one: bool,
+    #[serde(serialize_with = "serialize_u128_as_string")]
+    sqrt_price_x64: u128,
+    #[serde(serialize_with = "serialize_u128_as_string")]
+    liquidity: u128,
+    tick: i32,
+    trade_fee_0: u64,
+    trade_fee_1: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct SolanaSwapObsPreview {
+    amount0: f64,
+    amount1: f64,
+    sqrt_price_x96: f64,
+    liquidity: f64,
+    tick: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SolanaSignatureInfo {
+    signature: String,
+    slot: u64,
+    #[serde(rename = "blockTime")]
+    block_time: Option<i64>,
+    err: Option<serde_json::Value>,
+}
+
+fn serialize_u128_as_string<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()> {
+    let rpc = SolanaLightRpc::new(args.rpc_url.clone());
+    let signatures = rpc
+        .get_signatures_for_address(&args.pool_address, args.signature_scan_limit)
+        .await?;
+    let mut samples = Vec::new();
+    for sig in signatures.into_iter().filter(|sig| sig.err.is_none()) {
+        let tx = rpc.get_transaction(&sig.signature).await?;
+        if let Some(sample) = parse_solana_pool_swap_sample(&args, &sig, &tx) {
+            samples.push(sample);
+        }
+        if samples.len() >= args.limit {
+            break;
+        }
+        if args.request_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(args.request_sleep_ms)).await;
+        }
+    }
+
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_string_pretty(&samples)?)
+            .with_context(|| format!("writing Solana pool swap samples {}", output.display()))?;
+    }
+    let normalized_rows = if let Some(output) = args.normalized_output.as_ref() {
+        Some(write_normalized_swap_jsonl(output, &samples)?)
+    } else {
+        None
+    };
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&samples)?);
+        return Ok(());
+    }
+
+    println!(
+        "solana pool swap samples pool={} program={} scanned={} kept={}",
+        args.pool_address,
+        args.program_id,
+        args.signature_scan_limit,
+        samples.len()
+    );
+    if let Some(normalized_rows) = normalized_rows {
+        println!(
+            "normalized SwapObs rows written={} path={}",
+            normalized_rows,
+            args.normalized_output
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    println!(
+        "{:<12} {:>10} {:<8} {:>18} {:>18} {:>5} {:>8}  data",
+        "signature", "slot", "ix", "delta0_raw", "delta1_raw", "dir", "tick"
+    );
+    for sample in &samples {
+        let direction = if sample.token0_in {
+            "0in"
+        } else if sample.token1_in {
+            "1in"
+        } else {
+            "-"
+        };
+        let tick = sample
+            .normalized_swap_preview
+            .map(|preview| preview.tick.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<12} {:>10} {:<8} {:>18} {:>18} {:>5} {:>8}  {}",
+            &sample.signature[..sample.signature.len().min(12)],
+            sample.slot,
+            sample.instruction,
+            sample.token0_pool_delta_raw,
+            sample.token1_pool_delta_raw,
+            direction,
+            tick,
+            sample.program_data_count
+        );
+    }
+
+    Ok(())
+}
+
+fn write_normalized_swap_jsonl(path: &Path, samples: &[SolanaPoolSwapSample]) -> Result<usize> {
+    let mut swaps = samples
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, sample)| sample_to_swap_obs(sample, idx as u64))
+        .collect::<Vec<_>>();
+    swaps.sort_by(|a, b| {
+        a.block
+            .cmp(&b.block)
+            .then_with(|| a.log_index.cmp(&b.log_index))
+    });
+    for (idx, swap) in swaps.iter_mut().enumerate() {
+        swap.log_index = idx as u64;
+    }
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating output directory {}", parent.display()))?;
+    }
+    let mut file = File::create(path)
+        .with_context(|| format!("creating normalized swaps {}", path.display()))?;
+    for swap in &swaps {
+        writeln!(file, "{}", serde_json::to_string(swap)?)
+            .with_context(|| format!("writing normalized swaps {}", path.display()))?;
+    }
+    Ok(swaps.len())
+}
+
+fn sample_to_swap_obs(
+    sample: &SolanaPoolSwapSample,
+    log_index: u64,
+) -> Option<autopool_backtest::SwapObs> {
+    let preview = sample.normalized_swap_preview?;
+    Some(autopool_backtest::SwapObs {
+        block: sample.slot,
+        log_index,
+        amount0: preview.amount0,
+        amount1: preview.amount1,
+        sqrt_price_x96: preview.sqrt_price_x96,
+        liquidity: preview.liquidity,
+        tick: preview.tick,
+    })
+}
+
+struct SolanaLightRpc {
+    rpc_url: String,
+    http: reqwest::Client,
+}
+
+impl SolanaLightRpc {
+    fn new(rpc_url: String) -> Self {
+        Self {
+            rpc_url,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let mut last_error: Option<anyhow::Error> = None;
+        for attempt in 0..5 {
+            match self.http.post(&self.rpc_url).json(&body).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let response = response.json::<serde_json::Value>().await?;
+                    if let Some(error) = response.get("error") {
+                        anyhow::bail!("Solana RPC {method} error: {error}");
+                    }
+                    return response
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("Solana RPC {method} missing result"));
+                }
+                Ok(response) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "Solana RPC {method} HTTP status {}",
+                        response.status()
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(anyhow::Error::new(error));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("Solana RPC {method} failed without response")))
+    }
+
+    async fn get_signatures_for_address(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<SolanaSignatureInfo>> {
+        let result = self
+            .call(
+                "getSignaturesForAddress",
+                json!([address, {"limit": limit.min(1_000)}]),
+            )
+            .await?;
+        serde_json::from_value(result).context("parsing getSignaturesForAddress result")
+    }
+
+    async fn get_transaction(&self, signature: &str) -> Result<serde_json::Value> {
+        self.call(
+            "getTransaction",
+            json!([signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]),
+        )
+        .await
+    }
+}
+
+fn parse_solana_pool_swap_sample(
+    args: &SampleSolanaPoolSwapsArgs,
+    sig: &SolanaSignatureInfo,
+    tx: &serde_json::Value,
+) -> Option<SolanaPoolSwapSample> {
+    let logs = tx
+        .get("meta")?
+        .get("logMessages")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let (instruction, program_data_base64) = target_program_swap_data(&logs, &args.program_id)?;
+    let (token0_pool_delta_raw, token0_decimals) =
+        pool_token_delta(tx, &args.pool_address, &args.token0_mint);
+    let (token1_pool_delta_raw, token1_decimals) =
+        pool_token_delta(tx, &args.pool_address, &args.token1_mint);
+    if token0_pool_delta_raw == 0 && token1_pool_delta_raw == 0 {
+        return None;
+    }
+    let raydium_clmm_event = if args.program_id == RAYDIUM_CLMM_PROGRAM_ID {
+        program_data_base64
+            .iter()
+            .find_map(|data| decode_raydium_clmm_swap_event(data, &args.pool_address))
+    } else {
+        None
+    };
+    let normalized_swap_preview = raydium_clmm_event
+        .as_ref()
+        .map(raydium_event_to_swap_obs_preview);
+
+    Some(SolanaPoolSwapSample {
+        signature: sig.signature.clone(),
+        slot: sig.slot,
+        block_time: sig.block_time,
+        instruction,
+        token0_mint: args.token0_mint.clone(),
+        token1_mint: args.token1_mint.clone(),
+        token0_pool_delta_raw,
+        token1_pool_delta_raw,
+        token0_decimals,
+        token1_decimals,
+        token0_in: token0_pool_delta_raw > 0,
+        token1_in: token1_pool_delta_raw > 0,
+        program_data_count: program_data_base64.len(),
+        program_data_base64,
+        raydium_clmm_event,
+        normalized_swap_preview,
+    })
+}
+
+fn decode_raydium_clmm_swap_event(
+    program_data_base64: &str,
+    expected_pool_address: &str,
+) -> Option<RaydiumClmmSwapEvent> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(program_data_base64)
+        .ok()?;
+    if bytes.len() < RAYDIUM_CLMM_SWAP_EVENT_LEN {
+        return None;
+    }
+    let mut offset = 8; // Anchor event discriminator.
+    let pool_state = read_pubkey_base58(&bytes, &mut offset)?;
+    let sender = read_pubkey_base58(&bytes, &mut offset)?;
+    let token_account_0 = read_pubkey_base58(&bytes, &mut offset)?;
+    let token_account_1 = read_pubkey_base58(&bytes, &mut offset)?;
+    let amount_0 = read_u64_le(&bytes, &mut offset)?;
+    let transfer_fee_0 = read_u64_le(&bytes, &mut offset)?;
+    let amount_1 = read_u64_le(&bytes, &mut offset)?;
+    let transfer_fee_1 = read_u64_le(&bytes, &mut offset)?;
+    let zero_for_one = read_bool(&bytes, &mut offset)?;
+    let sqrt_price_x64 = read_u128_le(&bytes, &mut offset)?;
+    let liquidity = read_u128_le(&bytes, &mut offset)?;
+    let tick = read_i32_le(&bytes, &mut offset)?;
+    let trade_fee_0 = read_u64_le(&bytes, &mut offset)?;
+    let trade_fee_1 = read_u64_le(&bytes, &mut offset)?;
+    if pool_state != expected_pool_address {
+        return None;
+    }
+    Some(RaydiumClmmSwapEvent {
+        pool_state,
+        sender,
+        token_account_0,
+        token_account_1,
+        amount_0,
+        transfer_fee_0,
+        amount_1,
+        transfer_fee_1,
+        zero_for_one,
+        sqrt_price_x64,
+        liquidity,
+        tick,
+        trade_fee_0,
+        trade_fee_1,
+    })
+}
+
+fn raydium_event_to_swap_obs_preview(event: &RaydiumClmmSwapEvent) -> SolanaSwapObsPreview {
+    let amount0 = if event.zero_for_one {
+        event.amount_0 as f64
+    } else {
+        -(event.amount_0 as f64)
+    };
+    let amount1 = if event.zero_for_one {
+        -(event.amount_1 as f64)
+    } else {
+        event.amount_1 as f64
+    };
+    SolanaSwapObsPreview {
+        amount0,
+        amount1,
+        sqrt_price_x96: event.sqrt_price_x64 as f64 * TWO_POW_32_F64,
+        liquidity: event.liquidity as f64,
+        tick: event.tick,
+    }
+}
+
+fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = offset.checked_add(len)?;
+    let slice = bytes.get(*offset..end)?;
+    *offset = end;
+    Some(slice)
+}
+
+fn read_pubkey_base58(bytes: &[u8], offset: &mut usize) -> Option<String> {
+    Some(bs58::encode(read_bytes(bytes, offset, 32)?).into_string())
+}
+
+fn read_u64_le(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        read_bytes(bytes, offset, 8)?.try_into().ok()?,
+    ))
+}
+
+fn read_u128_le(bytes: &[u8], offset: &mut usize) -> Option<u128> {
+    Some(u128::from_le_bytes(
+        read_bytes(bytes, offset, 16)?.try_into().ok()?,
+    ))
+}
+
+fn read_i32_le(bytes: &[u8], offset: &mut usize) -> Option<i32> {
+    Some(i32::from_le_bytes(
+        read_bytes(bytes, offset, 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_bool(bytes: &[u8], offset: &mut usize) -> Option<bool> {
+    match read_bytes(bytes, offset, 1)?[0] {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn target_program_swap_data(logs: &[String], program_id: &str) -> Option<(String, Vec<String>)> {
+    let mut in_target = false;
+    let mut instruction: Option<String> = None;
+    let mut data = Vec::new();
+    let invoke_prefix = format!("Program {program_id} invoke");
+    let success_prefix = format!("Program {program_id} success");
+    let failed_prefix = format!("Program {program_id} failed");
+    for log in logs {
+        if log.starts_with(&invoke_prefix) {
+            in_target = true;
+            instruction = None;
+            data.clear();
+            continue;
+        }
+        if in_target && log.starts_with("Program log: Instruction: ") {
+            let ix = log
+                .trim_start_matches("Program log: Instruction: ")
+                .to_string();
+            if ix.to_ascii_lowercase().contains("swap") {
+                instruction = Some(ix);
+            }
+            continue;
+        }
+        if in_target && log.starts_with("Program data: ") {
+            data.push(log.trim_start_matches("Program data: ").to_string());
+            continue;
+        }
+        if in_target && (log.starts_with(&success_prefix) || log.starts_with(&failed_prefix)) {
+            if let Some(ix) = instruction.clone() {
+                return Some((ix, data.clone()));
+            }
+            in_target = false;
+            data.clear();
+        }
+    }
+    None
+}
+
+fn pool_token_delta(tx: &serde_json::Value, pool_address: &str, mint: &str) -> (i128, Option<u8>) {
+    let pre = token_amount_by_account(tx, "preTokenBalances", pool_address, mint);
+    let post = token_amount_by_account(tx, "postTokenBalances", pool_address, mint);
+    let decimals = post
+        .iter()
+        .chain(pre.iter())
+        .find_map(|(_, decimals)| *decimals);
+    let pre_sum = pre.iter().map(|(amount, _)| *amount).sum::<i128>();
+    let post_sum = post.iter().map(|(amount, _)| *amount).sum::<i128>();
+    (post_sum - pre_sum, decimals)
+}
+
+fn token_amount_by_account(
+    tx: &serde_json::Value,
+    field: &str,
+    pool_address: &str,
+    mint: &str,
+) -> Vec<(i128, Option<u8>)> {
+    tx.get("meta")
+        .and_then(|meta| meta.get(field))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|balance| {
+            balance.get("owner").and_then(serde_json::Value::as_str) == Some(pool_address)
+                && balance.get("mint").and_then(serde_json::Value::as_str) == Some(mint)
+        })
+        .filter_map(|balance| {
+            let amount = balance
+                .get("uiTokenAmount")?
+                .get("amount")?
+                .as_str()?
+                .parse::<i128>()
+                .ok()?;
+            let decimals = balance
+                .get("uiTokenAmount")
+                .and_then(|value| value.get("decimals"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u8::try_from(value).ok());
+            Some((amount, decimals))
+        })
+        .collect()
 }
 
 fn hot_pool_experiment_plan(args: HotPoolExperimentArgs) -> Result<()> {
@@ -5895,6 +6476,32 @@ mod tests {
         assert!(scenario.net_fee_apr_proxy > 900.0);
         assert_eq!(scenario.risk_grade, "medium");
         assert_eq!(scenario.verdict, "candidate_replay");
+    }
+
+    #[test]
+    fn decodes_raydium_clmm_swap_event() {
+        let event = decode_raydium_clmm_swap_event(
+            "QMbN6CYIceL5cEcIwJ0doJ606WjQpCy4c1fKQWkhV+rJ9GWEcQ0Beqx+qMoro1HpabFjovKAi6Xg2hc3AOJa/INrzLINjURgJ+pZMQTN1cdziJMBFtZsa/jPU5cifiYm349rv58fllzmMP246IpMm+Wt1jXLWP5a94u9i6w4S5ssqbnw+uUHH97IKB0AAAAAAAAAAAAAAAAHhCcHAAAAAAAAAAAAAAAAAMHWr0ETYI1+AAAAAAAAAACpeeHOew0AAAAAAAAAAAAA9Mj//wAAAAAAAAAAeVMHAAAAAAA=",
+            "HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD",
+        )
+        .expect("valid Raydium swap event");
+
+        assert_eq!(
+            event.pool_state,
+            "HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD"
+        );
+        assert_eq!(event.amount_0, 489_212_126);
+        assert_eq!(event.amount_1, 120_030_215);
+        assert!(!event.zero_for_one);
+        assert_eq!(event.sqrt_price_x64, 9_119_050_456_317_810_369);
+        assert_eq!(event.liquidity, 14_825_403_021_737);
+        assert_eq!(event.tick, -14_092);
+        assert_eq!(event.trade_fee_1, 480_121);
+
+        let preview = raydium_event_to_swap_obs_preview(&event);
+        assert_eq!(preview.amount0, -489_212_126.0);
+        assert_eq!(preview.amount1, 120_030_215.0);
+        assert_eq!(preview.tick, -14_092);
     }
 
     fn hot_pool_candidate_fixture(
