@@ -118,6 +118,12 @@ Latest grid result: `hedged_narrow` at 0.75 fixed hedge had the best score, with
 ~1074% p05 mechanical net APR and ~$3.48 worst drawdown. Lower hedge fractions had
 higher mean net, but the p05 APR and drawdown deteriorated quickly.
 
+The grid report now also prints a `by regime` section. On the same 3-window sample,
+range windows favored heavier hedging for left-tail control, while the single
+`trend_down_money` window favored keeping more directional beta and punished higher
+fixed hedges versus hold. Treat this as a rule-design hint, not a deployable
+setting: the next useful step is regime-conditioned hedge sizing over more windows.
+
 Schema:
 
 ```text

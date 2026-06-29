@@ -4734,6 +4734,11 @@ struct WindowPolicyRow {
     swaps: usize,
     block_first: u64,
     block_last: u64,
+    tick_first: i32,
+    tick_last: i32,
+    tick_delta: i32,
+    trend_strength: f64,
+    regime: String,
     minutes: f64,
     policy: String,
     net_pnl_usd: f64,
@@ -4771,6 +4776,7 @@ struct HedgeGridReport {
     windows: usize,
     config: serde_json::Value,
     rows: Vec<HedgeGridRow>,
+    regime_rows: Vec<HedgeGridRegimeRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4786,6 +4792,27 @@ struct HedgeGridRow {
     mean_fee_lvr_apr_pct: Option<f64>,
     worst_max_drawdown_usd: f64,
     score: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct HedgeGridRegimeRow {
+    hedge_fraction: f64,
+    policy: String,
+    regime: String,
+    windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_vs_hold_usd: f64,
+    p05_net_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+}
+
+#[derive(Debug, Clone)]
+struct WindowRegimeLabel {
+    tick_first: i32,
+    tick_last: i32,
+    tick_delta: i32,
+    trend_strength: f64,
+    label: String,
 }
 
 fn params_json(params: &ReplayParams) -> serde_json::Value {
@@ -5072,6 +5099,22 @@ fn mean_values_opt(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| mean_values(values))
 }
 
+fn stddev_values(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = mean_values(values);
+    let variance = values
+        .iter()
+        .map(|value| {
+            let diff = *value - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
 fn replay_events(
     data_dir: PathBuf,
     pool_address: Option<String>,
@@ -5256,6 +5299,7 @@ fn build_window_rows(
     while start + window_swaps <= swaps.len() {
         let end = start + window_swaps;
         let window = &swaps[start..end];
+        let regime = classify_window_regime(window);
         let years = replay_window_years_from_swaps(window, params);
         let minutes = years.unwrap_or(0.0) * 365.0 * 24.0 * 60.0;
         let policies = run_battery(params, window);
@@ -5267,6 +5311,11 @@ fn build_window_rows(
                 swaps: window.len(),
                 block_first: window.first().map(|swap| swap.block).unwrap_or(0),
                 block_last: window.last().map(|swap| swap.block).unwrap_or(0),
+                tick_first: regime.tick_first,
+                tick_last: regime.tick_last,
+                tick_delta: regime.tick_delta,
+                trend_strength: regime.trend_strength,
+                regime: regime.label.clone(),
                 minutes,
                 policy: policy.policy,
                 net_pnl_usd: policy.net_pnl_usd,
@@ -5288,6 +5337,38 @@ fn build_window_rows(
     rows
 }
 
+fn classify_window_regime(swaps: &[autopool_backtest::SwapObs]) -> WindowRegimeLabel {
+    let tick_first = swaps.first().map(|swap| swap.tick).unwrap_or(0);
+    let tick_last = swaps.last().map(|swap| swap.tick).unwrap_or(tick_first);
+    let tick_delta = tick_last - tick_first;
+    let deltas = swaps
+        .windows(2)
+        .map(|pair| (pair[1].tick - pair[0].tick) as f64)
+        .collect::<Vec<_>>();
+    let realized = stddev_values(&deltas).max(1.0);
+    let trend_strength =
+        (tick_delta as f64).abs() / (realized * (swaps.len().max(1) as f64).sqrt());
+    let abs_delta = tick_delta.abs();
+    let label = if trend_strength >= 1.0 && abs_delta >= 60 {
+        if tick_delta > 0 {
+            "trend_up_risk".to_string()
+        } else {
+            "trend_down_money".to_string()
+        }
+    } else if realized >= 20.0 {
+        "volatile_range".to_string()
+    } else {
+        "range".to_string()
+    };
+    WindowRegimeLabel {
+        tick_first,
+        tick_last,
+        tick_delta,
+        trend_strength,
+        label,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_normalized_hedge_grid(
     spec_path: PathBuf,
@@ -5307,6 +5388,7 @@ fn replay_normalized_hedge_grid(
     let mut swaps = 0usize;
     let mut windows = 0usize;
     let mut config = serde_json::Value::Null;
+    let mut regime_source_rows = Vec::new();
     let mut fractions = hedge_fractions;
     fractions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     fractions.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
@@ -5331,6 +5413,13 @@ fn replay_normalized_hedge_grid(
             windows = report.windows;
         }
         config = report.config.clone();
+        for window_row in report.rows.iter().filter(|row| {
+            row.policy == "hedged_narrow"
+                || ((row.policy == "delta_hedged" || row.policy == "hedged_wide")
+                    && (hedge_fraction - control_fraction).abs() < 1e-9)
+        }) {
+            regime_source_rows.push((hedge_fraction, window_row.clone()));
+        }
         for summary in report.summaries.into_iter().filter(|summary| {
             summary.policy == "hedged_narrow"
                 || ((summary.policy == "delta_hedged" || summary.policy == "hedged_wide")
@@ -5371,6 +5460,7 @@ fn replay_normalized_hedge_grid(
         windows,
         config,
         rows,
+        regime_rows: summarize_hedge_regime_rows(&regime_source_rows),
     };
     emit_hedge_grid_report(report, format)
 }
@@ -5402,6 +5492,81 @@ fn hedge_grid_score(summary: &WindowPolicySummary) -> Option<f64> {
     let mean = summary.mean_net_apr_pct.unwrap_or(0.0);
     let drawdown_penalty = summary.worst_max_drawdown_usd * 25.0;
     Some(p05 + summary.win_rate_vs_hold_pct * 20.0 + mean * 0.05 - drawdown_penalty)
+}
+
+fn summarize_hedge_regime_rows(rows: &[(f64, WindowPolicyRow)]) -> Vec<HedgeGridRegimeRow> {
+    let mut keys = rows
+        .iter()
+        .map(|(hedge, row)| (*hedge, row.policy.clone(), row.regime.clone()))
+        .collect::<Vec<_>>();
+    keys.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    keys.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9 && a.1 == b.1 && a.2 == b.2);
+    let mut out = keys
+        .into_iter()
+        .filter_map(|(hedge_fraction, policy, regime)| {
+            let policy_rows = rows
+                .iter()
+                .filter(|(hedge, row)| {
+                    (*hedge - hedge_fraction).abs() < 1e-9
+                        && row.policy == policy
+                        && row.regime == regime
+                })
+                .map(|(_, row)| row)
+                .collect::<Vec<_>>();
+            if policy_rows.is_empty() {
+                return None;
+            }
+            let net_aprs = policy_rows
+                .iter()
+                .filter_map(|row| row.net_apr_pct)
+                .collect::<Vec<_>>();
+            Some(HedgeGridRegimeRow {
+                hedge_fraction,
+                policy,
+                regime,
+                windows: policy_rows.len(),
+                win_rate_vs_hold_pct: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| {
+                            if row.net_vs_hold_usd > 0.0 {
+                                100.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_vs_hold_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.net_vs_hold_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
+                worst_max_drawdown_usd: policy_rows
+                    .iter()
+                    .map(|row| row.max_drawdown_usd)
+                    .fold(0.0, f64::max),
+            })
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| {
+        a.policy
+            .cmp(&b.policy)
+            .then_with(|| a.regime.cmp(&b.regime))
+            .then_with(|| {
+                a.hedge_fraction
+                    .partial_cmp(&b.hedge_fraction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    out
 }
 
 fn emit_hedge_grid_report(report: HedgeGridReport, format: OutputFormat) -> Result<()> {
@@ -5444,6 +5609,27 @@ fn emit_hedge_grid_report(report: HedgeGridReport, format: OutputFormat) -> Resu
             row.worst_max_drawdown_usd,
             optional_f64(row.score)
         );
+    }
+    if !report.regime_rows.is_empty() {
+        println!();
+        println!("by regime:");
+        println!(
+            "{:<14} {:<16} {:<18} {:>4} {:>8} {:>10} {:>10} {:>9}",
+            "hedge", "policy", "regime", "n", "win%", "meanVsH", "p05APR", "worstDD"
+        );
+        for row in &report.regime_rows {
+            println!(
+                "{:<14.2} {:<16} {:<18} {:>4} {:>7.0}% {:>10.2} {:>9} {:>9.2}",
+                row.hedge_fraction,
+                row.policy,
+                row.regime,
+                row.windows,
+                row.win_rate_vs_hold_pct,
+                row.mean_net_vs_hold_usd,
+                optional_pct(row.p05_net_apr_pct),
+                row.worst_max_drawdown_usd,
+            );
+        }
     }
     Ok(())
 }
@@ -7358,6 +7544,41 @@ mod tests {
             tick: 2,
         }]));
         assert!(sample_goal_reached(&args, &samples));
+    }
+
+    #[test]
+    fn classifies_window_regimes_from_tick_path() {
+        let range = swaps_for_ticks(&[10, 11, 10, 9, 10, 10]);
+        let volatile_range = swaps_for_ticks(&[0, 50, -45, 55, -50, 0]);
+        let trend_up = swaps_for_ticks(&(0..40).map(|index| index * 10).collect::<Vec<_>>());
+        let trend_down = swaps_for_ticks(&(0..40).map(|index| -index * 10).collect::<Vec<_>>());
+
+        assert_eq!(classify_window_regime(&range).label, "range");
+        assert_eq!(
+            classify_window_regime(&volatile_range).label,
+            "volatile_range"
+        );
+        assert_eq!(classify_window_regime(&trend_up).label, "trend_up_risk");
+        assert_eq!(
+            classify_window_regime(&trend_down).label,
+            "trend_down_money"
+        );
+    }
+
+    fn swaps_for_ticks(ticks: &[i32]) -> Vec<autopool_backtest::SwapObs> {
+        ticks
+            .iter()
+            .enumerate()
+            .map(|(index, tick)| autopool_backtest::SwapObs {
+                block: index as u64,
+                log_index: 0,
+                amount0: 1.0,
+                amount1: -1.0,
+                sqrt_price_x96: 1.0,
+                liquidity: 1.0,
+                tick: *tick,
+            })
+            .collect()
     }
 
     fn solana_sample_fixture(

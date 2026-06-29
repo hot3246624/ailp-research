@@ -333,6 +333,20 @@ p05 APR and drawdown. `delta_hedged` is a dynamic control and does not use the f
 `hedge_fraction` parameter. This pushes the next research step toward regime-aware
 hedge sizing, not a static all-or-nothing hedge.
 
+The hedge-grid report now also prints a `by regime` breakdown. On the same sample:
+
+| regime | best observed hedge readout |
+| --- | --- |
+| `range` | higher hedge fractions kept p05 APR positive and reduced drawdown; full hedge had the strongest range-window left tail in this short sample |
+| `trend_down_money` | higher fixed hedge lagged hold badly because the directional move favored inventory; lower hedge kept more beta but with weaker tail control |
+
+Interpretation: the 0.75 hedge result is a compromise across a tiny regime mix, not
+a universal hedge setting. The deployable path is a regime-conditioned hedge rule:
+more hedge in range/noisy windows, less static hedge when the window is moving to
+the money side, and separate crash tests for risk-side trends. The `trend_*` labels
+assume the normalized replay convention where the stable/numeraire leg is token0 and
+the risk leg is token1.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:
