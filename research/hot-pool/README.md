@@ -342,18 +342,28 @@ Commands:
 ```bash
 scripts/meteora-dlmm-snapshot.sh \
   --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
-  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl \
-  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.raw.json
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.latest.json \
+  --raw-jsonl-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.raw.jsonl \
+  --append
 
 cargo run -q -p autopool-cli -- replay-dlmm-bins \
   --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
-  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.jsonl
 ```
 
 The one-row replay shows about `+$486` gross fee for `$10k`, but this is a capacity
 alarm rather than a strategy result: `$10k` is about `2.0x` active-bin liquidity, and
-one observation cannot produce APR or rolling-window evidence. Next useful step is
-repeated snapshots or decoded swap/bin history for promotion-style windows.
+one observation cannot produce APR or rolling-window evidence. Append mode dedupes
+by slot for heartbeat sampling, but Meteora Data API rolling-window volume is still
+only a capacity/fee-density probe. Replay APR requires non-overlapping swap flow
+matched to active-bin liquidity snapshots.
+
+Append smoke on 2026-06-30 produced two SOL-USDC rows over slots
+`429714568 -> 429714639`, active bins `-6468 -> -6465`, active-bin liquidity about
+`$10.3k -> $10.0k`, and cap/active about `1.0x` for `$10k`. The Rust replay accepts
+the stream, but the rows use overlapping rolling `30m` volume and are not promotion
+evidence.
 
 Orca `HYPE-USDC` final P1 coverage replay:
 

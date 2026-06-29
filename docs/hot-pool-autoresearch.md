@@ -725,15 +725,17 @@ The first read-only Meteora SDK ingestion is now wired:
 ```bash
 scripts/meteora-dlmm-snapshot.sh \
   --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
-  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl \
-  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.raw.json \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.latest.json \
+  --raw-jsonl-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.raw.jsonl \
+  --append \
   --bins-left 8 \
   --bins-right 8 \
   --volume-window 30m
 
 cargo run -q -p autopool-cli -- replay-dlmm-bins \
   --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
-  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl \
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.jsonl \
   --half-width-bins 5 \
   --capital-usd 10000
 ```
@@ -756,6 +758,26 @@ not a deployment proposal. This is still valuable because it proves the business
 flow is now DLMM-native: protocol API metadata -> official SDK active bin/bin
 liquidity -> `DlmmBinObs` JSONL -> Rust DLMM replay. Next evidence step is repeated
 snapshots or decoded swap/bin history, then rolling windows.
+
+The append mode is for heartbeat-style sampling and dedupes by Solana slot. Treat
+Data API rolling-window volume (`30m`, `1h`, and similar) as a capacity/fee-density
+probe only: `amount_in_usd` must be non-overlapping interval flow before the replay
+APR or rolling promotion gate is meaningful. The deployable Meteora target remains
+decoded swap flow plus matched historical active-bin liquidity snapshots.
+
+Append smoke on 2026-06-30 produced two SOL-USDC rows:
+
+```text
+slots:        429714568 -> 429714639
+active bins:  -6468 -> -6465
+active liq:   ~$10.3k -> ~$10.0k
+30m volume:   ~$1.18m -> ~$0.99m
+cap/active:   ~1.0x for $10k capital
+```
+
+The Rust DLMM replay accepts the stream and emits the expected caveats, but this is
+not promotion evidence: the volume fields are overlapping rolling windows, and the
+position is still roughly equal to active-bin liquidity.
 
 ### Orca HYPE-USDC Replay
 

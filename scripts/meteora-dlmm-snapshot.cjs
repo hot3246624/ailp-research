@@ -5,11 +5,12 @@ const fs = require("fs");
 const path = require("path");
 
 function usage() {
-  console.error(`usage: node scripts/meteora-dlmm-snapshot.cjs --spec <spec.json> --out <obs.jsonl> [--raw-out <snapshot.json>] [--rpc <url>] [--bins-left 8] [--bins-right 8] [--volume-window 30m]`);
+  console.error(`usage: node scripts/meteora-dlmm-snapshot.cjs --spec <spec.json> --out <obs.jsonl> [--append] [--raw-out <snapshot.json>] [--raw-jsonl-out <snapshots.jsonl>] [--rpc <url>] [--bins-left 8] [--bins-right 8] [--volume-window 30m]`);
 }
 
 function parseArgs(argv) {
   const out = {
+    append: false,
     binsLeft: 8,
     binsRight: 8,
     volumeWindow: "30m",
@@ -17,8 +18,16 @@ function parseArgs(argv) {
   };
   for (let i = 2; i < argv.length; i += 1) {
     const key = argv[i];
+    if (!key.startsWith("--")) {
+      usage();
+      process.exit(2);
+    }
+    if (key === "--append") {
+      out.append = true;
+      continue;
+    }
     const value = argv[i + 1];
-    if (!key.startsWith("--") || value === undefined) {
+    if (value === undefined) {
       usage();
       process.exit(2);
     }
@@ -32,6 +41,9 @@ function parseArgs(argv) {
         break;
       case "--raw-out":
         out.rawOut = value;
+        break;
+      case "--raw-jsonl-out":
+        out.rawJsonlOut = value;
         break;
       case "--rpc":
         out.rpc = value;
@@ -56,6 +68,45 @@ function parseArgs(argv) {
     process.exit(2);
   }
   return out;
+}
+
+function jsonlStatus(file, dedupeKey, dedupeValue) {
+  if (!fs.existsSync(file)) {
+    return { rows: 0, duplicate: false };
+  }
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+  let rows = 0;
+  let duplicate = false;
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue;
+    }
+    rows += 1;
+    if (!duplicate) {
+      try {
+        const parsed = JSON.parse(line);
+        duplicate = parsed[dedupeKey] === dedupeValue;
+      } catch (_err) {
+        // Keep counting usable-looking lines; parse errors should be caught by the
+        // Rust replay reader when the stream is consumed.
+      }
+    }
+  }
+  return { rows, duplicate };
+}
+
+function writeJsonl(file, value, options) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (!options.append) {
+    fs.writeFileSync(file, `${JSON.stringify(value)}\n`);
+    return { existing_rows: 0, appended: true, duplicate: false };
+  }
+  const status = jsonlStatus(file, options.dedupeKey, value[options.dedupeKey]);
+  if (status.duplicate) {
+    return { existing_rows: status.rows, appended: false, duplicate: true };
+  }
+  fs.appendFileSync(file, `${JSON.stringify(value)}\n`);
+  return { existing_rows: status.rows, appended: true, duplicate: false };
 }
 
 function requireSdk(name) {
@@ -148,8 +199,10 @@ async function main() {
     active_liquidity_usd: active.liquidity_usd,
     amount_in_usd: volume,
   };
-  fs.mkdirSync(path.dirname(args.out), { recursive: true });
-  fs.writeFileSync(args.out, `${JSON.stringify(obs)}\n`);
+  const obsWrite = writeJsonl(args.out, obs, {
+    append: args.append,
+    dedupeKey: "block",
+  });
 
   const snapshot = {
     source: "meteora-dlmm-sdk",
@@ -180,6 +233,12 @@ async function main() {
     fs.mkdirSync(path.dirname(args.rawOut), { recursive: true });
     fs.writeFileSync(args.rawOut, `${JSON.stringify(snapshot, null, 2)}\n`);
   }
+  const rawJsonlWrite = args.rawJsonlOut
+    ? writeJsonl(args.rawJsonlOut, snapshot, {
+        append: args.append,
+        dedupeKey: "slot",
+      })
+    : null;
   console.log(JSON.stringify({
     pool: poolAddress,
     symbol: spec.symbol,
@@ -188,7 +247,13 @@ async function main() {
     active_liquidity_usd: obs.active_liquidity_usd,
     amount_in_usd: obs.amount_in_usd,
     out: args.out,
+    append: args.append,
+    appended: obsWrite.appended,
+    duplicate: obsWrite.duplicate,
+    existing_rows: obsWrite.existing_rows,
     raw_out: args.rawOut || null,
+    raw_jsonl_out: args.rawJsonlOut || null,
+    raw_jsonl_appended: rawJsonlWrite ? rawJsonlWrite.appended : null,
   }));
 }
 

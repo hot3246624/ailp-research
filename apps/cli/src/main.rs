@@ -5964,6 +5964,7 @@ fn replay_dlmm_bins(
     let mut caveats = vec![
         "DLMM replay uses normalized bin observations, not CLMM tick math".to_string(),
         "active_liquidity_usd must come from active-bin account state, not pool TVL".to_string(),
+        "amount_in_usd must be non-overlapping per-observation flow; rolling API volume snapshots are capacity probes, not additive PnL history".to_string(),
     ];
     if observations.len() < 2 {
         caveats.push(
