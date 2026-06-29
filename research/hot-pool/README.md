@@ -249,6 +249,22 @@ lagged gate failed 25/40/60/80-swap windows with p05 APR around `-426%`, `-478%`
 `hedged_wide` gates also rejected. Treat this as a useful warning: full-window APR can
 look investable while rolling left-tail and hold-edge metrics say no.
 
+Orca `SOL-USDC` capacity replay:
+
+```text
+sample A: scanned 759 signatures, kept 187 normalized swaps, tx_errors=0
+span:     slot 429682709..429683021, about 2.1 minutes, tick 26160..26162 after inversion
+```
+
+`SOL-USDC` is the large-capacity benchmark from the refreshed Orca queue: ~$24m TVL,
+~$231m 24h volume, volume/TVL near 9.55, 4bps fee tier, and ~139% 24h fee APR. The
+full short replay looked good before gating (`delta_hedged` about `+$1.10` net with
+~$0.21 max drawdown; `vol_scaled_rebalance` about `+$1.34` net), but promotion
+rejected it. The lagged gate p05 APR was about `-2854%`, `-1144%`, `-728%`, and
+`130%` across 25/40/60/80-swap windows. Direct `delta_hedged` and `hedged_wide` gates
+also rejected. This is not a long-regime verdict, but it is evidence that enormous
+volume with a 4bps fee tier is not enough by itself.
+
 Schema:
 
 ```text

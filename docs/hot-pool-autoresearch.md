@@ -578,6 +578,45 @@ cleanly. A single full-window replay can show 600%-1400% mechanical APR while ro
 windows still lose to hold on average. The promotion gate is doing real work here:
 this is a replay-based rejection, not a data-landing failure.
 
+### Orca SOL-USDC Replay
+
+`SOL-USDC` is not the highest APR Orca pool, but it is the best current capacity and
+throughput benchmark: about `$24m` TVL, about `$231m` 24h volume, volume/TVL near
+`9.55`, `4bps` fee tier, and about `139%` 24h fee APR. It tests whether a very large
+and very busy pool can compensate for low fee tier with turnover alone.
+
+The first public-RPC sample was dense in time but more expensive to land than
+SOL-ORCA:
+
+```text
+sample A: scanned 759 signatures, kept 187 normalized swaps, tx_errors=0
+span:     slot 429682709..429683021, tick span 26160..26162 after numeraire inversion
+window:   about 2.1 minutes
+```
+
+With `narrow_half_width=100`, `wide_half_width=1000`, `$10k` capital, and snapshot
+active liquidity, the full replay again looked attractive only before rolling-window
+checks:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | -$0.86 | $0.00 | $0.00 | $0.00 | ~-2161% | $9.95 |
+| narrow_rebalance | +$0.25 | +$1.10 | $1.11 | $0.55 | ~630% | $9.11 |
+| vol_scaled_rebalance | +$1.34 | +$2.20 | $2.20 | $1.09 | ~3386% | $8.26 |
+| delta_hedged | +$1.10 | +$1.96 | $1.11 | $0.55 | ~2781% | $0.21 |
+| hedged_wide | +$0.11 | +$0.97 | $0.11 | $0.06 | ~286% | $0.02 |
+
+The promotion gate rejected the sample. The lagged rule failed 25/40/60/80-swap
+windows with p05 APR about `-2854%`, `-1144%`, `-728%`, and `130%`. Direct
+`--gate-policy delta-hedged` rejected with p05 APR about `-2843%`, `-1032%`, `-687%`,
+and `159%`; `--gate-policy hedged-wide` reduced drawdown but only reached p05 APR
+about `-285%`, `-104%`, `-69%`, and `18%`.
+
+Interpretation: this is a high-capacity microburst sample, not a long-regime
+verdict. It does show that enormous volume is not enough by itself. Low fee tier can
+leave the fee-LVR edge too thin for the 500% left-tail gate once rolling windows and
+hold-edge checks are applied.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:
