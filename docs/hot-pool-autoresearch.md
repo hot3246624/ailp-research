@@ -820,6 +820,44 @@ active-bin liquidity. Therefore replay-grade DLMM observations now need one of:
 - add a documented approximation that maps average execution price to a bin id, but
   gate it as proxy-only until active-bin liquidity is reconstructed.
 
+### Meteora Flow/Snapshot Proxy Join
+
+The first bounded live-shadow join is now available:
+
+```bash
+node scripts/meteora-dlmm-join-flow-snapshots.cjs \
+  --flow data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.jsonl \
+  --snapshots data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.jsonl \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.latest.json \
+  --max-slot-distance 400 \
+  --active-bin-source flow-price
+
+cargo run -q -p autopool-cli -- replay-dlmm-bins \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.jsonl \
+  --half-width-bins 5 \
+  --capital-usd 1000
+```
+
+2026-06-30 live-shadow smoke:
+
+```text
+snapshot A: slot 429723287, active bin -6465, active liq ~$9,971
+flow scan:  scanned 51 signatures, decoded 20 swaps, tx_errors=0
+snapshot B: slot 429723404, active bin -6462, active liq ~$9,239
+join gate:  19 joined rows, 18 stale rows skipped, max distance 364 slots, avg 252 slots
+flow:       ~$68,467 joined notional, active-bin proxy -6465..-6461
+capacity:   $1k capital / ~$9,971 active-liq ~= 0.10x
+proxy PnL:  static/centered +$2.10 net, $2.50 fees, ~$0.39 maxDD over 19 rows
+```
+
+Do not read the printed `46988%` annualized APR as strategy performance: the window is
+only 19 swaps over roughly 140 seconds, and active liquidity is from nearest snapshots
+rather than historical bin-array state. This result matters because the data plumbing
+finally separates real non-overlapping flow from active-liquidity approximation and
+keeps old flow out via a slot-distance gate.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

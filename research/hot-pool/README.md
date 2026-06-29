@@ -386,6 +386,27 @@ and decoded `swap` instructions only contain `amountIn` / `minAmountOut`. We now
 need to join this flow stream to repeated active-bin snapshots or archival bin-array
 state.
 
+Flow/snapshot proxy join is now wired:
+
+```bash
+node scripts/meteora-dlmm-join-flow-snapshots.cjs \
+  --flow data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.jsonl \
+  --snapshots data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshots.jsonl \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-flow-proxy.latest.json \
+  --max-slot-distance 400 \
+  --active-bin-source flow-price
+```
+
+2026-06-30 live-shadow smoke: snapshot A at slot `429723287` had active bin `-6465`
+and active-liq about `$9,971`; snapshot B at slot `429723404` had active bin `-6462`
+and active-liq about `$9,239`. A fresh flow scan decoded 20 swaps from 51 signatures,
+and the join admitted 19 rows while skipping 18 stale rows. Joined flow notional was
+about `$68,467`; `$1k` capital was about `0.10x` active-bin liquidity. Proxy replay
+showed `+$2.10` net and `$0.39` max drawdown over 19 rows, but the printed annualized
+APR is not a strategy result because the window is tiny and active liquidity still
+comes from nearest snapshots.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
