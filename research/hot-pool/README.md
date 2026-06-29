@@ -231,6 +231,24 @@ supports `--gate-policy hedged-wide`; it still returned `reject_replay` with p05
 about `106%`, `-545%`, and `-1665%` across 15/25/40-swap families. Treat
 `SOL-CARDS` as an interesting Whirlpool lead for more data, not a strategy promotion.
 
+Orca `SOL-ORCA` coverage replay:
+
+```text
+sample A: scanned 106 signatures, kept 100 normalized swaps, tx_errors=0
+sample B: scanned 103 signatures, kept 100 normalized swaps, tx_errors=0
+merged:   200 unique swaps, slot span 429673585..429678365, tick span -28026..-27957
+```
+
+`SOL-ORCA` was selected from the refreshed queue as a broader Whirlpool coverage pass:
+~201% 24h fee APR, 16bps fee tier, ~$763k TVL, ~$2.6m 24h volume, and volume/TVL
+around 3.45. The full 200-row replay looked promising at first glance: `delta_hedged`
+was about `+$3.76` net with ~$1.03 max drawdown, while `vol_scaled_rebalance` showed
+about `+$8.86` net and ~1462% mechanical window APR. Rolling gates rejected it. The
+lagged gate failed 25/40/60/80-swap windows with p05 APR around `-426%`, `-478%`,
+`-431%`, and `-248%`, and negative mean edge versus hold. Direct `delta_hedged` and
+`hedged_wide` gates also rejected. Treat this as a useful warning: full-window APR can
+look investable while rolling left-tail and hold-edge metrics say no.
+
 Schema:
 
 ```text

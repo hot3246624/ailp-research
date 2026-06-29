@@ -541,6 +541,43 @@ short-window defensive APR read, but it is still not a strategy. It is a reason 
 collect more `SOL-CARDS` data and keep gating `hedged_wide`/defensive policies
 directly, not a reason to promote the pool.
 
+### Orca SOL-ORCA Replay
+
+The next Whirlpool coverage pass refreshed the Orca queue and selected `SOL-ORCA`
+because it had better heat than the already rejected SOL-PUMP/SOL-GRASS samples while
+still being replayable: about `201%` 24h fee APR, `16bps` fee tier, about `$763k` TVL,
+about `$2.6m` 24h volume, and volume/TVL around `3.45`. Sampling quality was high:
+
+```text
+sample A: scanned 106 signatures, kept 100 normalized swaps, tx_errors=0
+sample B: scanned 103 signatures, kept 100 normalized swaps, tx_errors=0
+merged:   200 unique swaps, slot span 429673585..429678365, tick span -28026..-27957
+```
+
+With SOL marked near `$73.38`, `narrow_half_width=384`, and snapshot active liquidity,
+the full 200-row replay looked superficially good but did not survive rolling-window
+gating:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | +$1.72 | $0.00 | $0.00 | $0.00 | ~283% | $29.28 |
+| narrow_rebalance | +$5.47 | +$3.76 | $3.76 | $2.11 | ~903% | $25.79 |
+| vol_scaled_rebalance | +$8.86 | +$7.15 | $7.16 | $3.88 | ~1462% | $22.43 |
+| delta_hedged | +$3.76 | +$2.04 | $3.76 | $2.11 | ~619% | $1.03 |
+| hedged_wide | +$0.63 | -$1.08 | $0.63 | $0.37 | ~104% | $0.16 |
+
+The expanded sample rejected the candidate under all gate views. The lagged rule
+failed 25/40/60/80-swap windows with win rates of about `47%`, `50%`, `43%`, and
+`50%`, negative mean edge versus hold, and p05 APR between about `-426%` and `-248%`.
+Direct `--gate-policy delta-hedged` also rejected with p05 APR about `-413%`, `-473%`,
+`-428%`, and `-217%`; `--gate-policy hedged-wide` reduced drawdown but had p05 APR
+only about `-61%`, `-71%`, `-65%`, and `-31%`.
+
+Interpretation: `SOL-ORCA` is useful because it demonstrates the current failure mode
+cleanly. A single full-window replay can show 600%-1400% mechanical APR while rolling
+windows still lose to hold on average. The promotion gate is doing real work here:
+this is a replay-based rejection, not a data-landing failure.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:
