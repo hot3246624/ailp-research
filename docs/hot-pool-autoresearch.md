@@ -1018,13 +1018,27 @@ MET-USDC and HYPE-USDC broadening:
 ```text
 MET-USDC 20bps: 25 decoded swaps, active-liq ~$998, 0 joined under 250-slot gate
 HYPE-USDC 20bps: active-liq ~$33.5k, 25 decoded swaps, 1 joined under 250-slot gate
-HYPE 400-slot scout: 23 joined, 2 windows, full proxy centered -$0.06 net, rolling scout passes with only 2 windows
+HYPE 400-slot scout: 23 joined, 2 windows, full proxy centered -$0.06 net
 ```
 
 MET is capacity-poor for `$1k` capital at the active bin. HYPE has better capacity
 than JUP and SOL, but the 250-slot gate still lacks enough near-slot rows; the 400-slot
-scout is internally mixed because the full 23-row proxy loses slightly while the two
-rolling windows pass. Treat HYPE as the next pool to keep sampling, not as promoted.
+scout is internally mixed and below promotion sample size. Treat HYPE as the next pool
+to keep sampling, not as promoted.
+
+The next HYPE refresh added only 5 fresh swap rows but widened the 400-slot proxy to 28
+joined rows and 3 rolling windows. It exposed a gate bug: the old p05 calculation used
+linear interpolation, so a 3-window sample with one deeply negative window could still
+show a positive p05. `percentile_f64` now uses conservative nearest-rank lower-tail
+percentiles. After the fix, the same HYPE 400-slot scout correctly rejects:
+
+```text
+centered: reject_proxy, meanNet -$1.20, meanVsH +$1.11, p05APR -11134%, cap/liq 0.03x
+static:   reject_proxy, meanNet -$1.10, meanVsH +$1.21, p05APR -10580%, cap/liq 0.03x
+```
+
+This is a genuine research improvement: the promotion gate now catches small-sample
+left tails instead of interpolating them away.
 
 ### Orca HYPE-USDC Replay
 

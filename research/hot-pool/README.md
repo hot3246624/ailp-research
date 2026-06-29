@@ -492,8 +492,15 @@ Broader Meteora checks: `MET-USDC` 20bps decoded 25 swaps but had active-bin liq
 around `$998` and 0 joined rows under the 250-slot gate, so capacity is poor for `$1k`.
 The higher-TVL `HYPE-USDC` 20bps pool had active-liq around `$33.5k`; strict 250-slot
 join admitted only 1 row, while 400-slot scout joined 23 rows. HYPE full proxy was
-slightly negative (`-$0.06` centered) but 2 rolling scout windows passed. HYPE is the
-next pool worth continued sampling; it is not promoted.
+slightly negative (`-$0.06` centered), so it remained unpromoted.
+
+The next HYPE refresh added only 5 fresh swaps but raised the 400-slot proxy to 28
+joined rows and 3 windows. That exposed a p05 gate issue: linear interpolation could
+hide one deeply negative window in a tiny sample. `percentile_f64` now uses conservative
+nearest-rank lower-tail percentiles. Replaying HYPE after the fix rejects centered and
+static on `left_tail_apr`; centered has mean net `-$1.20`, mean vs hold `+$1.11`, p05
+APR about `-11134%`, and cap/active-liq about `0.03x`. HYPE still has good capacity,
+but it is not promoted.
 
 Orca `HYPE-USDC` final P1 coverage replay:
 

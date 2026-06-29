@@ -9460,16 +9460,10 @@ fn percentile_f64(values: &[f64], percentile: f64) -> Option<f64> {
     }
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let index = (sorted.len() - 1) as f64 * percentile / 100.0;
-    let lower = index.floor() as usize;
-    let upper = index.ceil() as usize;
-    if lower == upper {
-        Some(sorted[lower])
-    } else {
-        let weight_upper = index - lower as f64;
-        let weight_lower = 1.0 - weight_upper;
-        Some(sorted[lower] * weight_lower + sorted[upper] * weight_upper)
-    }
+    let percentile = percentile.clamp(0.0, 100.0);
+    let rank = (percentile / 100.0 * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    Some(sorted[index])
 }
 
 fn decode_swap_tick_lossy(data: &str) -> Option<i32> {
@@ -10058,6 +10052,15 @@ mod tests {
                 "capacity".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn percentile_f64_uses_conservative_nearest_rank_tail() {
+        let values = vec![-11_134.22, 272_483.87, 9_947_820.75];
+
+        assert_eq!(percentile_f64(&values, 5.0), Some(-11_134.22));
+        assert_eq!(percentile_f64(&values, 50.0), Some(272_483.87));
+        assert_eq!(percentile_f64(&values, 95.0), Some(9_947_820.75));
     }
 
     fn hedge_rule_row_fixture(
