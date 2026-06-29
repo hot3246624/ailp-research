@@ -1040,6 +1040,24 @@ static:   reject_proxy, meanNet -$1.10, meanVsH +$1.21, p05APR -10580%, cap/liq 
 This is a genuine research improvement: the promotion gate now catches small-sample
 left tails instead of interpolating them away.
 
+Follow-up HYPE live-shadow refresh on the same `ANCx...` pool improved strict
+near-slot coverage but did not change the strategy verdict. With a 250-slot join
+gate, the accumulated stream reached 80 flow rows, 10 joined rows, and 10 snapshots,
+still below the 15-observation minimum for a rolling window. The 400-slot preliminary
+join reached 32 rows and 4 windows, but both DLMM policies again rejected on
+`left_tail_apr`:
+
+```text
+centered: reject_proxy, meanNet -$1.72, meanVsH +$1.01, p05APR -11134%, cap/liq 0.03x
+static:   reject_proxy, meanNet -$1.68, meanVsH +$1.05, p05APR -10580%, cap/liq 0.03x
+```
+
+HYPE remains useful for capacity/live-shadow plumbing because active-bin liquidity is
+around `$33k`, but the current evidence is not a promotion signal. The next useful
+bounded run is either one more strict 250-slot HYPE collection to reach the first
+near-slot window, or a switch to another high-capacity Meteora USDC pool if HYPE keeps
+replaying the same left-tail failure.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

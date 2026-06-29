@@ -502,6 +502,14 @@ static on `left_tail_apr`; centered has mean net `-$1.20`, mean vs hold `+$1.11`
 APR about `-11134%`, and cap/active-liq about `0.03x`. HYPE still has good capacity,
 but it is not promoted.
 
+A follow-up HYPE refresh improved strict near-slot coverage to 10 joined rows from 80
+flow rows under the 250-slot gate, still below the 15-row rolling window minimum. The
+400-slot preliminary view reached 32 joined rows and 4 windows, but centered/static
+again rejected on `left_tail_apr`: centered mean net `-$1.72`, mean vs hold `+$1.01`,
+p05 APR about `-11134%`; static mean net `-$1.68`, mean vs hold `+$1.05`, p05 APR
+about `-10580%`; cap/active-liq stayed about `0.03x`. HYPE is capacity-good but still
+not strategy-approved.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
