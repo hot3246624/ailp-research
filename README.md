@@ -134,6 +134,9 @@ fee APR, but every idea must beat hold/passive-wide/narrow baselines after LVR,
 churn, slippage, hedge cost, capacity, and operational risk. The `hot-pool-candidates`
 command now turns protocol API scans into a ranked replay/API-validation queue and
 demotes rows whose reported APR fails the simple fee×turnover sanity check.
+It also carries protocol price-risk flags such as Raydium 24h price range, so hot
+pools with attractive fees but violent inventory drift are not treated as clean
+strategy wins.
 `hot-pool-experiment-plan` converts that queue into replay manifests: Orca/Raydium
 CLMM pools are routed to normalized-swap collection, while Meteora DLMM pools are
 blocked behind a separate bin-replay adapter instead of being forced through v3

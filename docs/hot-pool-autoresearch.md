@@ -102,6 +102,11 @@ If reported APR is much larger than this formula, the row gets
 Meteora `JLP-USDC` row that reported ~985% APR even though 3 bps fee and ~0.88x
 daily volume/TVL imply only about 9.6% fee APR from the simple formula.
 
+The queue also carries price-risk warnings when protocol APIs expose them. For
+Raydium CLMM, `wide_price_range_24h` is raised when day `priceMin/priceMax` imply
+a 25%+ range. That does not discard the pool; it flags that any narrow strategy
+must prove fee income beats LVR and rebalance risk.
+
 Recent cleaner replay candidates:
 
 | priority | venue | symbol | fee APR | volume/TVL | note |

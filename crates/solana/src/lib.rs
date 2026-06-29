@@ -91,6 +91,10 @@ pub struct SolanaPoolCandidate {
     pub reward_apr: Option<f64>,
     pub total_apr: Option<f64>,
     pub current_price: Option<f64>,
+    pub price_min_24h: Option<f64>,
+    pub price_max_24h: Option<f64>,
+    pub price_range_24h_pct: Option<f64>,
+    pub price_change_24h_pct: Option<f64>,
     pub current_tick: Option<Tick>,
     pub active_liquidity: Option<String>,
     pub updated_slot: Option<u64>,
@@ -317,6 +321,11 @@ fn parse_orca_pool(pool: &Value) -> Option<SolanaPoolCandidate> {
         reward_apr: None,
         total_apr: fee_apr_24h,
         current_price: f64_at(pool, &["price"]),
+        price_min_24h: None,
+        price_max_24h: None,
+        price_range_24h_pct: None,
+        price_change_24h_pct: f64_at(pool, &["stats", "24h", "priceDelta"])
+            .map(fractionish_to_percent),
         current_tick: i32_at(pool, &["tickCurrentIndex"]),
         active_liquidity: string_at(pool, &["liquidity"]),
         updated_slot: u64_at(pool, &["updatedSlot"]),
@@ -356,6 +365,8 @@ fn parse_raydium_pool(pool: &Value) -> Option<SolanaPoolCandidate> {
         f64_at(pool, &["day", "feeApr"]).or_else(|| fee_apr_from_fees(fees_usd_24h, tvl_usd, 1.0));
     let fee_apr_7d =
         f64_at(pool, &["week", "feeApr"]).or_else(|| fee_apr_from_fees(fees_usd_7d, tvl_usd, 7.0));
+    let price_min_24h = f64_at(pool, &["day", "priceMin"]);
+    let price_max_24h = f64_at(pool, &["day", "priceMax"]);
     let symbol = format!("{}-{}", token_a.symbol, token_b.symbol);
     let mut row = SolanaPoolCandidate {
         venue: SolanaVenue::RaydiumClmm,
@@ -377,6 +388,10 @@ fn parse_raydium_pool(pool: &Value) -> Option<SolanaPoolCandidate> {
         reward_apr,
         total_apr: f64_at(pool, &["day", "apr"]),
         current_price: f64_at(pool, &["price"]),
+        price_min_24h,
+        price_max_24h,
+        price_range_24h_pct: price_range_pct(price_min_24h, price_max_24h),
+        price_change_24h_pct: None,
         current_tick: None,
         active_liquidity: None,
         updated_slot: None,
@@ -444,6 +459,10 @@ fn parse_meteora_pool(pool: &Value) -> Option<SolanaPoolCandidate> {
         reward_apr,
         total_apr: fee_apr_24h,
         current_price: f64_at(pool, &["current_price"]),
+        price_min_24h: None,
+        price_max_24h: None,
+        price_range_24h_pct: None,
+        price_change_24h_pct: None,
         current_tick: None,
         active_liquidity: None,
         updated_slot: None,
@@ -475,6 +494,12 @@ fn finalize_candidate(row: &mut SolanaPoolCandidate) {
     }
     if row.fee_apr_24h.unwrap_or(0.0) > 1_000.0 {
         row.warnings.push("fee_apr_outlier".to_string());
+    }
+    if row.price_range_24h_pct.unwrap_or(0.0) >= 25.0 {
+        row.warnings.push("wide_price_range_24h".to_string());
+    }
+    if row.price_change_24h_pct.unwrap_or(0.0).abs() >= 25.0 {
+        row.warnings.push("large_price_move_24h".to_string());
     }
     if major_token_score(&row.tokens) < 0.5 {
         row.warnings.push("long_tail_inventory".to_string());
@@ -539,6 +564,15 @@ fn fee_apr_from_fees(fees: Option<Usd>, tvl_usd: Usd, days: f64) -> Option<f64> 
         return None;
     }
     Some(fees / tvl_usd / days * 365.0 * 100.0)
+}
+
+fn price_range_pct(min: Option<f64>, max: Option<f64>) -> Option<f64> {
+    let min = min?;
+    let max = max?;
+    if min <= 0.0 || max < min {
+        return None;
+    }
+    Some((max / min - 1.0) * 100.0)
 }
 
 fn orca_fee_rate_to_bps(raw: f64) -> Bps {
@@ -659,5 +693,13 @@ mod tests {
         assert_eq!(f64_at(&value, &["string"]), Some(123.45));
         assert_eq!(f64_at(&value, &["number"]), Some(456.0));
         assert_eq!(bool_at(&value, &["nested", "flag"]), Some(true));
+    }
+
+    #[test]
+    fn computes_price_range_percent() {
+        let range = price_range_pct(Some(80.0), Some(100.0)).unwrap();
+        assert!((range - 25.0).abs() < 1e-9);
+        assert_eq!(price_range_pct(Some(0.0), Some(100.0)), None);
+        assert_eq!(price_range_pct(Some(100.0), Some(80.0)), None);
     }
 }
