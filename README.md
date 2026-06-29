@@ -128,6 +128,10 @@ and day-over-day validation. `solana-discover` is the stricter protocol-API laye
 it reads Orca Whirlpools, Raydium CLMM, and Meteora DLMM directly, normalizes fee
 units/APR fields, applies an outlier cap, and writes the executable candidate rows
 for replay/RPC enrichment.
+`docs/hot-pool-autoresearch.md` defines the strategy-development protocol for the
+highest-upside hypothesis: hot, high-fee, high-flow pools may show 2,000%+ gross
+fee APR, but every idea must beat hold/passive-wide/narrow baselines after LVR,
+churn, slippage, hedge cost, capacity, and operational risk.
 
 ## External References
 

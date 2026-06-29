@@ -1,6 +1,7 @@
 /target/
 /data/
 /logs/
+research/hot-pool/results.tsv
 .env
 .DS_Store
 *.log
