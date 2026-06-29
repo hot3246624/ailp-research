@@ -963,6 +963,41 @@ mechanical APR was about `-1,250%`, so the default gate rejected it for
 `pass_proxy_gate` as the current SOL-USDC read: the pool remains interesting, but not
 strategy-approved.
 
+Second strict refresh kept the same failure mode:
+
+```text
+snapshot before: slot 429745397, active bin -6459, active-liq ~$9,673
+flow scan:       scanned 93 signatures, decoded 25 swaps, tx_errors=0
+snapshot after:  slot 429745519, active bin -6459, active-liq ~$9,700
+join gate:       114 flow rows, 10 snapshots, 50 joined, 64 stale skipped
+slot distance:   max 242, avg 128.0, max allowed 250
+full proxy:      centered +$4.29 net, $4.39 fees, $3.30 maxDD, 3 rebalances
+rolling gate:    centered/static/hold all reject_proxy
+```
+
+Centered still had positive mean edge (`+$0.84` versus hold), but failed
+`left_tail_apr` again with p05 mechanical APR about `-1,245%`; static failed the same
+left-tail gate with p05 about `-1,115%`. Two consecutive strict refreshes now reject
+SOL-USDC, so the next useful path is either a different Meteora USDC pair or a longer
+strict live-shadow sample that proves the left tail recovers.
+
+Current Meteora candidate refresh put `JUP-USDC` at the top of the USDC-numeraire queue
+after excluding SOL-USDC: about `$916k` TVL, `$5.7m` 24h volume, `717%` fee APR, and
+volume/TVL around `6.22`. Initial JUP live-shadow sampling decoded 25 swaps from 67
+signatures with `0` tx errors and active-bin liquidity around `$25k`, but all flow rows
+were outside the 250-slot join gate. A second small run skipped replay cleanly:
+
+```text
+JUP-USDC snapshots: 4
+flow rows:          25
+joined rows:        0 under 250-slot max distance
+status:             replay skipped; no live-shadow window
+```
+
+That is not a strategy rejection; it is a near-slot data availability rejection under
+the strict live-shadow gate. The runner now exits cleanly when joined rows cannot
+produce enough rolling windows.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

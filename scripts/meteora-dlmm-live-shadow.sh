@@ -168,13 +168,32 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
 
   echo
   echo "== join flow/snapshots =="
-  node "${ROOT}/scripts/meteora-dlmm-join-flow-snapshots.cjs" \
+  JOIN_SUMMARY="$(node "${ROOT}/scripts/meteora-dlmm-join-flow-snapshots.cjs" \
     --flow "${FLOW}" \
     --snapshots "${SNAPSHOTS}" \
     --out "${PROXY}" \
     --raw-out "${PROXY_LATEST}" \
     --max-slot-distance "${MAX_SLOT_DISTANCE}" \
-    --active-bin-source flow-price
+    --active-bin-source flow-price)"
+  echo "${JOIN_SUMMARY}"
+  JOINED_ROWS="$(node -e 'const input=JSON.parse(process.argv[1]); console.log(Number(input.joined_rows || 0));' "${JOIN_SUMMARY}")"
+  if [[ "${JOINED_ROWS}" -lt "${WINDOW_OBSERVATIONS}" ]]; then
+    echo
+    echo "== replay skipped =="
+    echo "joined_rows=${JOINED_ROWS} is below window_observations=${WINDOW_OBSERVATIONS}; no replay-grade live-shadow window under current slot-distance gate"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "report=${REPORT_OUT}"
+    exit 0
+  fi
+  POSSIBLE_WINDOWS="$((1 + (JOINED_ROWS - WINDOW_OBSERVATIONS) / STEP_OBSERVATIONS))"
+  if [[ "${POSSIBLE_WINDOWS}" -lt "${MIN_WINDOWS}" ]]; then
+    echo
+    echo "== replay skipped =="
+    echo "joined_rows=${JOINED_ROWS} can produce ${POSSIBLE_WINDOWS} windows, below min_windows=${MIN_WINDOWS}; collect more live-shadow rows before promotion gate"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "report=${REPORT_OUT}"
+    exit 0
+  fi
 
   echo
   echo "== full proxy replay =="

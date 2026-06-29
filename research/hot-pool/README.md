@@ -468,6 +468,20 @@ centered failed only `left_tail_apr` with p05 about `-1,250%`; static also faile
 `left_tail_apr` with p05 about `-1,134%`. Current SOL-USDC status is therefore
 `proxy_candidate_rejected_on_latest_strict_refresh`, not strategy-approved.
 
+Second strict SOL-USDC refresh confirmed the left-tail problem: 93 scanned signatures
+produced 25 swaps with 0 tx errors; the 250-slot join admitted 50 rows from 114 total
+flow rows and 10 snapshots. Full proxy centered improved to `+$4.29` net and `$4.39`
+fees, but rolling 15-row/5-step gate again rejected all policies. Centered failed only
+`left_tail_apr` with p05 about `-1,245%`; static failed the same gate with p05 about
+`-1,115%`. Two consecutive strict refreshes reject SOL-USDC.
+
+The refreshed Meteora queue made `JUP-USDC` the next USDC-numeraire candidate after
+SOL-USDC: about `$916k` TVL, `$5.7m` 24h volume, `717%` fee APR, and volume/TVL near
+`6.22`. Initial JUP live-shadow decoded 25 swaps from 67 signatures with 0 tx errors
+and active-bin liquidity around `$25k`, but every flow row sat outside the 250-slot
+join gate. A second small run also produced 0 joined rows and now exits cleanly with
+`replay skipped`; this is near-slot data insufficiency, not a strategy rejection.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
