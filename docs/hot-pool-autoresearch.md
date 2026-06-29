@@ -360,20 +360,27 @@ JSONL files and rewrites a stable sorted replay stream. Merging the original sam
 the fresh refresh, and one older paginated refresh produced 231 input rows, 171
 unique normalized swaps, and 60 duplicates across overlapping samples.
 
-Current best read on the 171-row merged segment:
+Next cursor extension (`before=4TXQ...KWbp`) added 28 normalized swaps and extended
+the span to block/slot `429588437..429604170`. The four-file merge has 259 input
+rows, 182 unique normalized swaps, and 77 duplicates. This mostly extends the segment
+backward a little and adds density around the existing regime; it is still not a
+long independent sample.
+
+Current best read on the 182-row merged segment:
 
 | combined sample | lagged rule map | windows | win vs hold | mean vs hold | p05 APR | worst DD |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 40 swaps / 15 step | range=1.00, volatile=1.00 | 8 | 62% | +$5.61 | ~-6% | $13.31 |
-| 25 swaps / 10 step | range=1.00, volatile=1.00 | 14 | 71% | +$1.53 | ~612% | $9.99 |
-| 25 swaps / 10 step | range=0.75, volatile=0.75 | 14 | 71% | +$2.13 | ~-881% | $6.06 |
+| 25 swaps / 10 step | range=1.00, volatile=1.00 | 15 | 60% | +$0.87 | ~541% | $10.49 |
+| 40 swaps / 15 step | range=1.00, volatile=1.00 | 9 | 67% | +$7.74 | ~-810% | $14.08 |
+| 60 swaps / 20 step | range=1.00, volatile=1.00 | 6 | 67% | +$11.55 | ~-185% | $15.30 |
 
 Interpretation: the conservative 1.00 range/volatile hedge is now the better default
 for the lagged rule, but the evidence is still small, uses overlapping windows, and
 mostly densifies one short wall-clock regime rather than extending far back in time.
-The global policy score still favors `delta_hedged` in both the 25/10 and 40/15
-merged-window checks. The next bottleneck remains more normalized Raydium windows
-across older cursors and then a true shadow monitor, not more in-sample rule tweaking.
+The 25-swap view remains promising, but the 40- and 60-swap views show negative
+left tails. Treat the rule as a candidate state machine, not a deployable strategy.
+The next bottleneck remains more normalized Raydium windows across older cursors and
+then a true shadow monitor, not more in-sample rule tweaking.
 
 ## Autoresearch Rules Adapted To AILP
 
