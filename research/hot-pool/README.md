@@ -42,6 +42,19 @@ cargo run -p autopool-cli -- replay-normalized-swaps \
   --swaps data/solana/hot-pool/swaps/<pool>/swaps.jsonl
 ```
 
+Solana proxy replay, used before tick-by-tick replay is available:
+
+```bash
+cargo run -p autopool-cli -- solana-proxy-replay \
+  --min-tvl-usd 50000 \
+  --min-volume-usd-24h 25000 \
+  --min-fee-apr 100 \
+  --max-fee-apr 5000 \
+  --min-volume-tvl-24h 0.5 \
+  --capital-usd 10000 \
+  --output data/solana/proxy/latest.json
+```
+
 Schema:
 
 ```text

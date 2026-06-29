@@ -162,6 +162,9 @@ Current implementation boundary:
 
 - `hot-pool-experiment-plan` writes replay specs and blocks pools without the right
   adapter.
+- `solana-proxy-replay` runs the first Solana business-flow estimate from protocol
+  pool stats: range-width assumption, fee capture, churn cost, net APR proxy, and
+  risk grade.
 - Orca Whirlpool and Raydium CLMM should emit normalized `SwapObs` JSONL first;
   this can reuse the existing tick/range replay engine.
 - Meteora DLMM needs a bin replay engine and should stay out of `SwapObs`/v3 math

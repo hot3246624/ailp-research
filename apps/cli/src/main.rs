@@ -8,7 +8,9 @@ use autopool_aerodrome::{
 use autopool_core::YieldSnapshot;
 use autopool_defillama::{DefiLlamaClient, DefiLlamaPool, PoolFilter};
 use autopool_evm::{BURN_TOPIC, COLLECT_TOPIC, JsonRpcClient, MINT_TOPIC, SWAP_TOPIC};
-use autopool_solana::{DiscoveryOptions, SolanaDiscoveryClient, SolanaPoolCandidate, SolanaVenue};
+use autopool_solana::{
+    DiscoveryOptions, SolanaDiscoveryClient, SolanaPoolCandidate, SolanaToken, SolanaVenue,
+};
 use autopool_strategy::WeightedRiskModel;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -238,6 +240,47 @@ enum Command {
         /// Also write per-pool replay spec sidecars under `data_dir/specs`.
         #[arg(long, default_value_t = false)]
         write_specs: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Run a Solana protocol-API proxy replay. This is the first end-to-end
+    /// business-flow estimate: pool stats -> range width -> fee capture -> churn
+    /// cost -> risk. It is not a substitute for tick-by-tick replay.
+    SolanaProxyReplay {
+        #[arg(long = "venue", value_enum)]
+        venues: Vec<SolanaDiscoverVenue>,
+        #[arg(long, default_value_t = 50_000.0)]
+        min_tvl_usd: f64,
+        #[arg(long, default_value_t = 25_000.0)]
+        min_volume_usd_24h: f64,
+        #[arg(long, default_value_t = 100.0)]
+        min_fee_apr: f64,
+        #[arg(long, default_value_t = 5_000.0)]
+        max_fee_apr: f64,
+        #[arg(long, default_value_t = 0.5)]
+        min_volume_tvl_24h: f64,
+        #[arg(long, default_value_t = 120)]
+        page_size: usize,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital_usd: f64,
+        /// Range half-width as percent around current price. Repeatable.
+        #[arg(long = "half-width-pct", default_values_t = [2.5, 5.0, 10.0, 20.0])]
+        half_width_pct: Vec<f64>,
+        /// Cap the concentration multiplier because protocol APIs do not expose
+        /// local active liquidity distributions.
+        #[arg(long, default_value_t = 12.0)]
+        max_concentration: f64,
+        #[arg(long, default_value_t = 5.0)]
+        rebalance_slippage_bps: f64,
+        #[arg(long, default_value_t = 0.002)]
+        rebalance_tx_cost_usd: f64,
+        #[arg(long, default_value_t = 12)]
+        max_rebalances_per_day: u32,
+        /// Optional JSON output path for the proxy replay rows.
+        #[arg(long)]
+        output: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -931,6 +974,44 @@ async fn main() -> Result<()> {
             write_specs,
             format,
         })?,
+        Command::SolanaProxyReplay {
+            venues,
+            min_tvl_usd,
+            min_volume_usd_24h,
+            min_fee_apr,
+            max_fee_apr,
+            min_volume_tvl_24h,
+            page_size,
+            limit,
+            capital_usd,
+            half_width_pct,
+            max_concentration,
+            rebalance_slippage_bps,
+            rebalance_tx_cost_usd,
+            max_rebalances_per_day,
+            output,
+            format,
+        } => {
+            solana_proxy_replay(SolanaProxyReplayArgs {
+                venues,
+                min_tvl_usd,
+                min_volume_usd_24h,
+                min_fee_apr,
+                max_fee_apr,
+                min_volume_tvl_24h,
+                page_size,
+                limit,
+                capital_usd,
+                half_width_pct,
+                max_concentration,
+                rebalance_slippage_bps,
+                rebalance_tx_cost_usd,
+                max_rebalances_per_day,
+                output,
+                format,
+            })
+            .await?
+        }
         Command::SampleBaseNetwork {
             rpc_url,
             rebalance_gas_units,
@@ -1937,6 +2018,61 @@ struct HotPoolExperimentRow {
     spec: ReplayPoolSpec,
 }
 
+#[derive(Debug, Clone)]
+struct SolanaProxyReplayArgs {
+    venues: Vec<SolanaDiscoverVenue>,
+    min_tvl_usd: f64,
+    min_volume_usd_24h: f64,
+    min_fee_apr: f64,
+    max_fee_apr: f64,
+    min_volume_tvl_24h: f64,
+    page_size: usize,
+    limit: usize,
+    capital_usd: f64,
+    half_width_pct: Vec<f64>,
+    max_concentration: f64,
+    rebalance_slippage_bps: f64,
+    rebalance_tx_cost_usd: f64,
+    max_rebalances_per_day: u32,
+    output: Option<PathBuf>,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SolanaProxyReplayRow {
+    venue: String,
+    symbol: String,
+    pool_address: String,
+    pool_kind: String,
+    fee_bps: Option<f64>,
+    tvl_usd: f64,
+    volume_usd_24h: f64,
+    volume_tvl_24h: f64,
+    pool_fee_apr_24h: f64,
+    pool_fee_apr_7d: Option<f64>,
+    price_range_24h_pct: Option<f64>,
+    price_change_24h_pct: Option<f64>,
+    modeled_price_range_pct: Option<f64>,
+    business_status: String,
+    best: SolanaProxyScenario,
+    scenarios: Vec<SolanaProxyScenario>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SolanaProxyScenario {
+    half_width_pct: f64,
+    estimated_concentration: f64,
+    no_rebalance_occupancy: f64,
+    estimated_rebalances_per_day: u32,
+    gross_fee_apr_proxy: f64,
+    churn_cost_apr: f64,
+    net_fee_apr_proxy: f64,
+    max_inventory_drawdown_proxy_pct: f64,
+    risk_grade: String,
+    verdict: String,
+}
+
 async fn hot_pool_candidates(args: HotPoolCandidateArgs) -> Result<()> {
     let venues = if args.venues.is_empty() {
         vec![
@@ -2180,6 +2316,311 @@ fn hot_pool_priority(
         "P1_replay_queue".to_string(),
         "replay_baselines".to_string(),
     )
+}
+
+async fn solana_proxy_replay(args: SolanaProxyReplayArgs) -> Result<()> {
+    let venues = if args.venues.is_empty() {
+        vec![
+            SolanaVenue::OrcaWhirlpool,
+            SolanaVenue::RaydiumClmm,
+            SolanaVenue::MeteoraDlmm,
+        ]
+    } else {
+        args.venues.iter().copied().map(Into::into).collect()
+    };
+    let options = DiscoveryOptions {
+        min_tvl_usd: args.min_tvl_usd,
+        page_size: args.page_size,
+    };
+    let client = SolanaDiscoveryClient::default();
+    let mut rows = client
+        .discover_many(&venues, &options)
+        .await?
+        .into_iter()
+        .filter_map(|candidate| solana_proxy_replay_row(candidate, &args))
+        .collect::<Vec<_>>();
+
+    rows.sort_by(|left, right| {
+        right
+            .best
+            .net_fee_apr_proxy
+            .total_cmp(&left.best.net_fee_apr_proxy)
+    });
+    let limited_rows = rows.into_iter().take(args.limit).collect::<Vec<_>>();
+
+    if let Some(output) = args.output.as_ref() {
+        if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating output directory {}", parent.display()))?;
+        }
+        fs::write(output, serde_json::to_string_pretty(&limited_rows)?)
+            .with_context(|| format!("writing Solana proxy replay {}", output.display()))?;
+    }
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&limited_rows)?);
+        return Ok(());
+    }
+
+    println!(
+        "solana proxy replay venues={:?} capital=${:.0} hw={:?}% filters: tvl>={:.0} vol24h>={:.0} fee_apr={:.1}%..{:.1}% vol/tvl>={:.2}",
+        venues.iter().map(|venue| venue.label()).collect::<Vec<_>>(),
+        args.capital_usd,
+        args.half_width_pct,
+        args.min_tvl_usd,
+        args.min_volume_usd_24h,
+        args.min_fee_apr,
+        args.max_fee_apr,
+        args.min_volume_tvl_24h,
+    );
+    println!(
+        "{:<8} {:<22} {:>7} {:>8} {:>8} {:>8} {:>8} {:>7} {:>6} {:>9} {:>9} {:<9}  verdict",
+        "venue",
+        "symbol",
+        "feeAPR",
+        "range24",
+        "bestHW",
+        "conc",
+        "gross",
+        "cost",
+        "reb/d",
+        "netAPR",
+        "ddProxy",
+        "risk"
+    );
+    for row in &limited_rows {
+        println!(
+            "{:<8} {:<22} {:>6.1}% {:>7} {:>7.1}% {:>8.2} {:>7.0}% {:>6.1}% {:>6} {:>8.0}% {:>8.1}% {:<9}  {}",
+            row.venue,
+            row.symbol,
+            row.pool_fee_apr_24h,
+            row.modeled_price_range_pct
+                .map(|value| format!("{value:.1}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            row.best.half_width_pct,
+            row.best.estimated_concentration,
+            row.best.gross_fee_apr_proxy,
+            row.best.churn_cost_apr,
+            row.best.estimated_rebalances_per_day,
+            row.best.net_fee_apr_proxy,
+            row.best.max_inventory_drawdown_proxy_pct,
+            row.best.risk_grade,
+            row.best.verdict
+        );
+    }
+
+    Ok(())
+}
+
+fn solana_proxy_replay_row(
+    candidate: SolanaPoolCandidate,
+    args: &SolanaProxyReplayArgs,
+) -> Option<SolanaProxyReplayRow> {
+    let fee_apr = candidate.fee_apr_24h?;
+    let volume = candidate.volume_usd_24h?;
+    if candidate.tvl_usd < args.min_tvl_usd
+        || volume < args.min_volume_usd_24h
+        || fee_apr < args.min_fee_apr
+        || fee_apr > args.max_fee_apr
+    {
+        return None;
+    }
+    let volume_tvl = if candidate.tvl_usd > 0.0 {
+        volume / candidate.tvl_usd
+    } else {
+        0.0
+    };
+    if volume_tvl < args.min_volume_tvl_24h {
+        return None;
+    }
+
+    let modeled_range = modeled_price_range_pct(&candidate);
+    let mut scenarios = args
+        .half_width_pct
+        .iter()
+        .copied()
+        .filter(|half_width| *half_width > 0.0)
+        .map(|half_width| solana_proxy_scenario(&candidate, half_width, modeled_range, args))
+        .collect::<Vec<_>>();
+    if scenarios.is_empty() {
+        return None;
+    }
+    scenarios.sort_by(|left, right| right.net_fee_apr_proxy.total_cmp(&left.net_fee_apr_proxy));
+    let best = scenarios[0].clone();
+    let business_status = if candidate.venue == SolanaVenue::MeteoraDlmm {
+        "proxy_only_requires_dlmm_replay".to_string()
+    } else if modeled_range.is_none() {
+        "proxy_fee_only_missing_price_range".to_string()
+    } else {
+        "proxy_ready_needs_tick_replay".to_string()
+    };
+
+    Some(SolanaProxyReplayRow {
+        venue: candidate.venue.label().to_string(),
+        symbol: candidate.symbol,
+        pool_address: candidate.pool_address,
+        pool_kind: candidate.pool_kind,
+        fee_bps: candidate.fee_bps,
+        tvl_usd: candidate.tvl_usd,
+        volume_usd_24h: volume,
+        volume_tvl_24h: volume_tvl,
+        pool_fee_apr_24h: fee_apr,
+        pool_fee_apr_7d: candidate.fee_apr_7d,
+        price_range_24h_pct: candidate.price_range_24h_pct,
+        price_change_24h_pct: candidate.price_change_24h_pct,
+        modeled_price_range_pct: modeled_range,
+        business_status,
+        best,
+        scenarios,
+        warnings: candidate.warnings,
+    })
+}
+
+fn solana_proxy_scenario(
+    candidate: &SolanaPoolCandidate,
+    half_width_pct: f64,
+    modeled_range_pct: Option<f64>,
+    args: &SolanaProxyReplayArgs,
+) -> SolanaProxyScenario {
+    let range_log = modeled_range_pct
+        .map(|pct| (1.0 + pct.max(0.0) / 100.0).ln())
+        .unwrap_or(0.0);
+    let half_log = (1.0 + half_width_pct.max(0.0) / 100.0).ln();
+    let band_log = (2.0 * half_log).max(1e-9);
+    let range_over_band = if range_log > 0.0 {
+        (range_log / band_log).max(1.0)
+    } else {
+        1.0
+    };
+    let estimated_concentration = range_over_band.min(args.max_concentration.max(1.0));
+    let no_rebalance_occupancy = if range_log > 0.0 {
+        (band_log / range_log).min(1.0)
+    } else {
+        1.0
+    };
+    let estimated_rebalances_per_day = if range_log > band_log {
+        (range_log / band_log).ceil() as u32 - 1
+    } else {
+        0
+    };
+    let executable_rebalances = estimated_rebalances_per_day.min(args.max_rebalances_per_day);
+    let rebalance_coverage = if estimated_rebalances_per_day == 0 {
+        1.0
+    } else {
+        executable_rebalances as f64 / estimated_rebalances_per_day as f64
+    };
+    let pool_fee_apr = candidate.fee_apr_24h.unwrap_or_default();
+    let gross_fee_apr_proxy = pool_fee_apr * estimated_concentration * rebalance_coverage;
+    let per_rebalance_cost_usd = args.rebalance_tx_cost_usd
+        + args.capital_usd * 0.5 * args.rebalance_slippage_bps / 10_000.0;
+    let churn_cost_apr = if args.capital_usd > 0.0 {
+        per_rebalance_cost_usd * estimated_rebalances_per_day as f64 * 365.0 / args.capital_usd
+            * 100.0
+    } else {
+        0.0
+    };
+    let net_fee_apr_proxy = (gross_fee_apr_proxy - churn_cost_apr).max(0.0);
+    let max_inventory_drawdown_proxy_pct =
+        inventory_drawdown_proxy_pct(modeled_range_pct, half_width_pct, candidate);
+    let risk_grade = if modeled_range_pct.is_none() {
+        "unknown".to_string()
+    } else {
+        proxy_risk_grade(
+            max_inventory_drawdown_proxy_pct,
+            estimated_rebalances_per_day,
+            half_width_pct,
+            candidate,
+        )
+    };
+    let verdict = proxy_verdict(net_fee_apr_proxy, &risk_grade, candidate);
+
+    SolanaProxyScenario {
+        half_width_pct,
+        estimated_concentration,
+        no_rebalance_occupancy,
+        estimated_rebalances_per_day,
+        gross_fee_apr_proxy,
+        churn_cost_apr,
+        net_fee_apr_proxy,
+        max_inventory_drawdown_proxy_pct,
+        risk_grade,
+        verdict,
+    }
+}
+
+fn modeled_price_range_pct(candidate: &SolanaPoolCandidate) -> Option<f64> {
+    candidate.price_range_24h_pct.or_else(|| {
+        candidate
+            .price_change_24h_pct
+            .map(|change| (change.abs() * 2.0).max(change.abs()))
+    })
+}
+
+fn inventory_drawdown_proxy_pct(
+    modeled_range_pct: Option<f64>,
+    half_width_pct: f64,
+    candidate: &SolanaPoolCandidate,
+) -> f64 {
+    let range =
+        modeled_range_pct.unwrap_or_else(|| candidate.price_change_24h_pct.unwrap_or(0.0).abs());
+    let out_of_range_move = (range / 2.0 - half_width_pct).max(0.0);
+    let il = constant_product_il_pct(range / 100.0);
+    (il + out_of_range_move * 0.65).max(il).min(100.0)
+}
+
+fn constant_product_il_pct(abs_move_fraction: f64) -> f64 {
+    let up = 1.0 + abs_move_fraction.max(0.0);
+    if up <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - 2.0 * up.sqrt() / (1.0 + up)) * 100.0
+}
+
+fn proxy_risk_grade(
+    drawdown_pct: f64,
+    rebalances_per_day: u32,
+    half_width_pct: f64,
+    candidate: &SolanaPoolCandidate,
+) -> String {
+    let long_tail = solana_major_token_score(&candidate.tokens) < 0.5;
+    if drawdown_pct >= 20.0 || rebalances_per_day > 12 || (long_tail && half_width_pct <= 5.0) {
+        "severe".to_string()
+    } else if drawdown_pct >= 10.0 || rebalances_per_day > 6 || long_tail {
+        "high".to_string()
+    } else if drawdown_pct >= 5.0 || rebalances_per_day > 2 {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    }
+}
+
+fn solana_major_token_score(tokens: &[SolanaToken]) -> f64 {
+    let majors = [
+        "SOL", "WSOL", "USDC", "USDT", "JUP", "JTO", "JITOSOL", "BONK", "WIF", "RAY",
+    ];
+    let count = tokens
+        .iter()
+        .filter(|token| majors.contains(&token.symbol.to_ascii_uppercase().as_str()))
+        .count();
+    match count {
+        0 => 0.0,
+        1 => 0.5,
+        _ => 1.0,
+    }
+}
+
+fn proxy_verdict(net_apr: f64, risk_grade: &str, candidate: &SolanaPoolCandidate) -> String {
+    if candidate.venue == SolanaVenue::MeteoraDlmm {
+        return "needs_dlmm_replay".to_string();
+    }
+    match risk_grade {
+        "unknown" => "needs_price_range_or_replay".to_string(),
+        "severe" if net_apr >= 1_000.0 => "shadow_only_tail_risk".to_string(),
+        "severe" => "reject_until_replay".to_string(),
+        "high" if net_apr >= 500.0 => "candidate_shadow".to_string(),
+        "medium" | "low" if net_apr >= 200.0 => "candidate_replay".to_string(),
+        _ => "weak_after_risk".to_string(),
+    }
 }
 
 fn hot_pool_experiment_plan(args: HotPoolExperimentArgs) -> Result<()> {
@@ -5437,6 +5878,25 @@ mod tests {
         assert!(requirements.contains(&"dlmm_bin_replay_engine".to_string()));
     }
 
+    #[test]
+    fn proxy_replay_caps_inventory_drawdown() {
+        let candidate = solana_pool_candidate_fixture(117.0, Some(1_852.0));
+        let drawdown = inventory_drawdown_proxy_pct(Some(1_852.0), 10.0, &candidate);
+        assert_eq!(drawdown, 100.0);
+    }
+
+    #[test]
+    fn proxy_replay_estimates_narrow_hot_pool_edge() {
+        let candidate = solana_pool_candidate_fixture(218.8, Some(26.6));
+        let args = proxy_args_fixture();
+        let scenario = solana_proxy_scenario(&candidate, 2.5, Some(26.6), &args);
+
+        assert!(scenario.estimated_concentration > 4.0);
+        assert!(scenario.net_fee_apr_proxy > 900.0);
+        assert_eq!(scenario.risk_grade, "medium");
+        assert_eq!(scenario.verdict, "candidate_replay");
+    }
+
     fn hot_pool_candidate_fixture(
         venue: &str,
         pool_kind: &str,
@@ -5494,6 +5954,79 @@ mod tests {
             experiment_priority: "P1_replay_queue".to_string(),
             next_step: "replay_baselines".to_string(),
             warnings,
+        }
+    }
+
+    fn solana_pool_candidate_fixture(
+        fee_apr_24h: f64,
+        price_range_24h_pct: Option<f64>,
+    ) -> SolanaPoolCandidate {
+        SolanaPoolCandidate {
+            venue: SolanaVenue::RaydiumClmm,
+            protocol: autopool_core::DexProtocol::Raydium,
+            pool_kind: "clmm".to_string(),
+            pool_address: "HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD".to_string(),
+            symbol: "CARDS-USDC".to_string(),
+            tokens: vec![
+                SolanaToken {
+                    address: "CARDS".to_string(),
+                    symbol: "CARDS".to_string(),
+                    name: Some("Collector Crypt".to_string()),
+                    decimals: Some(6),
+                    verified: None,
+                },
+                SolanaToken {
+                    address: "USDC".to_string(),
+                    symbol: "USDC".to_string(),
+                    name: Some("USD Coin".to_string()),
+                    decimals: Some(6),
+                    verified: None,
+                },
+            ],
+            fee_bps: Some(40.0),
+            tick_spacing: Some(60),
+            bin_step: None,
+            tvl_usd: 3_600_000.0,
+            volume_usd_24h: Some(5_500_000.0),
+            volume_usd_7d: Some(45_000_000.0),
+            fees_usd_24h: Some(22_000.0),
+            fees_usd_7d: Some(180_000.0),
+            fee_apr_24h: Some(fee_apr_24h),
+            fee_apr_7d: Some(149.0),
+            reward_apr: Some(0.0),
+            total_apr: Some(fee_apr_24h),
+            current_price: Some(0.25),
+            price_min_24h: Some(0.20),
+            price_max_24h: Some(0.25),
+            price_range_24h_pct,
+            price_change_24h_pct: None,
+            current_tick: None,
+            active_liquidity: None,
+            updated_slot: None,
+            verified: true,
+            warnings: Vec::new(),
+            deployability_score: 0.0,
+        }
+    }
+
+    fn proxy_args_fixture() -> SolanaProxyReplayArgs {
+        SolanaProxyReplayArgs {
+            venues: Vec::new(),
+            min_tvl_usd: 50_000.0,
+            min_volume_usd_24h: 25_000.0,
+            min_fee_apr: 100.0,
+            max_fee_apr: 5_000.0,
+            min_volume_tvl_24h: 0.5,
+            page_size: 120,
+            limit: 20,
+            capital_usd: 10_000.0,
+            half_width_pct: vec![2.5, 5.0, 10.0, 20.0],
+            max_concentration: 12.0,
+            rebalance_slippage_bps: 5.0,
+            rebalance_tx_cost_usd: 0.002,
+            max_rebalances_per_day: 12,
+            output: None,
+            format: OutputFormat::Table,
         }
     }
 }

@@ -142,6 +142,11 @@ CLMM pools are routed to normalized-swap collection, while Meteora DLMM pools ar
 blocked behind a separate bin-replay adapter instead of being forced through v3
 tick math. `replay-normalized-swaps` is the generic adapter boundary once a Solana
 CLMM decoder emits `SwapObs` JSONL.
+`solana-proxy-replay` now runs the first end-to-end Solana business-flow estimate:
+protocol pool stats -> range-width assumption -> fee capture -> churn cost -> APR
+and risk grade. The latest proxy pass puts `Raydium CARDS-USDC` around 1000% net
+APR at 2.5% half-width with medium risk, and `Orca SOL-PUMP` around 425% with low
+risk; both still require real swap/tick replay before shadow trading.
 
 ## External References
 

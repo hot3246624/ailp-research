@@ -151,6 +151,41 @@ Latest live scan result: clean CLMM rows are currently `Raydium CARDS-USDC`,
 collection, not on strategy math. Meteora dominates the visible hot queue, but it
 is DLMM/bin-based and must not be evaluated with the v3 tick engine.
 
+## Solana Proxy Replay
+
+Use this when the business question is "how much APR might this strategy make, and
+how much risk is attached?" before tick-by-tick replay exists:
+
+```bash
+cargo run -p autopool-cli -- solana-proxy-replay \
+  --min-tvl-usd 50000 \
+  --min-volume-usd-24h 25000 \
+  --min-fee-apr 100 \
+  --max-fee-apr 5000 \
+  --min-volume-tvl-24h 0.5 \
+  --capital-usd 10000 \
+  --output data/solana/proxy/latest.json
+```
+
+This is a protocol-API proxy, not a deployable backtest. It estimates:
+
+- pool-wide fee APR;
+- concentration from a chosen half-width versus the observed price range;
+- daily rebalances needed to keep the range active;
+- slippage/transaction churn cost;
+- inventory drawdown proxy and risk grade.
+
+Current CLMM proxy results:
+
+| venue | pool | best half-width | net APR proxy | risk | interpretation |
+| --- | --- | ---: | ---: | --- | --- |
+| Raydium | CARDS-USDC | 2.5% | ~1000% | medium | strong candidate; needs real CLMM replay |
+| Orca | SOL-PUMP | 2.5% | ~425% | low | cleaner but lower upside |
+| Raydium | WSOL-CX | 10% | ~990% | severe | reject until replay; price range is extreme |
+
+Meteora may show 1000%+ gross APR rows, but proxy risk is `unknown` until the DLMM
+bin replay engine exists.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:
