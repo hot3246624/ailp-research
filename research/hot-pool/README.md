@@ -326,6 +326,35 @@ APR are modeled for normalized bin observations. This is infrastructure only; re
 Meteora evaluation still requires decoded swap events and historical bin-liquidity
 snapshots.
 
+First real DLMM active-bin snapshot is now wired through the official Meteora SDK:
+
+```text
+pool:      Meteora SOL-USDC 5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6
+slot:      429710432
+activeBin: -6457
+bin step:  4 bps
+active-bin liquidity: ~$5,060
+30m volume from Meteora Data API: ~$1.83m
+```
+
+Commands:
+
+```bash
+scripts/meteora-dlmm-snapshot.sh \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.raw.json
+
+cargo run -q -p autopool-cli -- replay-dlmm-bins \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl
+```
+
+The one-row replay shows about `+$486` gross fee for `$10k`, but this is a capacity
+alarm rather than a strategy result: `$10k` is about `2.0x` active-bin liquidity, and
+one observation cannot produce APR or rolling-window evidence. Next useful step is
+repeated snapshots or decoded swap/bin history for promotion-style windows.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text

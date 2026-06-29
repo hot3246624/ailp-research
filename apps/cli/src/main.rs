@@ -518,6 +518,24 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Replay normalized Meteora DLMM bin observations produced by the read-only SDK
+    /// snapshot helper. This uses the DLMM bin model, not the v3 tick model.
+    ReplayDlmmBins {
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        bins: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        half_width_bins: i32,
+        #[arg(long, default_value_t = 10_000.0)]
+        capital_usd: f64,
+        #[arg(long, default_value_t = 0.002)]
+        rebalance_cost_usd: f64,
+        #[arg(long, default_value_t = 5.0)]
+        rebalance_slippage_bps: f64,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Replay normalized swaps over rolling fixed-size windows and summarize
     /// policy stability, mechanical APR, and drawdown across windows.
     ReplayNormalizedWindows {
@@ -1548,6 +1566,23 @@ async fn main() -> Result<()> {
             params,
             format,
         } => replay_normalized_swaps(spec, swaps, &params, format)?,
+        Command::ReplayDlmmBins {
+            spec,
+            bins,
+            half_width_bins,
+            capital_usd,
+            rebalance_cost_usd,
+            rebalance_slippage_bps,
+            format,
+        } => replay_dlmm_bins(
+            spec,
+            bins,
+            half_width_bins,
+            capital_usd,
+            rebalance_cost_usd,
+            rebalance_slippage_bps,
+            format,
+        )?,
         Command::ReplayNormalizedWindows {
             spec,
             swaps,
@@ -4342,6 +4377,30 @@ fn load_normalized_swaps(path: &Path) -> Result<Vec<autopool_backtest::SwapObs>>
     Ok(swaps)
 }
 
+fn load_dlmm_bin_observations(path: &Path) -> Result<Vec<autopool_backtest::DlmmBinObs>> {
+    let file = File::open(path)
+        .with_context(|| format!("opening normalized DLMM bin stream {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut observations = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let obs =
+            serde_json::from_str::<autopool_backtest::DlmmBinObs>(&line).with_context(|| {
+                format!(
+                    "failed to parse normalized DLMM bin observation {} line {}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+        observations.push(obs);
+    }
+    observations.sort_by_key(|obs| obs.block);
+    Ok(observations)
+}
+
 fn solana_spacing_label(row: &SolanaPoolCandidate) -> String {
     if let Some(tick_spacing) = row.tick_spacing {
         return format!("tick:{tick_spacing}");
@@ -5206,6 +5265,19 @@ struct ReplayReport {
 }
 
 #[derive(Debug, Serialize)]
+struct DlmmReplayReport {
+    label: String,
+    observations: usize,
+    block_first: Option<u64>,
+    block_last: Option<u64>,
+    active_bin_first: Option<i32>,
+    active_bin_last: Option<i32>,
+    config: serde_json::Value,
+    caveats: Vec<String>,
+    policies: Vec<autopool_backtest::DlmmPolicyReport>,
+}
+
+#[derive(Debug, Serialize)]
 struct NormalizedWindowReplayReport {
     label: String,
     swaps: usize,
@@ -5492,6 +5564,68 @@ fn emit_replay_report(
     Ok(())
 }
 
+fn emit_dlmm_replay_report(report: DlmmReplayReport, format: OutputFormat) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "dlmm replay {} observations={} slots={}..{} active_bin={}..{}",
+        report.label,
+        report.observations,
+        optional_u64(report.block_first),
+        optional_u64(report.block_last),
+        optional_i32(report.active_bin_first),
+        optional_i32(report.active_bin_last),
+    );
+    for caveat in &report.caveats {
+        println!("caveat: {caveat}");
+    }
+    println!(
+        "config: fee={:.2}bps bin_step={:.2}bps capital=${:.0} activeLiq=${:.0} cap/active={:.2}x rebalance=${:.3}+{:.1}bps half_width=±{} bins",
+        report.config["fee_bps"].as_f64().unwrap_or_default(),
+        report.config["bin_step_bps"].as_f64().unwrap_or_default(),
+        report.config["capital_usd"].as_f64().unwrap_or_default(),
+        report.config["avg_active_liquidity_usd"]
+            .as_f64()
+            .unwrap_or_default(),
+        report.config["capital_to_active_liquidity"]
+            .as_f64()
+            .unwrap_or_default(),
+        report.config["rebalance_cost_usd"]
+            .as_f64()
+            .unwrap_or_default(),
+        report.config["rebalance_slippage_bps"]
+            .as_f64()
+            .unwrap_or_default(),
+        report.config["half_width_bins"]
+            .as_i64()
+            .unwrap_or_default(),
+    );
+    println!(
+        "{:<24} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8}",
+        "policy", "net_pnl", "final", "fees", "netAPR", "maxDD", "inRange", "rebals"
+    );
+    for policy in &report.policies {
+        println!(
+            "{:<24} {:>10.2} {:>10.2} {:>9.2} {:>9} {:>9.2} {:>8.1}% {:>8}",
+            policy.policy,
+            policy.net_pnl_usd,
+            policy.final_value_usd,
+            policy.fee_income_usd,
+            policy
+                .net_apr_pct
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            policy.max_drawdown_usd,
+            policy.time_in_range_pct,
+            policy.rebalances,
+        );
+    }
+    Ok(())
+}
+
 fn replay_window_years(report: &ReplayReport, params: &ReplayParams) -> Option<f64> {
     let first = report.block_first?;
     let last = report.block_last?;
@@ -5760,6 +5894,111 @@ fn replay_normalized_swaps(
         policies,
     };
     emit_replay_report(report, &params, format)
+}
+
+fn replay_dlmm_bins(
+    spec_path: PathBuf,
+    bins_path: PathBuf,
+    half_width_bins: i32,
+    capital_usd: f64,
+    rebalance_cost_usd: f64,
+    rebalance_slippage_bps: f64,
+    format: OutputFormat,
+) -> Result<()> {
+    let spec = read_replay_pool_spec(&spec_path)?;
+    if spec.replay_model != "dlmm_bin_replay" {
+        anyhow::bail!(
+            "unsupported replay_model `{}` in {}; dlmm bin replay requires dlmm_bin_replay",
+            spec.replay_model,
+            spec_path.display()
+        );
+    }
+    let bin_step = spec
+        .bin_step
+        .with_context(|| format!("missing bin_step in {}", spec_path.display()))?;
+    let observations = load_dlmm_bin_observations(&bins_path)?;
+    if observations.is_empty() {
+        anyhow::bail!("no DLMM bin observations found in {}", bins_path.display());
+    }
+    let cfg = autopool_backtest::DlmmReplayConfig {
+        capital_usd,
+        fee_bps: spec.fee_bps,
+        bin_step_bps: bin_step as f64,
+        rebalance_cost_usd,
+        rebalance_slippage_bps,
+        block_seconds: spec.block_seconds,
+    };
+    let avg_active_liquidity_usd = observations
+        .iter()
+        .map(|obs| obs.active_liquidity_usd)
+        .sum::<f64>()
+        / observations.len() as f64;
+    let capital_to_active_liquidity = if avg_active_liquidity_usd > 0.0 {
+        Some(capital_usd / avg_active_liquidity_usd)
+    } else {
+        None
+    };
+    let policies = vec![
+        autopool_backtest::run_dlmm_bin_policy(
+            &observations,
+            &cfg,
+            autopool_backtest::DlmmRangeMode::HoldInventory,
+            "hold_inventory",
+        )
+        .unwrap(),
+        autopool_backtest::run_dlmm_bin_policy(
+            &observations,
+            &cfg,
+            autopool_backtest::DlmmRangeMode::StaticRange { half_width_bins },
+            "static_bin_range",
+        )
+        .unwrap(),
+        autopool_backtest::run_dlmm_bin_policy(
+            &observations,
+            &cfg,
+            autopool_backtest::DlmmRangeMode::CenteredRebalance { half_width_bins },
+            "centered_bin_rebalance",
+        )
+        .unwrap(),
+    ];
+    let mut caveats = vec![
+        "DLMM replay uses normalized bin observations, not CLMM tick math".to_string(),
+        "active_liquidity_usd must come from active-bin account state, not pool TVL".to_string(),
+    ];
+    if observations.len() < 2 {
+        caveats.push(
+            "single observation: APR/window and rolling promotion evidence are intentionally unavailable"
+                .to_string(),
+        );
+    }
+    if capital_to_active_liquidity.unwrap_or(0.0) > 0.25 {
+        caveats.push(format!(
+            "capacity warning: capital is {:.1}x average active-bin liquidity; fee share is not scalable",
+            capital_to_active_liquidity.unwrap()
+        ));
+    }
+    let report = DlmmReplayReport {
+        label: format!("{} ({})", spec.symbol, spec.pool_address),
+        observations: observations.len(),
+        block_first: observations.first().map(|obs| obs.block),
+        block_last: observations.last().map(|obs| obs.block),
+        active_bin_first: observations.first().map(|obs| obs.active_bin_id),
+        active_bin_last: observations.last().map(|obs| obs.active_bin_id),
+        config: json!({
+            "fee_bps": cfg.fee_bps,
+            "bin_step_bps": cfg.bin_step_bps,
+            "capital_usd": cfg.capital_usd,
+            "rebalance_cost_usd": cfg.rebalance_cost_usd,
+            "rebalance_slippage_bps": cfg.rebalance_slippage_bps,
+            "block_seconds": cfg.block_seconds,
+            "half_width_bins": half_width_bins,
+            "avg_active_liquidity_usd": avg_active_liquidity_usd,
+            "capital_to_active_liquidity": capital_to_active_liquidity,
+        }),
+        caveats,
+        policies,
+    };
+    emit_dlmm_replay_report(report, format)
 }
 
 fn replay_normalized_windows(

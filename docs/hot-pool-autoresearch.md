@@ -718,6 +718,45 @@ range occupancy, recenter costs, drawdown, and APR for normalized bin observatio
 It is not deployable until real Meteora swap events and historical bin-liquidity
 snapshots are decoded.
 
+### Meteora SOL-USDC DLMM Snapshot
+
+The first read-only Meteora SDK ingestion is now wired:
+
+```bash
+scripts/meteora-dlmm-snapshot.sh \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.raw.json \
+  --bins-left 8 \
+  --bins-right 8 \
+  --volume-window 30m
+
+cargo run -q -p autopool-cli -- replay-dlmm-bins \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --bins data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-bin-snapshot.jsonl \
+  --half-width-bins 5 \
+  --capital-usd 10000
+```
+
+Fresh snapshot:
+
+```text
+pool:      Meteora SOL-USDC 5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6
+slot:      429710432
+activeBin: -6457
+bin step:  4 bps
+active-bin liquidity: ~$5,060
+30m volume from Meteora Data API: ~$1.83m
+```
+
+The one-row replay returns about `+$486` gross fee for a `$10k` position in the
+active bin, but this is not an APR result and not scalable evidence: capital is
+about `2.0x` the active-bin liquidity, so the modeled fee share is a capacity alarm,
+not a deployment proposal. This is still valuable because it proves the business
+flow is now DLMM-native: protocol API metadata -> official SDK active bin/bin
+liquidity -> `DlmmBinObs` JSONL -> Rust DLMM replay. Next evidence step is repeated
+snapshots or decoded swap/bin history, then rolling windows.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
