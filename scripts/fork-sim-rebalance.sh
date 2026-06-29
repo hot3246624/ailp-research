@@ -204,6 +204,9 @@ BASE_RPC_URL="${FORK_RPC}" cargo run -q -p autopool-cli -- monitor-position \
   --pool-address "${POOL}" \
   --output "${WORKDIR}/position-monitor.jsonl" \
   --iterations 1 \
+  --token0-usd "${TOKEN0_USD}" \
+  --risk-token-side "${RISK_TOKEN_SIDE}" \
+  --max-risk-token-share "${MAX_RISK_TOKEN_SHARE}" \
   --format json \
   >"${WORKDIR}/position-monitor.stdout.json"
 

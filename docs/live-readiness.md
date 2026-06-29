@@ -73,15 +73,17 @@ Not ready:
 
 - Minimal read-only position monitoring now exists:
   `monitor-position --token-id ... --output logs/base/positions.jsonl` persists
-  current tick, in-range status, liquidity, owed tokens, owner/gauge state, and
-  receipt-safe metadata as JSONL. It still does not alert, compute USD exposure,
-  compute shadow PnL, or watch wallet balances.
+  current tick, in-range status, liquidity, owed tokens, owner/gauge state, token
+  amounts, USD exposure (when `--token0-usd` is supplied), risk-token share, alert
+  labels, and kill-switch reasons as JSONL. It still does not compute full shadow
+  PnL, hedge PnL, reward liquidation, or wallet balances.
 - No **delta hedge adapter** yet. The best risk-adjusted strategy depends on a perp
   hedge, likely Hyperliquid or another venue.
 - No **post-trade accounting ledger** yet: fees, rewards, hedge PnL, gas, slippage,
   realized vs expected edge.
-- No **kill-switch** yet: max drawdown, max slippage, max one-sided exposure,
-  stale RPC, sequencer/RPC health, failed simulation count.
+- Kill-switch coverage is still partial: monitor can flag out-of-range and one-sided
+  risk exposure, but max drawdown, stale RPC, sequencer/RPC health, and failed
+  simulation count are not wired into an operator halt state yet.
 - RPC is not production-grade. Public/free endpoints are fine for research but too
   slow and flaky for automated execution.
 - Reward APR and reward liquidation are still approximated; reward-heavy pools should

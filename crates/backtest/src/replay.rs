@@ -1124,6 +1124,41 @@ pub fn cl_mint_amounts(
     (a0 / cfg.scale0(), a1 / cfg.scale1(), pos.liquidity)
 }
 
+/// Token amounts (human units) for an existing concentrated-liquidity position
+/// with known raw `liquidity` across `[lower_tick, upper_tick]` at
+/// `current_sqrt_x96`.
+pub fn cl_position_amounts(
+    decimals0: u8,
+    decimals1: u8,
+    lower_tick: i32,
+    upper_tick: i32,
+    current_sqrt_x96: f64,
+    liquidity: f64,
+) -> (f64, f64) {
+    let cfg = ReplayConfig {
+        decimals0,
+        decimals1,
+        fee_fraction: 0.0,
+        token0_usd: 1.0,
+        capital_usd: 0.0,
+        rebalance_gas_usd: 0.0,
+        rebalance_slippage_bps: 0.0,
+        rebalance_swap_fraction: 0.5,
+        reward_apr: 0.0,
+        reward_haircut: 0.0,
+    };
+    let sqrt = current_sqrt_x96 / TWO_POW_96;
+    let pos = Position {
+        liquidity,
+        sqrt_lower: sqrt_ratio_at_tick(lower_tick),
+        sqrt_upper: sqrt_ratio_at_tick(upper_tick),
+        amount0_entry: 0.0,
+        amount1_entry: 0.0,
+    };
+    let (a0, a1) = pos.amounts_at(sqrt);
+    (a0 / cfg.scale0(), a1 / cfg.scale1())
+}
+
 fn hold_report(
     swaps: &[SwapObs],
     cfg: &ReplayConfig,
@@ -1864,6 +1899,15 @@ mod tests {
         let (a0, a1) = pos.amounts_at(below);
         assert!(a1 == 0.0, "all token0 below range, a1={a1}");
         assert!(a0 > 0.0);
+    }
+
+    #[test]
+    fn exported_position_amounts_match_mint_amounts() {
+        let sqrt_x96 = sqrt_ratio_at_tick(80_000) * TWO_POW_96;
+        let (mint0, mint1, liquidity) = cl_mint_amounts(18, 18, 79_000, 81_000, sqrt_x96, 10.0);
+        let (amount0, amount1) = cl_position_amounts(18, 18, 79_000, 81_000, sqrt_x96, liquidity);
+        assert!((amount0 - mint0).abs() < 1e-9);
+        assert!((amount1 - mint1).abs() < 1e-6);
     }
 
     #[test]

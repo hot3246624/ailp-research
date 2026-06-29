@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::{Context, Result};
 use autopool_aerodrome::{
     BASE_CHAIN_ID, BASE_SLIPSTREAM_GAUGES_V3, PilotProfile, SlipstreamCandidate,
@@ -431,6 +433,22 @@ enum Command {
         /// Number of snapshots to write. Use 0 for an endless monitor.
         #[arg(long, default_value_t = 1)]
         iterations: u64,
+        /// USD value of one token0. When set, monitor snapshots include token
+        /// amounts, USD exposure, owed-value estimates, risk share, and alerts.
+        #[arg(long)]
+        token0_usd: Option<f64>,
+        /// Which side is the risk asset for exposure/kill-switch checks.
+        #[arg(long, value_enum, default_value_t = RiskTokenSide::Token1)]
+        risk_token_side: RiskTokenSide,
+        /// Maximum share of position value allowed in the risk token.
+        #[arg(long, default_value_t = 0.8)]
+        max_risk_token_share: f64,
+        /// Warn when current tick is this close to either range edge.
+        #[arg(long, default_value_t = 120)]
+        min_distance_to_edge_ticks: i32,
+        /// Warn when uncollected fees exceed this USD value. Requires --token0-usd.
+        #[arg(long)]
+        max_owed_value_usd: Option<f64>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -941,6 +959,11 @@ async fn main() -> Result<()> {
             output,
             poll_seconds,
             iterations,
+            token0_usd,
+            risk_token_side,
+            max_risk_token_share,
+            min_distance_to_edge_ticks,
+            max_owed_value_usd,
             format,
         } => {
             monitor_position(PositionMonitorArgs {
@@ -950,6 +973,13 @@ async fn main() -> Result<()> {
                 output,
                 poll_seconds,
                 iterations,
+                risk: PositionRiskOptions {
+                    token0_usd,
+                    risk_token_side,
+                    max_risk_token_share,
+                    min_distance_to_edge_ticks,
+                    max_owed_value_usd,
+                },
                 format,
             })
             .await?
@@ -2968,6 +2998,10 @@ fn risk_token_inventory_share(
     }
 }
 
+fn raw_u128_to_human(value: u128, decimals: u8) -> f64 {
+    value as f64 / 10f64.powi(decimals as i32)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NpmPositionSnapshot {
     tick_lower: i32,
@@ -3129,15 +3163,48 @@ async fn read_pool_gauge(rpc: &JsonRpcClient, pool_address: &str) -> Result<Opti
     }
 }
 
+async fn read_erc20_decimals(rpc: &JsonRpcClient, token: &str) -> Result<Option<u8>> {
+    let calldata = format!("0x{}", autopool_evm::abi::selector("decimals()"));
+    let raw = match rpc.eth_call(token, &calldata).await {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    Ok(parse_hex_u64_lossy(&raw).and_then(|value| u8::try_from(value).ok()))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PositionRiskOptions {
+    token0_usd: Option<f64>,
+    risk_token_side: RiskTokenSide,
+    max_risk_token_share: f64,
+    min_distance_to_edge_ticks: i32,
+    max_owed_value_usd: Option<f64>,
+}
+
+impl Default for PositionRiskOptions {
+    fn default() -> Self {
+        Self {
+            token0_usd: None,
+            risk_token_side: RiskTokenSide::Token1,
+            max_risk_token_share: 0.8,
+            min_distance_to_edge_ticks: 120,
+            max_owed_value_usd: None,
+        }
+    }
+}
+
 async fn build_position_snapshot(
     rpc: &JsonRpcClient,
     token_id: u64,
     pool_address: Option<&str>,
+    risk: PositionRiskOptions,
 ) -> Result<serde_json::Value> {
     let c = BASE_SLIPSTREAM_GAUGES_V3;
     let npm = c.nonfungible_position_manager;
     let owner = read_owner_of(rpc, npm, token_id).await?;
     let position = read_npm_position_detail(rpc, npm, token_id).await?;
+    let decimals0 = read_erc20_decimals(rpc, &position.token0).await?;
+    let decimals1 = read_erc20_decimals(rpc, &position.token1).await?;
     let resolved_pool = match pool_address {
         Some(address) => Some(address.to_string()),
         None => {
@@ -3156,11 +3223,15 @@ async fn build_position_snapshot(
     let mut in_range: Option<bool> = None;
     let mut fee_bps: Option<f64> = None;
     let mut gauge: Option<String> = None;
+    let mut sqrt_price_x96_hex: Option<String> = None;
+    let mut pool_liquidity_raw: Option<String> = None;
 
     if let Some(pool) = resolved_pool.as_deref() {
         let state = rpc.read_cl_pool_state(pool).await?;
         current_tick = Some(state.current_tick);
         tick_spacing_live = Some(state.tick_spacing);
+        sqrt_price_x96_hex = Some(state.sqrt_price_x96_hex.clone());
+        pool_liquidity_raw = Some(state.liquidity.clone());
         in_range = Some(
             state.current_tick >= position.tick_lower && state.current_tick < position.tick_upper,
         );
@@ -3180,6 +3251,85 @@ async fn build_position_snapshot(
     let range_width_ticks = position.tick_upper - position.tick_lower;
     let distance_to_lower = current_tick.map(|tick| tick - position.tick_lower);
     let distance_to_upper = current_tick.map(|tick| position.tick_upper - tick);
+    let price_token1_per_token0 = match (&sqrt_price_x96_hex, decimals0, decimals1) {
+        (Some(sqrt_hex), Some(decimals0), Some(decimals1)) => {
+            let sqrt_x96 = hex_word_to_f64(sqrt_hex);
+            let raw_price = (sqrt_x96 / 79_228_162_514_264_337_593_543_950_336.0).powi(2);
+            Some(raw_price * 10f64.powi(decimals0 as i32 - decimals1 as i32))
+        }
+        _ => None,
+    };
+    let (amount0, amount1) = match (&sqrt_price_x96_hex, decimals0, decimals1) {
+        (Some(sqrt_hex), Some(decimals0), Some(decimals1)) => {
+            let sqrt_x96 = hex_word_to_f64(sqrt_hex);
+            let (amount0, amount1) = autopool_backtest::cl_position_amounts(
+                decimals0,
+                decimals1,
+                position.tick_lower,
+                position.tick_upper,
+                sqrt_x96,
+                position.liquidity as f64,
+            );
+            (Some(amount0), Some(amount1))
+        }
+        _ => (None, None),
+    };
+    let owed0 = decimals0.map(|decimals| raw_u128_to_human(position.tokens_owed0, decimals));
+    let owed1 = decimals1.map(|decimals| raw_u128_to_human(position.tokens_owed1, decimals));
+    let token1_usd = match (risk.token0_usd, price_token1_per_token0) {
+        (Some(token0_usd), Some(price)) if price > 0.0 => Some(token0_usd / price),
+        _ => None,
+    };
+    let amount0_usd = amount0
+        .zip(risk.token0_usd)
+        .map(|(amount, usd)| amount * usd);
+    let amount1_usd = amount1.zip(token1_usd).map(|(amount, usd)| amount * usd);
+    let position_value_usd = match (amount0_usd, amount1_usd) {
+        (Some(amount0_usd), Some(amount1_usd)) => Some(amount0_usd + amount1_usd),
+        _ => None,
+    };
+    let owed0_usd = owed0.zip(risk.token0_usd).map(|(amount, usd)| amount * usd);
+    let owed1_usd = owed1.zip(token1_usd).map(|(amount, usd)| amount * usd);
+    let owed_value_usd = match (owed0_usd, owed1_usd) {
+        (Some(owed0_usd), Some(owed1_usd)) => Some(owed0_usd + owed1_usd),
+        _ => None,
+    };
+    let risk_token_share = match (amount0, amount1, price_token1_per_token0) {
+        (Some(amount0), Some(amount1), Some(price)) => Some(risk_token_inventory_share(
+            amount0,
+            amount1,
+            price,
+            risk.risk_token_side,
+        )),
+        _ => None,
+    };
+    let mut alerts = Vec::<String>::new();
+    let mut kill_switch_reasons = Vec::<String>::new();
+    if in_range == Some(false) {
+        alerts.push("out_of_range".to_string());
+        kill_switch_reasons.push("position_out_of_range".to_string());
+    }
+    if let (Some(lower), Some(upper)) = (distance_to_lower, distance_to_upper) {
+        if lower.min(upper) <= risk.min_distance_to_edge_ticks {
+            alerts.push("near_range_edge".to_string());
+        }
+    }
+    if let Some(share) = risk_token_share {
+        if share > risk.max_risk_token_share {
+            alerts.push("risk_token_share_exceeded".to_string());
+            kill_switch_reasons.push("risk_token_share_exceeded".to_string());
+        }
+    }
+    if let (Some(owed_value), Some(limit)) = (owed_value_usd, risk.max_owed_value_usd) {
+        if owed_value > limit {
+            alerts.push("owed_value_above_collection_threshold".to_string());
+        }
+    }
+    alerts.sort();
+    alerts.dedup();
+    kill_switch_reasons.sort();
+    kill_switch_reasons.dedup();
+    let kill_switch_triggered = !kill_switch_reasons.is_empty();
     let result = json!({
         "token_id": token_id,
         "npm": npm,
@@ -3189,21 +3339,46 @@ async fn build_position_snapshot(
         "appears_staked": appears_staked,
         "token0": position.token0,
         "token1": position.token1,
+        "decimals0": decimals0,
+        "decimals1": decimals1,
         "tick_spacing_position": position.tick_spacing,
         "tick_spacing_pool": tick_spacing_live,
         "tick_lower": position.tick_lower,
         "tick_upper": position.tick_upper,
         "range_width_ticks": range_width_ticks,
         "current_tick": current_tick,
+        "sqrt_price_x96": sqrt_price_x96_hex,
+        "pool_liquidity_raw": pool_liquidity_raw,
+        "price_token1_per_token0": price_token1_per_token0,
         "in_range": in_range,
         "distance_to_lower_ticks": distance_to_lower,
         "distance_to_upper_ticks": distance_to_upper,
         "liquidity_raw": position.liquidity.to_string(),
+        "amount0": amount0,
+        "amount1": amount1,
+        "token0_usd": risk.token0_usd,
+        "token1_usd": token1_usd,
+        "amount0_usd": amount0_usd,
+        "amount1_usd": amount1_usd,
+        "position_value_usd": position_value_usd,
         "tokens_owed0_raw": position.tokens_owed0.to_string(),
         "tokens_owed1_raw": position.tokens_owed1.to_string(),
+        "tokens_owed0": owed0,
+        "tokens_owed1": owed1,
+        "tokens_owed0_usd": owed0_usd,
+        "tokens_owed1_usd": owed1_usd,
+        "owed_value_usd": owed_value_usd,
         "fee_growth_inside0_last_x128": position.fee_growth_inside0_last_x128,
         "fee_growth_inside1_last_x128": position.fee_growth_inside1_last_x128,
         "fee_bps": fee_bps,
+        "risk_token_side": risk.risk_token_side.label(),
+        "risk_token_share": risk_token_share,
+        "max_risk_token_share": risk.max_risk_token_share,
+        "min_distance_to_edge_ticks": risk.min_distance_to_edge_ticks,
+        "max_owed_value_usd": risk.max_owed_value_usd,
+        "alerts": alerts,
+        "kill_switch_triggered": kill_switch_triggered,
+        "kill_switch_reasons": kill_switch_reasons,
         "requires_signature": false,
         "broadcast": false
     });
@@ -3217,7 +3392,13 @@ async fn inspect_position(
     format: OutputFormat,
 ) -> Result<()> {
     let rpc = JsonRpcClient::new(rpc_url);
-    let result = build_position_snapshot(&rpc, token_id, pool_address.as_deref()).await?;
+    let result = build_position_snapshot(
+        &rpc,
+        token_id,
+        pool_address.as_deref(),
+        PositionRiskOptions::default(),
+    )
+    .await?;
 
     if format == OutputFormat::Json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -3272,6 +3453,7 @@ struct PositionMonitorArgs {
     output: PathBuf,
     poll_seconds: u64,
     iterations: u64,
+    risk: PositionRiskOptions,
     format: OutputFormat,
 }
 
@@ -3298,7 +3480,8 @@ async fn monitor_position(args: PositionMonitorArgs) -> Result<()> {
         }
         iteration += 1;
         let mut snapshot =
-            build_position_snapshot(&rpc, args.token_id, args.pool_address.as_deref()).await?;
+            build_position_snapshot(&rpc, args.token_id, args.pool_address.as_deref(), args.risk)
+                .await?;
         if let Some(object) = snapshot.as_object_mut() {
             object.insert("monitor_sequence".to_string(), json!(iteration));
             object.insert(
@@ -3316,12 +3499,14 @@ async fn monitor_position(args: PositionMonitorArgs) -> Result<()> {
         match args.format {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&snapshot)?),
             OutputFormat::Table => println!(
-                "snapshot #{iteration} token_id={} tick={} in_range={} owed0={} owed1={} -> {}",
+                "snapshot #{iteration} token_id={} tick={} in_range={} value_usd={} risk_share={} alerts={} kill_switch={} -> {}",
                 args.token_id,
                 json_optional_i64(&snapshot, "current_tick"),
                 json_optional_bool(&snapshot, "in_range"),
-                json_str(&snapshot, "tokens_owed0_raw"),
-                json_str(&snapshot, "tokens_owed1_raw"),
+                json_optional_f64(&snapshot, "position_value_usd"),
+                json_optional_pct(&snapshot, "risk_token_share"),
+                json_string_array(&snapshot, "alerts"),
+                json_optional_bool(&snapshot, "kill_switch_triggered"),
                 args.output.display()
             ),
         }
@@ -4076,6 +4261,40 @@ fn json_optional_i64(value: &serde_json::Value, key: &str) -> String {
 
 fn json_optional_bool(value: &serde_json::Value, key: &str) -> String {
     json_bool(value, key)
+}
+
+fn json_optional_f64(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn json_optional_pct(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn json_string_array(value: &serde_json::Value, key: &str) -> String {
+    let values = value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
+    }
 }
 
 fn current_unix_timestamp() -> u64 {

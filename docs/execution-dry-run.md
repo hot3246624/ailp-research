@@ -131,10 +131,10 @@ Validated on WETH-AERO GaugesV3 (`0x4e5066...e51`) using a local Base fork:
 
 | step | calls | gas |
 | --- | ---: | ---: |
-| fresh SwapRouter swap | 1 | 224,119 |
-| fresh NPM mint multicall | 1 | 418,491 |
+| fresh SwapRouter swap | 1 | 234,346 |
+| fresh NPM mint multicall | 1 | 418,539 |
 | monitor minted position | read-only | n/a |
-| rebalance NPM multicall | 4 | 497,130 |
+| rebalance NPM multicall | 4 | 497,166 |
 
 Two fork findings are now baked into the CLI:
 
@@ -146,6 +146,10 @@ Two fork findings are now baked into the CLI:
 - The one-sided inventory gate now takes an explicit `--risk-token-side token0|token1`
   plus `--max-risk-token-share`; this prevents WETH-USDC-style pools from being checked
   as if the stablecoin side were the risk asset.
+- `monitor-position` now enriches snapshots with CL token amounts, USD exposure when
+  `--token0-usd` is supplied, risk-token share, alert labels, and kill-switch reasons.
+  The funded fork validates that the snapshot path remains read-only
+  (`requires_signature=false`, `broadcast=false`).
 
 ## Remaining gaps
 

@@ -116,8 +116,9 @@ which **rejects $10k on the 200 bps fee-alpha pool (>30 bps impact; latest read 
 `docs/live-readiness.md` is the current launch-readiness readout: the best researched
 shape is high fee / low volatility with small capacity, WETH-USDC 200 bps passes
 impact gates around $1k-$5k but not $10k, and the project is not ready for unattended
-live trading until monitoring, shadow PnL, hedge integration, kill-switches, and a
-manual guarded execution path are complete.
+live trading. Read-only monitoring now emits USD exposure, risk-share alerts, and
+kill-switch reasons, but shadow PnL, hedge integration, broader halt conditions, and
+a manual guarded execution path are still required before real capital.
 `docs/solana-pivot.md` opens the next research line: Base proved the execution
 machinery but has a thin candidate surface, while Solana currently exposes many more
 organic high-APY LP candidates. The new `solana-universe` command ranks Raydium/Orca/
