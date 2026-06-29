@@ -405,7 +405,9 @@ cargo run -p autopool-cli -- replay-promotion-gate \
 
 Default windows are 25:10, 40:15, 60:20, and 80:25 swaps. The default gate policy is
 `lagged-regime-rule`; the command can also gate defensive controls directly with
-`--gate-policy hedged-wide` or `--gate-policy delta-hedged`. `--gate-policy
+`--gate-policy hedged-wide`, `--gate-policy delta-hedged`, or `--gate-policy
+delta-trend-stop`. `delta-trend-stop` is a narrow dynamic-delta LP that stands down to
+the money leg when a short intra-window trend signal fires. `--gate-policy
 lagged-policy-switch` evaluates a no-lookahead regime switch that chooses the current
 window's policy from the prior window's regime. The default switch is
 `range=delta_hedged`, `volatile=hedged_wide`, `money_trend=hedged_wide`, and
@@ -697,6 +699,25 @@ Whirlpool samples. The next useful strategy work is not another coarse blend; it
 more timely adverse-trend signal, a different fee source, or a venue with structurally
 higher fee density such as Meteora DLMM.
 
+The first intra-window stop test was also a hard rejection. Code now exposes
+`delta_trend_stop` / `--gate-policy delta-trend-stop`: a narrow `delta_hedged` LP
+that stands down to the money leg when recent tick displacement crosses a short trend
+threshold. On `SOL-Fartcoin`, the aggressive threshold run rejected every gate with
+p05 APR about `-36738%`, `-21422%`, `-15534%`, and `-9876%` across 25/40/60/80-swap
+windows. Looser thresholds helped but did not come close: the threshold-20 check still
+had p05 APR about `-29691%`, `-12417%`, `-5460%`, and `-4683%`.
+
+Window decomposition shows why: the stop often fired twice inside windows that the
+slower classifier still labels `range`, turning small `delta_hedged` drawdowns into
+double-digit dollar drawdowns and destroying fee mean. Interpretation: Whirlpool
+on/off timing is not the missing edge. The evidence now pushes us away from more gate
+micro-tuning and toward either historical active-liquidity reconstruction or a
+higher-fee venue. A bounded Meteora DLMM replay skeleton is now in
+`autopool_backtest::dlmm`; it models bin-step price ratios, active-bin fee share,
+range occupancy, recenter costs, drawdown, and APR for normalized bin observations.
+It is not deployable until real Meteora swap events and historical bin-liquidity
+snapshots are decoded.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
@@ -849,7 +870,8 @@ It can advance to tiny guarded live only if, in addition:
 1. Add replay ingestion for Solana hot pools:
    - Orca Whirlpool swaps/tick arrays;
    - Raydium CLMM swaps/tick arrays;
-   - Meteora DLMM swaps/bin liquidity.
+   - Meteora DLMM swaps/bin liquidity. The `autopool_backtest::dlmm` replay skeleton
+     is available; the missing piece is real normalized `DlmmBinObs` ingestion.
 2. For each top pool, store a daily frozen dataset and replay all baselines.
 3. Add `time_in_range_pct`, `fee_minus_lvr`, and capacity-at-impact metrics to every
    hot-pool report.

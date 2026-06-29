@@ -4,8 +4,13 @@ use autopool_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod dlmm;
 pub mod replay;
 
+pub use dlmm::{
+    DlmmBinObs, DlmmPolicyReport, DlmmRangeMode, DlmmReplayConfig, dlmm_bin_price_ratio,
+    run_dlmm_bin_policy,
+};
 pub use replay::{
     ExecConfig, FoldResult, MultiPathReport, PolicyDistribution, PolicyReport, RangeMode,
     ReplayConfig, Scenario, SwapObs, SwapSim, WalkForwardConfig, WalkForwardReport,

@@ -84,6 +84,7 @@ enum PromotionGatePolicy {
     LaggedPolicyBlend,
     HedgedWide,
     DeltaHedged,
+    DeltaTrendStop,
 }
 
 impl PromotionGatePolicy {
@@ -94,6 +95,7 @@ impl PromotionGatePolicy {
             Self::LaggedPolicyBlend => "lagged_policy_blend",
             Self::HedgedWide => "hedged_wide",
             Self::DeltaHedged => "delta_hedged",
+            Self::DeltaTrendStop => "delta_trend_stop",
         }
     }
 }
@@ -6196,7 +6198,9 @@ fn replay_promotion_gate(
                     promotion_window_row(config, rule_row, &thresholds, max_worst_drawdown_usd),
                 )
             }
-            PromotionGatePolicy::HedgedWide | PromotionGatePolicy::DeltaHedged => {
+            PromotionGatePolicy::HedgedWide
+            | PromotionGatePolicy::DeltaHedged
+            | PromotionGatePolicy::DeltaTrendStop => {
                 let (row_label, row_swaps, summary) = evaluate_fixed_policy_window(
                     &spec_path,
                     swaps_path.clone(),
@@ -6253,7 +6257,9 @@ fn replay_promotion_gate(
             PromotionGatePolicy::LaggedRegimeRule => regime_rule.describe(),
             PromotionGatePolicy::LaggedPolicySwitch => policy_rule.describe(),
             PromotionGatePolicy::LaggedPolicyBlend => blend_rule.describe(),
-            PromotionGatePolicy::HedgedWide | PromotionGatePolicy::DeltaHedged => "-".to_string(),
+            PromotionGatePolicy::HedgedWide
+            | PromotionGatePolicy::DeltaHedged
+            | PromotionGatePolicy::DeltaTrendStop => "-".to_string(),
         },
         thresholds,
         max_worst_drawdown_usd,

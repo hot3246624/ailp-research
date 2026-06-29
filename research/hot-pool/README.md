@@ -176,6 +176,8 @@ the current window's policy from the prior window's regime, with default mapping
 It also supports `--gate-policy lagged-policy-blend`, a smoother two-sleeve allocation
 between `delta_hedged` and `hedged_wide` using only the prior window's regime. Use the
 `--rule-*-wide-fraction` flags to set the capital share allocated to `hedged_wide`.
+`--gate-policy delta-trend-stop` is now available for direct testing of a narrow
+dynamic-delta LP that exits to the money leg on a short intra-window trend signal.
 
 The latest scout also says the best near-term opportunities are not Raydium-only.
 Current hot candidates are mostly Meteora DLMM and Orca Whirlpool pools. Meteora
@@ -310,6 +312,20 @@ all-wide boundary only reached about `-267%`, `-119%`, `-108%`, and `-285%`.
 Conclusion: smoother capital blending helps risk control but still does not create a
 deployable 500%+ left-tail strategy.
 
+First intra-window stop test on `SOL-Fartcoin`: `delta_trend_stop` also rejected.
+The aggressive threshold run had p05 APR about `-36738%`, `-21422%`, `-15534%`, and
+`-9876%` across 25/40/60/80-swap windows. Looser threshold-20 still only improved to
+about `-29691%`, `-12417%`, `-5460%`, and `-4683%`. Window decomposition showed the
+problem: the stop often fired twice inside windows later classified as `range`,
+turning small `delta_hedged` drawdowns into double-digit drawdowns. Current strategy
+status is still no deployable Whirlpool strategy.
+
+Meteora DLMM now has a bounded replay skeleton in `autopool_backtest::dlmm`: bin-step
+price ratios, active-bin fee share, range occupancy, recenter costs, drawdown, and
+APR are modeled for normalized bin observations. This is infrastructure only; real
+Meteora evaluation still requires decoded swap events and historical bin-liquidity
+snapshots.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
@@ -323,9 +339,10 @@ not an alpha lead. Full replay had hold at about `+$36.49`, narrow LP at `+$35.5
 `delta_hedged` at about `-$0.86`, and `hedged_wide` near flat. Promotion rejected all
 views: lagged p05 APR was about `-882%`, `-452%`, `-754%`, and `224%` across
 25/40/60/80-swap windows, with negative mean edge versus hold; direct `delta_hedged`
-and `hedged_wide` gates also rejected. This completes the current Orca Whirlpool P1
-coverage pass. Next useful work is regime-aware strategy improvement, historical
-active-liquidity reconstruction, or Meteora DLMM bin replay.
+and `hedged_wide` gates also rejected. `delta_trend_stop` also rejected, with p05 APR
+still deeply negative under threshold scans. This completes the current Orca
+Whirlpool P1 coverage pass. Next useful work is historical active-liquidity
+reconstruction or real Meteora DLMM bin ingestion.
 
 Schema:
 

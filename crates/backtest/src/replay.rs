@@ -298,6 +298,16 @@ pub enum RangeMode {
         half_width_ticks: i32,
         rehedge_band: f64,
     },
+    /// Narrow dynamic-delta LP with an intra-window trend stop. It keeps the
+    /// fee-harvesting shape of `DeltaHedged` in range/chop, but stands down to the
+    /// money leg as soon as recent tick displacement becomes a strong trend.
+    DeltaTrendStop {
+        half_width_ticks: i32,
+        rehedge_band: f64,
+        enter_threshold: f64,
+        exit_threshold: f64,
+        window: usize,
+    },
     /// The deployable shape: a wide, never-rebalanced band (low churn, harvests
     /// fees) plus a dynamic delta hedge (kills the inventory beta a wide band still
     /// carries). Combines passive-wide's positive expectancy with low variance.
@@ -506,6 +516,16 @@ fn run_policy(
         } => (enter_threshold, exit_threshold, window),
         _ => (f64::INFINITY, 0.0, 200),
     };
+    let delta_trend_stop = matches!(mode, RangeMode::DeltaTrendStop { .. });
+    let (trend_stop_enter, trend_stop_exit, trend_stop_window) = match mode {
+        RangeMode::DeltaTrendStop {
+            enter_threshold,
+            exit_threshold,
+            window,
+            ..
+        } => (enter_threshold, exit_threshold, window),
+        _ => (f64::INFINITY, 0.0, 25),
+    };
     let hedge_fraction = match mode {
         RangeMode::HedgedRebalance { hedge_fraction, .. } => hedge_fraction,
         _ => 0.0,
@@ -515,10 +535,13 @@ fn run_policy(
     // HedgedWide (wide, static) — only the range behaviour differs.
     let delta_hedged = matches!(
         mode,
-        RangeMode::DeltaHedged { .. } | RangeMode::HedgedWide { .. }
+        RangeMode::DeltaHedged { .. }
+            | RangeMode::DeltaTrendStop { .. }
+            | RangeMode::HedgedWide { .. }
     );
     let rehedge_band = match mode {
         RangeMode::DeltaHedged { rehedge_band, .. }
+        | RangeMode::DeltaTrendStop { rehedge_band, .. }
         | RangeMode::HedgedWide { rehedge_band, .. } => rehedge_band,
         _ => f64::INFINITY,
     };
@@ -651,6 +674,63 @@ fn run_policy(
                 // else: hold the band — no churn while neither trending nor ranging.
             } else if ranging {
                 // Resume LPing: re-form the LP ratio from the money leg.
+                let val = sidelined_token0;
+                let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                gas_usd += cfg.rebalance_gas_usd;
+                slippage_usd += slip;
+                rebalances += 1;
+                let half = next_half_width(&mode, &tick_window);
+                half_width_sum += half as f64;
+                half_width_count += 1;
+                let (nl, nu) = centered_range(swap.tick, half);
+                lower = nl;
+                upper = nu;
+                let net = (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                position = Some(Position::open_with_capital(
+                    cfg, post_sqrt, lower, upper, net,
+                ));
+                sidelined_token0 = 0.0;
+            }
+        } else if delta_trend_stop {
+            let regime = assess_regime(&tick_window, trend_stop_window);
+            let trending = regime.trend_strength >= trend_stop_enter;
+            let ranging = regime.trend_strength <= trend_stop_exit;
+            if position.is_some() {
+                let in_range = position.as_ref().unwrap().in_range(post_sqrt);
+                if trending {
+                    let (exec_sqrt, _) =
+                        price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                    let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                    let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                    let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                    gas_usd += cfg.rebalance_gas_usd;
+                    slippage_usd += slip;
+                    rebalances += 1;
+                    sidelined_token0 =
+                        (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                    position = None;
+                } else if !in_range && rebalance {
+                    let (exec_sqrt, exec_tick) =
+                        price_after_delay(swaps, i, swap.block, exec.action_delay_blocks);
+                    let val = position.as_ref().unwrap().value_token0(cfg, exec_sqrt);
+                    let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
+                    let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
+                    gas_usd += cfg.rebalance_gas_usd;
+                    slippage_usd += slip;
+                    rebalances += 1;
+                    let half = next_half_width(&mode, &tick_window);
+                    half_width_sum += half as f64;
+                    half_width_count += 1;
+                    let (nl, nu) = centered_range(exec_tick, half);
+                    lower = nl;
+                    upper = nu;
+                    let net = (val - (cfg.rebalance_gas_usd + slip) / cfg.token0_usd).max(0.0);
+                    position = Some(Position::open_with_capital(
+                        cfg, exec_sqrt, lower, upper, net,
+                    ));
+                }
+            } else if ranging {
                 let val = sidelined_token0;
                 let notional_usd = cfg.token0_to_usd(val) * cfg.rebalance_swap_fraction;
                 let slip = notional_usd * cfg.rebalance_slippage_bps / 10_000.0;
@@ -959,6 +1039,9 @@ fn initial_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         RangeMode::DeltaHedged {
             half_width_ticks, ..
         } => *half_width_ticks,
+        RangeMode::DeltaTrendStop {
+            half_width_ticks, ..
+        } => *half_width_ticks,
         RangeMode::HedgedWide {
             half_width_ticks, ..
         } => *half_width_ticks,
@@ -1007,6 +1090,9 @@ fn next_half_width(mode: &RangeMode, window: &[i32]) -> i32 {
         RangeMode::DeltaHedged {
             half_width_ticks, ..
         } => *half_width_ticks,
+        RangeMode::DeltaTrendStop {
+            half_width_ticks, ..
+        } => *half_width_ticks,
         RangeMode::HedgedWide {
             half_width_ticks, ..
         } => *half_width_ticks,
@@ -1024,6 +1110,7 @@ fn should_rebalance(mode: &RangeMode) -> bool {
             | RangeMode::HardExitStop { .. }
             | RangeMode::HedgedRebalance { .. }
             | RangeMode::DeltaHedged { .. }
+            | RangeMode::DeltaTrendStop { .. }
     )
 }
 
@@ -1257,6 +1344,8 @@ pub fn run_baseline_battery_with(
     if swaps.is_empty() {
         return Vec::new();
     }
+    let trend_stop_enter = (adaptive_trend_threshold / 2.0).max(2.0);
+    let trend_stop_exit = (trend_stop_enter / 2.0).max(1.0);
     vec![
         run_policy(swaps, cfg, exec, RangeMode::HoldInventory, "hold_50_50"),
         run_policy(
@@ -1355,6 +1444,19 @@ pub fn run_baseline_battery_with(
                 rehedge_band: 0.25,
             },
             "delta_hedged",
+        ),
+        run_policy(
+            swaps,
+            cfg,
+            exec,
+            RangeMode::DeltaTrendStop {
+                half_width_ticks: narrow_half_width,
+                rehedge_band: 0.25,
+                enter_threshold: trend_stop_enter,
+                exit_threshold: trend_stop_exit,
+                window: 25,
+            },
+            "delta_trend_stop",
         ),
         run_policy(
             swaps,
@@ -2209,6 +2311,61 @@ mod tests {
         assert!(
             delta.max_drawdown_usd < unhedged.max_drawdown_usd,
             "hedge should cap drawdown in a crash"
+        );
+    }
+
+    #[test]
+    fn delta_trend_stop_stands_down_inside_fast_trend() {
+        let cfg = cfg();
+        let exec = ExecConfig {
+            action_delay_blocks: 0,
+            block_seconds: 2.0,
+            funding_bps_per_day: 0.0,
+            risk_asset_is_token1: true,
+        };
+        let mut stream = scenario_swaps(Scenario::Calm, 80_000, 80, 600, 1e18, 1e24);
+        let trend = scenario_swaps(Scenario::Pump, 80_000, 240, 6_000, 1e18, 1e24);
+        stream.extend(trend);
+        for (i, s) in stream.iter_mut().enumerate() {
+            s.block = 1000 + i as u64;
+        }
+
+        let delta = run_policy(
+            &stream,
+            &cfg,
+            &exec,
+            RangeMode::DeltaHedged {
+                half_width_ticks: 100,
+                rehedge_band: 0.25,
+            },
+            "delta_hedged",
+        );
+        let stop = run_policy(
+            &stream,
+            &cfg,
+            &exec,
+            RangeMode::DeltaTrendStop {
+                half_width_ticks: 100,
+                rehedge_band: 0.25,
+                enter_threshold: 1.5,
+                exit_threshold: 0.75,
+                window: 15,
+            },
+            "delta_trend_stop",
+        );
+
+        assert!(
+            stop.swaps_in_range < delta.swaps_in_range,
+            "trend stop should stand down inside a fast trend ({} vs {})",
+            stop.swaps_in_range,
+            delta.swaps_in_range
+        );
+        assert!(stop.rebalances > 0, "trend stop should actively exit");
+        assert!(
+            stop.max_drawdown_usd < delta.max_drawdown_usd,
+            "trend stop drawdown {} should be below delta hedge {}",
+            stop.max_drawdown_usd,
+            delta.max_drawdown_usd
         );
     }
 
