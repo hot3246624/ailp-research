@@ -509,6 +509,8 @@ enum Command {
         #[arg(long = "grid-hedge-fraction", default_values_t = vec![0.0, 0.25, 0.5, 0.75, 1.0])]
         hedge_fractions: Vec<f64>,
         #[command(flatten)]
+        regime_rule: RegimeHedgeRuleArgs,
+        #[command(flatten)]
         params: NormalizedReplayParams,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
@@ -898,6 +900,71 @@ struct NormalizedReplayParams {
     reward_haircut: f64,
 }
 
+#[derive(Debug, Clone, Copy, clap::Args)]
+struct RegimeHedgeRuleArgs {
+    /// Hedge fraction used after a prior range window.
+    #[arg(long, default_value_t = 1.0)]
+    rule_range_hedge_fraction: f64,
+    /// Hedge fraction used after a prior volatile-range window.
+    #[arg(long, default_value_t = 1.0)]
+    rule_volatile_hedge_fraction: f64,
+    /// Hedge fraction used after a prior trend toward the money side.
+    #[arg(long, default_value_t = 0.25)]
+    rule_trend_money_hedge_fraction: f64,
+    /// Hedge fraction used after a prior trend toward the risk side.
+    #[arg(long, default_value_t = 1.0)]
+    rule_trend_risk_hedge_fraction: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct RegimeHedgeRule {
+    range_hedge_fraction: f64,
+    volatile_hedge_fraction: f64,
+    trend_money_hedge_fraction: f64,
+    trend_risk_hedge_fraction: f64,
+}
+
+impl From<RegimeHedgeRuleArgs> for RegimeHedgeRule {
+    fn from(value: RegimeHedgeRuleArgs) -> Self {
+        Self {
+            range_hedge_fraction: value.rule_range_hedge_fraction,
+            volatile_hedge_fraction: value.rule_volatile_hedge_fraction,
+            trend_money_hedge_fraction: value.rule_trend_money_hedge_fraction,
+            trend_risk_hedge_fraction: value.rule_trend_risk_hedge_fraction,
+        }
+    }
+}
+
+impl RegimeHedgeRule {
+    fn fractions(&self) -> [f64; 4] {
+        [
+            self.range_hedge_fraction,
+            self.volatile_hedge_fraction,
+            self.trend_money_hedge_fraction,
+            self.trend_risk_hedge_fraction,
+        ]
+    }
+
+    fn hedge_fraction_for_prior_regime(&self, regime: &str) -> f64 {
+        match regime {
+            "trend_down_money" => self.trend_money_hedge_fraction,
+            "trend_up_risk" => self.trend_risk_hedge_fraction,
+            "volatile_range" => self.volatile_hedge_fraction,
+            _ => self.range_hedge_fraction,
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "range={:.2},volatile={:.2},money_trend={:.2},risk_trend={:.2}",
+            self.range_hedge_fraction,
+            self.volatile_hedge_fraction,
+            self.trend_money_hedge_fraction,
+            self.trend_risk_hedge_fraction
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1277,6 +1344,7 @@ async fn main() -> Result<()> {
             step_swaps,
             min_windows,
             hedge_fractions,
+            regime_rule,
             params,
             format,
         } => replay_normalized_hedge_grid(
@@ -1286,6 +1354,7 @@ async fn main() -> Result<()> {
             step_swaps,
             min_windows,
             hedge_fractions,
+            regime_rule.into(),
             &params,
             format,
         )?,
@@ -2902,6 +2971,15 @@ async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()>
             if let Some(sample) = parse_solana_pool_swap_sample(&args, &sig, &tx) {
                 samples.push(sample);
             }
+            if scanned_signatures % 50 == 0 {
+                eprintln!(
+                    "sample progress scanned={} kept={} normalized={} tx_errors={}",
+                    scanned_signatures,
+                    samples.len(),
+                    normalized_preview_count(&samples),
+                    transaction_errors
+                );
+            }
             if sample_goal_reached(&args, &samples) {
                 break 'pages;
             }
@@ -2993,13 +3071,16 @@ async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()>
     Ok(())
 }
 
+fn normalized_preview_count(samples: &[SolanaPoolSwapSample]) -> usize {
+    samples
+        .iter()
+        .map(|sample| sample.normalized_swap_previews.len())
+        .sum()
+}
+
 fn sample_goal_reached(args: &SampleSolanaPoolSwapsArgs, samples: &[SolanaPoolSwapSample]) -> bool {
     if let Some(min_normalized_swaps) = args.min_normalized_swaps {
-        return samples
-            .iter()
-            .map(|sample| sample.normalized_swap_previews.len())
-            .sum::<usize>()
-            >= min_normalized_swaps;
+        return normalized_preview_count(samples) >= min_normalized_swaps;
     }
     samples.len() >= args.limit
 }
@@ -4777,6 +4858,7 @@ struct HedgeGridReport {
     config: serde_json::Value,
     rows: Vec<HedgeGridRow>,
     regime_rows: Vec<HedgeGridRegimeRow>,
+    rule_rows: Vec<HedgeGridRuleRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4802,6 +4884,20 @@ struct HedgeGridRegimeRow {
     windows: usize,
     win_rate_vs_hold_pct: f64,
     mean_net_vs_hold_usd: f64,
+    p05_net_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct HedgeGridRuleRow {
+    rule: String,
+    hedge_map: String,
+    windows: usize,
+    skipped_windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_pnl_usd: f64,
+    mean_net_vs_hold_usd: f64,
+    mean_net_apr_pct: Option<f64>,
     p05_net_apr_pct: Option<f64>,
     worst_max_drawdown_usd: f64,
 }
@@ -5377,11 +5473,19 @@ fn replay_normalized_hedge_grid(
     step_swaps: usize,
     min_windows: usize,
     hedge_fractions: Vec<f64>,
+    regime_rule: RegimeHedgeRule,
     overrides: &NormalizedReplayParams,
     format: OutputFormat,
 ) -> Result<()> {
     if hedge_fractions.is_empty() {
-        anyhow::bail!("pass at least one --hedge-fraction");
+        anyhow::bail!("pass at least one --grid-hedge-fraction");
+    }
+    for hedge_fraction in regime_rule.fractions() {
+        if !(0.0..=1.5).contains(&hedge_fraction) {
+            anyhow::bail!(
+                "regime rule hedge fraction {hedge_fraction} outside supported range 0.0..=1.5"
+            );
+        }
     }
     let mut rows = Vec::new();
     let mut label = String::new();
@@ -5461,6 +5565,7 @@ fn replay_normalized_hedge_grid(
         config,
         rows,
         regime_rows: summarize_hedge_regime_rows(&regime_source_rows),
+        rule_rows: summarize_lagged_regime_rule_rows(&regime_source_rows, &regime_rule),
     };
     emit_hedge_grid_report(report, format)
 }
@@ -5569,6 +5674,102 @@ fn summarize_hedge_regime_rows(rows: &[(f64, WindowPolicyRow)]) -> Vec<HedgeGrid
     out
 }
 
+fn summarize_lagged_regime_rule_rows(
+    rows: &[(f64, WindowPolicyRow)],
+    rule: &RegimeHedgeRule,
+) -> Vec<HedgeGridRuleRow> {
+    let hedged_rows = rows
+        .iter()
+        .filter(|(_, row)| row.policy == "hedged_narrow")
+        .map(|(hedge, row)| (*hedge, row.clone()))
+        .collect::<Vec<_>>();
+    if hedged_rows.is_empty() {
+        return Vec::new();
+    }
+    let mut window_indices = hedged_rows
+        .iter()
+        .map(|(_, row)| row.window_index)
+        .collect::<Vec<_>>();
+    window_indices.sort_unstable();
+    window_indices.dedup();
+
+    let mut selected = Vec::new();
+    let mut skipped = 0usize;
+    for window_index in window_indices {
+        if window_index == 0 {
+            skipped += 1;
+            continue;
+        }
+        let prior_regime = hedged_rows
+            .iter()
+            .find(|(_, row)| row.window_index + 1 == window_index)
+            .map(|(_, row)| row.regime.clone());
+        let Some(prior_regime) = prior_regime else {
+            skipped += 1;
+            continue;
+        };
+        let target_hedge = rule.hedge_fraction_for_prior_regime(&prior_regime);
+        if let Some((_, row)) = hedged_rows
+            .iter()
+            .filter(|(_, row)| row.window_index == window_index)
+            .min_by(|(left_hedge, _), (right_hedge, _)| {
+                (*left_hedge - target_hedge)
+                    .abs()
+                    .partial_cmp(&(*right_hedge - target_hedge).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            selected.push(row.clone());
+        } else {
+            skipped += 1;
+        }
+    }
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let net_aprs = selected
+        .iter()
+        .filter_map(|row| row.net_apr_pct)
+        .collect::<Vec<_>>();
+    vec![HedgeGridRuleRow {
+        rule: "lagged_regime_rule".to_string(),
+        hedge_map: rule.describe(),
+        windows: selected.len(),
+        skipped_windows: skipped,
+        win_rate_vs_hold_pct: mean_values(
+            &selected
+                .iter()
+                .map(|row| {
+                    if row.net_vs_hold_usd > 0.0 {
+                        100.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_pnl_usd: mean_values(
+            &selected
+                .iter()
+                .map(|row| row.net_pnl_usd)
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_vs_hold_usd: mean_values(
+            &selected
+                .iter()
+                .map(|row| row.net_vs_hold_usd)
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_apr_pct: mean_values_opt(&net_aprs),
+        p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
+        worst_max_drawdown_usd: selected
+            .iter()
+            .map(|row| row.max_drawdown_usd)
+            .fold(0.0, f64::max),
+    }]
+}
+
 fn emit_hedge_grid_report(report: HedgeGridReport, format: OutputFormat) -> Result<()> {
     if format == OutputFormat::Json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -5628,6 +5829,29 @@ fn emit_hedge_grid_report(report: HedgeGridReport, format: OutputFormat) -> Resu
                 row.mean_net_vs_hold_usd,
                 optional_pct(row.p05_net_apr_pct),
                 row.worst_max_drawdown_usd,
+            );
+        }
+    }
+    if !report.rule_rows.is_empty() {
+        println!();
+        println!("lagged regime rules:");
+        println!(
+            "{:<22} {:>4} {:>5} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9}  map",
+            "rule", "n", "skip", "win%", "meanNet", "meanVsH", "meanAPR", "p05APR", "worstDD"
+        );
+        for row in &report.rule_rows {
+            println!(
+                "{:<22} {:>4} {:>5} {:>7.0}% {:>10.2} {:>10.2} {:>9} {:>9} {:>9.2}  {}",
+                row.rule,
+                row.windows,
+                row.skipped_windows,
+                row.win_rate_vs_hold_pct,
+                row.mean_net_pnl_usd,
+                row.mean_net_vs_hold_usd,
+                optional_pct(row.mean_net_apr_pct),
+                optional_pct(row.p05_net_apr_pct),
+                row.worst_max_drawdown_usd,
+                row.hedge_map,
             );
         }
     }
@@ -7563,6 +7787,69 @@ mod tests {
             classify_window_regime(&trend_down).label,
             "trend_down_money"
         );
+    }
+
+    #[test]
+    fn lagged_regime_rule_uses_prior_window_to_select_hedge() {
+        let rule = RegimeHedgeRule {
+            range_hedge_fraction: 0.75,
+            volatile_hedge_fraction: 0.75,
+            trend_money_hedge_fraction: 0.25,
+            trend_risk_hedge_fraction: 1.0,
+        };
+        let rows = vec![
+            (0.25, hedge_window_row(0, "range", 1.0, -1.0, 100.0, 4.0)),
+            (0.75, hedge_window_row(0, "range", 2.0, -2.0, 200.0, 2.0)),
+            (
+                0.25,
+                hedge_window_row(1, "trend_down_money", 3.0, -3.0, 300.0, 3.0),
+            ),
+            (
+                0.75,
+                hedge_window_row(1, "trend_down_money", 9.0, 7.0, 900.0, 1.0),
+            ),
+        ];
+
+        let summary = summarize_lagged_regime_rule_rows(&rows, &rule);
+
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].windows, 1);
+        assert_eq!(summary[0].skipped_windows, 1);
+        assert_eq!(summary[0].mean_net_pnl_usd, 9.0);
+        assert_eq!(summary[0].mean_net_vs_hold_usd, 7.0);
+        assert_eq!(summary[0].p05_net_apr_pct, Some(900.0));
+    }
+
+    fn hedge_window_row(
+        window_index: usize,
+        regime: &str,
+        net_pnl_usd: f64,
+        net_vs_hold_usd: f64,
+        net_apr_pct: f64,
+        max_drawdown_usd: f64,
+    ) -> WindowPolicyRow {
+        WindowPolicyRow {
+            window_index,
+            swap_start: window_index,
+            swap_end_exclusive: window_index + 1,
+            swaps: 1,
+            block_first: window_index as u64,
+            block_last: window_index as u64 + 1,
+            tick_first: 0,
+            tick_last: 0,
+            tick_delta: 0,
+            trend_strength: 0.0,
+            regime: regime.to_string(),
+            minutes: 1.0,
+            policy: "hedged_narrow".to_string(),
+            net_pnl_usd,
+            net_vs_hold_usd,
+            fee_minus_lvr_usd: 0.0,
+            net_apr_pct: Some(net_apr_pct),
+            fee_lvr_apr_pct: None,
+            max_drawdown_usd,
+            rebalances: 0,
+        }
     }
 
     fn swaps_for_ticks(ticks: &[i32]) -> Vec<autopool_backtest::SwapObs> {

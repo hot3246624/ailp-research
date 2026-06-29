@@ -124,6 +124,14 @@ range windows favored heavier hedging for left-tail control, while the single
 fixed hedges versus hold. Treat this as a rule-design hint, not a deployable
 setting: the next useful step is regime-conditioned hedge sizing over more windows.
 
+The current hedge-grid command also prints a `lagged_regime_rule` row. It uses the
+prior window's regime to choose the next window's hedge fraction, avoiding direct
+lookahead. The default rule is now conservative in range-like states:
+`range=1.00`, `volatile=1.00`, `money_trend=0.25`, `risk_trend=1.00`. On the latest
+157-row combined CARDS-USDC sample, 25-swap/10-step windows showed 77% win rate vs
+hold, mean vs hold about +$9.31, p05 APR about +476%, and worst drawdown about
+$7.15. Caveat: this is still a small, overlapping-window sample.
+
 Schema:
 
 ```text

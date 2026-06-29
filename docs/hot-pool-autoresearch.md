@@ -347,6 +347,27 @@ the money side, and separate crash tests for risk-side trends. The `trend_*` lab
 assume the normalized replay convention where the stable/numeraire leg is token0 and
 the risk leg is token1.
 
+The hedge-grid command now also evaluates a no-lookahead `lagged_regime_rule`: skip
+the first window, use the prior window's regime label to choose the current window's
+fixed hedge fraction, and then summarize the selected windows. Default rule map:
+`range=1.00`, `volatile=1.00`, `money_trend=0.25`, `risk_trend=1.00`.
+
+The first 77-row sample was too small and favored a 0.75 range hedge in lagged
+40-swap windows. A fresh 80-row public-RPC refresh then flipped the range result
+toward 1.00. Combining both adjacent files into a 157-row segment gives the current
+best read:
+
+| combined sample | lagged rule map | windows | win vs hold | mean vs hold | p05 APR | worst DD |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 40 swaps / 15 step | range=1.00, volatile=1.00 | 7 | 57% | +$5.73 | ~-144% | $13.31 |
+| 25 swaps / 10 step | range=1.00, volatile=1.00 | 13 | 77% | +$9.31 | ~476% | $7.15 |
+| 25 swaps / 10 step | range=0.75, volatile=0.75 | 13 | 77% | +$7.98 | ~-2342% | $21.42 |
+
+Interpretation: the conservative 1.00 range/volatile hedge is now the better default
+for the lagged rule, but the evidence is still small and uses overlapping windows.
+The next bottleneck remains more normalized Raydium windows and then a true shadow
+monitor, not more in-sample rule tweaking.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:
