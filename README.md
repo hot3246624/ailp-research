@@ -156,6 +156,11 @@ be reconstructed, while Meteora remains a separate DLMM/bin replay track.
 The latest real Raydium `CARDS-USDC` replay smoke test decoded 50/50 recent swaps
 over a ~47.5 minute window; hedged narrow produced about $8.23 net on $10k with
 ~$0.33 max drawdown, while unhedged fee-rich variants still showed inventory drag.
+`replay-normalized-windows` now splits normalized swaps into rolling windows and
+reports win-rate-vs-hold, mechanical APR percentiles, fee-LVR APR, and worst
+drawdown. A 72-swap `CARDS-USDC` check confirmed that fee capture can be very high,
+but short-window left-tail APR and hedge-vs-beta tradeoffs are still too unstable
+for capital.
 
 ## External References
 

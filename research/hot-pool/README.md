@@ -80,6 +80,21 @@ normalized rows, replay window ~47.5 minutes. Hedged narrow/delta hedged produce
 about $8.23 net on $10k with $0.33 max drawdown; vol-scaled/adaptive captured more
 fee-LVR but stayed net negative because inventory drift dominated the short window.
 
+Rolling window replay:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-windows \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl \
+  --window-swaps 25 \
+  --step-swaps 10 \
+  --min-windows 4
+```
+
+Latest 72-row check produced 5 rolling windows. `vol_scaled_rebalance` won vs hold
+in 60% of windows with high fee-LVR APR but a very poor p05 net APR; fixed hedging
+kept drawdown small but underperformed in upside-beta windows.
+
 Schema:
 
 ```text

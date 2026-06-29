@@ -213,6 +213,17 @@ cargo run -p autopool-cli -- replay-normalized-swaps \
   --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl
 ```
 
+Replay rolling windows to test stability instead of trusting one short segment:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-windows \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl \
+  --window-swaps 25 \
+  --step-swaps 10 \
+  --min-windows 4
+```
+
 ```bash
 cargo run -p autopool-cli -- sample-solana-pool-swaps \
   --pool-address BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW \
@@ -265,6 +276,24 @@ Interpretation: the fee engine is hot enough to justify continued work, but inve
 direction dominates unhedged PnL even in a short window. The next useful milestone is
 multi-window replay that tests whether hedged narrow/vol-scaled variants repeatedly
 beat hold and passive wide after churn and capacity constraints.
+
+Latest multi-window check: a public-RPC slow scan landed 72 normalized `CARDS-USDC`
+rows. The full 16.2 minute segment showed `vol_scaled/adaptive` net PnL of about
+`$50.43` on `$10k`, with `$20.82` fee-LVR and `$73.08` max drawdown. Rolling
+25-swap windows with 10-swap steps produced 5 windows:
+
+| policy | win rate vs hold | mean net | mean net APR window | p05 net APR window | mean fee-LVR APR window | worst DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vol_scaled_rebalance | 60% | $14.95 | ~11251% | ~-54401% | ~8887% | $73.08 |
+| adaptive_regime | 40% | $9.89 | ~5739% | ~-57569% | ~9907% | $73.08 |
+| hedged_narrow | 40% | $1.45 | ~1809% | ~-589% | ~4831% | $9.01 |
+| hedged_wide | 40% | $0.19 | ~232% | ~-23% | ~555% | $0.96 |
+
+Interpretation: hot flow is real, but the strategy is not yet stable enough for
+capital. Fixed full hedging protects drawdown but can underperform badly during a
+fast upside move; unhedged/vol-scaled variants capture fees and beta but carry
+large inventory drawdown. The next research target is regime-aware hedge sizing and
+promotion gates based on multi-window win rate and left-tail APR, not headline APR.
 
 ## Autoresearch Rules Adapted To AILP
 

@@ -468,6 +468,26 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Replay normalized swaps over rolling fixed-size windows and summarize
+    /// policy stability, mechanical APR, and drawdown across windows.
+    ReplayNormalizedWindows {
+        #[arg(long)]
+        spec: PathBuf,
+        /// JSONL file of normalized SwapObs rows. Defaults to `swaps.jsonl` next to
+        /// the spec file.
+        #[arg(long)]
+        swaps: Option<PathBuf>,
+        #[arg(long, default_value_t = 50)]
+        window_swaps: usize,
+        #[arg(long, default_value_t = 25)]
+        step_swaps: usize,
+        #[arg(long, default_value_t = 2)]
+        min_windows: usize,
+        #[command(flatten)]
+        params: NormalizedReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Stress-test the range policies against a synthetic price scenario
     /// (calm / pump / crash / chop) when collected data lacks that regime.
     ReplayScenario {
@@ -1208,6 +1228,23 @@ async fn main() -> Result<()> {
             params,
             format,
         } => replay_normalized_swaps(spec, swaps, &params, format)?,
+        Command::ReplayNormalizedWindows {
+            spec,
+            swaps,
+            window_swaps,
+            step_swaps,
+            min_windows,
+            params,
+            format,
+        } => replay_normalized_windows(
+            spec,
+            swaps,
+            window_swaps,
+            step_swaps,
+            min_windows,
+            &params,
+            format,
+        )?,
         Command::ReplayScenario {
             scenario,
             start_tick,
@@ -4630,6 +4667,54 @@ struct ReplayReport {
     policies: Vec<autopool_backtest::PolicyReport>,
 }
 
+#[derive(Debug, Serialize)]
+struct NormalizedWindowReplayReport {
+    label: String,
+    swaps: usize,
+    window_swaps: usize,
+    step_swaps: usize,
+    windows: usize,
+    config: serde_json::Value,
+    summaries: Vec<WindowPolicySummary>,
+    rows: Vec<WindowPolicyRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WindowPolicyRow {
+    window_index: usize,
+    swap_start: usize,
+    swap_end_exclusive: usize,
+    swaps: usize,
+    block_first: u64,
+    block_last: u64,
+    minutes: f64,
+    policy: String,
+    net_pnl_usd: f64,
+    net_vs_hold_usd: f64,
+    fee_minus_lvr_usd: f64,
+    net_apr_pct: Option<f64>,
+    fee_lvr_apr_pct: Option<f64>,
+    max_drawdown_usd: f64,
+    rebalances: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct WindowPolicySummary {
+    policy: String,
+    windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_pnl_usd: f64,
+    mean_net_vs_hold_usd: f64,
+    mean_fee_minus_lvr_usd: f64,
+    mean_net_apr_pct: Option<f64>,
+    p05_net_apr_pct: Option<f64>,
+    p50_net_apr_pct: Option<f64>,
+    p95_net_apr_pct: Option<f64>,
+    mean_fee_lvr_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+    mean_rebalances: f64,
+}
+
 fn params_json(params: &ReplayParams) -> serde_json::Value {
     json!({
         "fee_bps": params.fee_bps,
@@ -4752,13 +4837,166 @@ fn replay_window_years(report: &ReplayReport, params: &ReplayParams) -> Option<f
     Some(((last - first) as f64 * params.block_seconds) / (365.0 * 24.0 * 60.0 * 60.0))
 }
 
-fn format_window_apr(value_usd: f64, capital_usd: f64, window_years: Option<f64>) -> String {
+fn replay_window_years_from_swaps(
+    swaps: &[autopool_backtest::SwapObs],
+    params: &ReplayParams,
+) -> Option<f64> {
+    let first = swaps.first()?.block;
+    let last = swaps.last()?.block;
+    if last <= first || params.block_seconds <= 0.0 {
+        return None;
+    }
+    Some(((last - first) as f64 * params.block_seconds) / (365.0 * 24.0 * 60.0 * 60.0))
+}
+
+fn window_apr_pct(value_usd: f64, capital_usd: f64, window_years: Option<f64>) -> Option<f64> {
     match window_years {
         Some(years) if years > 0.0 && capital_usd > 0.0 => {
-            format!("{:.0}%", value_usd / capital_usd / years * 100.0)
+            Some(value_usd / capital_usd / years * 100.0)
         }
-        _ => "-".to_string(),
+        _ => None,
     }
+}
+
+fn format_window_apr(value_usd: f64, capital_usd: f64, window_years: Option<f64>) -> String {
+    window_apr_pct(value_usd, capital_usd, window_years)
+        .map(|value| format!("{value:.0}%"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn summarize_window_rows(rows: &[WindowPolicyRow]) -> Vec<WindowPolicySummary> {
+    let mut policies = rows
+        .iter()
+        .map(|row| row.policy.clone())
+        .collect::<Vec<_>>();
+    policies.sort();
+    policies.dedup();
+    policies
+        .into_iter()
+        .filter_map(|policy| {
+            let policy_rows = rows
+                .iter()
+                .filter(|row| row.policy == policy)
+                .collect::<Vec<_>>();
+            if policy_rows.is_empty() {
+                return None;
+            }
+            let windows = policy_rows.len();
+            let net_aprs = policy_rows
+                .iter()
+                .filter_map(|row| row.net_apr_pct)
+                .collect::<Vec<_>>();
+            let fee_lvr_aprs = policy_rows
+                .iter()
+                .filter_map(|row| row.fee_lvr_apr_pct)
+                .collect::<Vec<_>>();
+            Some(WindowPolicySummary {
+                policy,
+                windows,
+                win_rate_vs_hold_pct: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| {
+                            if row.net_vs_hold_usd > 0.0 {
+                                100.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_pnl_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.net_pnl_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_vs_hold_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.net_vs_hold_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_fee_minus_lvr_usd: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.fee_minus_lvr_usd)
+                        .collect::<Vec<_>>(),
+                ),
+                mean_net_apr_pct: mean_values_opt(&net_aprs),
+                p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
+                p50_net_apr_pct: percentile_f64(&net_aprs, 50.0),
+                p95_net_apr_pct: percentile_f64(&net_aprs, 95.0),
+                mean_fee_lvr_apr_pct: mean_values_opt(&fee_lvr_aprs),
+                worst_max_drawdown_usd: policy_rows
+                    .iter()
+                    .map(|row| row.max_drawdown_usd)
+                    .fold(0.0, f64::max),
+                mean_rebalances: mean_values(
+                    &policy_rows
+                        .iter()
+                        .map(|row| row.rebalances as f64)
+                        .collect::<Vec<_>>(),
+                ),
+            })
+        })
+        .collect()
+}
+
+fn emit_normalized_window_report(
+    report: NormalizedWindowReplayReport,
+    format: OutputFormat,
+) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "window replay {} swaps={} windows={} window_swaps={} step_swaps={}",
+        report.label, report.swaps, report.windows, report.window_swaps, report.step_swaps
+    );
+    println!("APR columns are mechanical per-window annualization summaries, not forecasts");
+    println!(
+        "{:<22} {:>4} {:>8} {:>10} {:>10} {:>10} {:>10} {:>12} {:>10} {:>9}",
+        "policy",
+        "n",
+        "win%",
+        "meanNet",
+        "meanVsH",
+        "meanAPR",
+        "p05APR",
+        "feeLVRAPR",
+        "worstDD",
+        "reb/win"
+    );
+    for summary in &report.summaries {
+        println!(
+            "{:<22} {:>4} {:>7.0}% {:>10.2} {:>10.2} {:>9} {:>9} {:>11} {:>10.2} {:>9.2}",
+            summary.policy,
+            summary.windows,
+            summary.win_rate_vs_hold_pct,
+            summary.mean_net_pnl_usd,
+            summary.mean_net_vs_hold_usd,
+            optional_pct(summary.mean_net_apr_pct),
+            optional_pct(summary.p05_net_apr_pct),
+            optional_pct(summary.mean_fee_lvr_apr_pct),
+            summary.worst_max_drawdown_usd,
+            summary.mean_rebalances
+        );
+    }
+    Ok(())
+}
+
+fn mean_values(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn mean_values_opt(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| mean_values(values))
 }
 
 fn replay_events(
@@ -4842,6 +5080,107 @@ fn replay_normalized_swaps(
         policies,
     };
     emit_replay_report(report, &params, format)
+}
+
+fn replay_normalized_windows(
+    spec_path: PathBuf,
+    swaps_path: Option<PathBuf>,
+    window_swaps: usize,
+    step_swaps: usize,
+    min_windows: usize,
+    overrides: &NormalizedReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    if window_swaps == 0 || step_swaps == 0 {
+        anyhow::bail!("window_swaps and step_swaps must be positive");
+    }
+    let spec = read_replay_pool_spec(&spec_path)?;
+    if spec.replay_model != "clmm_tick_replay" {
+        anyhow::bail!(
+            "unsupported replay_model `{}` in {}; normalized windows currently supports clmm_tick_replay only",
+            spec.replay_model,
+            spec_path.display()
+        );
+    }
+    let swaps_path = swaps_path.unwrap_or_else(|| {
+        spec_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("swaps.jsonl")
+    });
+    let params = overrides.to_replay_params(&spec)?;
+    let mut swaps = load_normalized_swaps(&swaps_path)?;
+    if params.invert {
+        for swap in &mut swaps {
+            *swap = swap.inverted();
+        }
+    }
+    if swaps.len() < window_swaps {
+        anyhow::bail!(
+            "need at least {} swaps for one window, found {} in {}",
+            window_swaps,
+            swaps.len(),
+            swaps_path.display()
+        );
+    }
+
+    let mut rows = Vec::new();
+    let mut window_index = 0usize;
+    let mut start = 0usize;
+    while start + window_swaps <= swaps.len() {
+        let end = start + window_swaps;
+        let window = &swaps[start..end];
+        let years = replay_window_years_from_swaps(window, &params);
+        let minutes = years.unwrap_or(0.0) * 365.0 * 24.0 * 60.0;
+        let policies = run_battery(&params, window);
+        for policy in policies {
+            rows.push(WindowPolicyRow {
+                window_index,
+                swap_start: start,
+                swap_end_exclusive: end,
+                swaps: window.len(),
+                block_first: window.first().map(|swap| swap.block).unwrap_or(0),
+                block_last: window.last().map(|swap| swap.block).unwrap_or(0),
+                minutes,
+                policy: policy.policy,
+                net_pnl_usd: policy.net_pnl_usd,
+                net_vs_hold_usd: policy.net_vs_hold_usd,
+                fee_minus_lvr_usd: policy.fee_minus_lvr_usd,
+                net_apr_pct: window_apr_pct(policy.net_pnl_usd, params.capital_usd, years),
+                fee_lvr_apr_pct: window_apr_pct(
+                    policy.fee_minus_lvr_usd,
+                    params.capital_usd,
+                    years,
+                ),
+                max_drawdown_usd: policy.max_drawdown_usd,
+                rebalances: policy.rebalances,
+            });
+        }
+        window_index += 1;
+        start += step_swaps;
+    }
+    if window_index < min_windows {
+        anyhow::bail!(
+            "need at least {} windows, got {} (swaps={}, window_swaps={}, step_swaps={})",
+            min_windows,
+            window_index,
+            swaps.len(),
+            window_swaps,
+            step_swaps
+        );
+    }
+
+    let report = NormalizedWindowReplayReport {
+        label: format!("{} ({})", spec.symbol, spec.pool_address),
+        swaps: swaps.len(),
+        window_swaps,
+        step_swaps,
+        windows: window_index,
+        config: params_json(&params),
+        summaries: summarize_window_rows(&rows),
+        rows,
+    };
+    emit_normalized_window_report(report, format)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6411,6 +6750,24 @@ fn percentile_ticks(values: &[i32], percentile: f64) -> Option<f64> {
     .map(|value| (value * 100.0).round() / 100.0)
 }
 
+fn percentile_f64(values: &[f64], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = (sorted.len() - 1) as f64 * percentile / 100.0;
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    if lower == upper {
+        Some(sorted[lower])
+    } else {
+        let weight_upper = index - lower as f64;
+        let weight_lower = 1.0 - weight_upper;
+        Some(sorted[lower] * weight_lower + sorted[upper] * weight_upper)
+    }
+}
+
 fn decode_swap_tick_lossy(data: &str) -> Option<i32> {
     let words = abi_words(data)?;
     let word = words.get(4)?;
@@ -6470,6 +6827,12 @@ fn optional_i32(value: Option<i32>) -> String {
 fn optional_f64(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn optional_pct(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.0}%"))
         .unwrap_or_else(|| "-".to_string())
 }
 
