@@ -301,6 +301,10 @@ enum Command {
         token0_mint: String,
         #[arg(long)]
         token1_mint: String,
+        /// Active pool liquidity to attach to normalized swaps when the venue event
+        /// does not emit per-swap liquidity, e.g. Orca Whirlpool Traded events.
+        #[arg(long)]
+        active_liquidity: Option<f64>,
         #[arg(long, default_value_t = 25)]
         limit: usize,
         #[arg(long, default_value_t = 100)]
@@ -1212,6 +1216,7 @@ async fn main() -> Result<()> {
             program_id,
             token0_mint,
             token1_mint,
+            active_liquidity,
             limit,
             signature_scan_limit,
             max_signature_pages,
@@ -1228,6 +1233,7 @@ async fn main() -> Result<()> {
                 program_id,
                 token0_mint,
                 token1_mint,
+                active_liquidity,
                 limit,
                 signature_scan_limit,
                 max_signature_pages,
@@ -2925,6 +2931,11 @@ const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgr
 const RAYDIUM_CLMM_SWAP_EVENT_DISCRIMINATOR: [u8; 8] =
     [0x40, 0xc6, 0xcd, 0xe8, 0x26, 0x08, 0x71, 0xe2];
 const RAYDIUM_CLMM_SWAP_EVENT_LEN: usize = 221;
+const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+const ORCA_WHIRLPOOL_TRADED_EVENT_DISCRIMINATOR: [u8; 8] =
+    [0xe1, 0xca, 0x49, 0xaf, 0x93, 0x2b, 0xa0, 0x96];
+const ORCA_WHIRLPOOL_TRADED_EVENT_LEN: usize = 121;
+const TWO_POW_64_F64: f64 = 18_446_744_073_709_551_616.0;
 const TWO_POW_32_F64: f64 = 4_294_967_296.0;
 
 #[derive(Debug, Clone)]
@@ -2934,6 +2945,7 @@ struct SampleSolanaPoolSwapsArgs {
     program_id: String,
     token0_mint: String,
     token1_mint: String,
+    active_liquidity: Option<f64>,
     limit: usize,
     signature_scan_limit: usize,
     max_signature_pages: usize,
@@ -2962,6 +2974,7 @@ struct SolanaPoolSwapSample {
     program_data_count: usize,
     program_data_base64: Vec<String>,
     raydium_clmm_events: Vec<RaydiumClmmSwapEvent>,
+    orca_whirlpool_events: Vec<OrcaWhirlpoolTradedEvent>,
     normalized_swap_previews: Vec<SolanaSwapObsPreview>,
 }
 
@@ -2983,6 +2996,22 @@ struct RaydiumClmmSwapEvent {
     tick: i32,
     trade_fee_0: u64,
     trade_fee_1: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OrcaWhirlpoolTradedEvent {
+    whirlpool: String,
+    a_to_b: bool,
+    #[serde(serialize_with = "serialize_u128_as_string")]
+    pre_sqrt_price: u128,
+    #[serde(serialize_with = "serialize_u128_as_string")]
+    post_sqrt_price: u128,
+    input_amount: u64,
+    output_amount: u64,
+    input_transfer_fee: u64,
+    output_transfer_fee: u64,
+    lp_fee: u64,
+    protocol_fee: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -3320,29 +3349,55 @@ fn parse_solana_pool_swap_sample(
     } else {
         Vec::new()
     };
+    let orca_matches = if args.program_id == ORCA_WHIRLPOOL_PROGRAM_ID {
+        matching_orca_whirlpool_traded_events(&invocations, &args.pool_address)
+    } else {
+        Vec::new()
+    };
     let instruction = raydium_matches
         .first()
         .map(|(instruction, _, _)| instruction.clone())
+        .or_else(|| {
+            orca_matches
+                .first()
+                .map(|(instruction, _, _)| instruction.clone())
+        })
         .unwrap_or_else(|| invocations[0].instruction.clone());
-    let program_data_base64 = if raydium_matches.is_empty() {
-        invocations
-            .iter()
-            .flat_map(|invocation| invocation.program_data_base64.iter().cloned())
-            .collect::<Vec<_>>()
-    } else {
+    let program_data_base64 = if !raydium_matches.is_empty() {
         raydium_matches
             .iter()
             .map(|(_, data, _)| data.clone())
+            .collect::<Vec<_>>()
+    } else if !orca_matches.is_empty() {
+        orca_matches
+            .iter()
+            .map(|(_, data, _)| data.clone())
+            .collect::<Vec<_>>()
+    } else {
+        invocations
+            .iter()
+            .flat_map(|invocation| invocation.program_data_base64.iter().cloned())
             .collect::<Vec<_>>()
     };
     let raydium_clmm_events = raydium_matches
         .into_iter()
         .map(|(_, _, event)| event)
         .collect::<Vec<_>>();
-    let normalized_swap_previews = raydium_clmm_events
+    let orca_whirlpool_events = orca_matches
+        .into_iter()
+        .map(|(_, _, event)| event)
+        .collect::<Vec<_>>();
+    let mut normalized_swap_previews = raydium_clmm_events
         .iter()
         .map(raydium_event_to_swap_obs_preview)
         .collect::<Vec<_>>();
+    if let Some(active_liquidity) = args.active_liquidity {
+        normalized_swap_previews.extend(
+            orca_whirlpool_events
+                .iter()
+                .map(|event| orca_event_to_swap_obs_preview(event, active_liquidity)),
+        );
+    }
 
     Some(SolanaPoolSwapSample {
         signature: sig.signature.clone(),
@@ -3360,6 +3415,7 @@ fn parse_solana_pool_swap_sample(
         program_data_count: program_data_base64.len(),
         program_data_base64,
         raydium_clmm_events,
+        orca_whirlpool_events,
         normalized_swap_previews,
     })
 }
@@ -3428,6 +3484,62 @@ fn matching_raydium_clmm_swap_events(
         .collect()
 }
 
+fn decode_orca_whirlpool_traded_event(
+    program_data_base64: &str,
+    expected_pool_address: &str,
+) -> Option<OrcaWhirlpoolTradedEvent> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(program_data_base64)
+        .ok()?;
+    if bytes.len() < ORCA_WHIRLPOOL_TRADED_EVENT_LEN {
+        return None;
+    }
+    if bytes.get(0..8)? != ORCA_WHIRLPOOL_TRADED_EVENT_DISCRIMINATOR {
+        return None;
+    }
+    let mut offset = 8; // Anchor event discriminator.
+    let whirlpool = read_pubkey_base58(&bytes, &mut offset)?;
+    let a_to_b = read_bool(&bytes, &mut offset)?;
+    let pre_sqrt_price = read_u128_le(&bytes, &mut offset)?;
+    let post_sqrt_price = read_u128_le(&bytes, &mut offset)?;
+    let input_amount = read_u64_le(&bytes, &mut offset)?;
+    let output_amount = read_u64_le(&bytes, &mut offset)?;
+    let input_transfer_fee = read_u64_le(&bytes, &mut offset)?;
+    let output_transfer_fee = read_u64_le(&bytes, &mut offset)?;
+    let lp_fee = read_u64_le(&bytes, &mut offset)?;
+    let protocol_fee = read_u64_le(&bytes, &mut offset)?;
+    if whirlpool != expected_pool_address {
+        return None;
+    }
+    Some(OrcaWhirlpoolTradedEvent {
+        whirlpool,
+        a_to_b,
+        pre_sqrt_price,
+        post_sqrt_price,
+        input_amount,
+        output_amount,
+        input_transfer_fee,
+        output_transfer_fee,
+        lp_fee,
+        protocol_fee,
+    })
+}
+
+fn matching_orca_whirlpool_traded_events(
+    invocations: &[SolanaProgramSwapInvocation],
+    expected_pool_address: &str,
+) -> Vec<(String, String, OrcaWhirlpoolTradedEvent)> {
+    invocations
+        .iter()
+        .flat_map(|invocation| {
+            invocation.program_data_base64.iter().filter_map(|data| {
+                decode_orca_whirlpool_traded_event(data, expected_pool_address)
+                    .map(|event| (invocation.instruction.clone(), data.clone(), event))
+            })
+        })
+        .collect()
+}
+
 fn raydium_event_to_swap_obs_preview(event: &RaydiumClmmSwapEvent) -> SolanaSwapObsPreview {
     let amount0 = if event.zero_for_one {
         event.amount_0 as f64
@@ -3446,6 +3558,38 @@ fn raydium_event_to_swap_obs_preview(event: &RaydiumClmmSwapEvent) -> SolanaSwap
         liquidity: event.liquidity as f64,
         tick: event.tick,
     }
+}
+
+fn orca_event_to_swap_obs_preview(
+    event: &OrcaWhirlpoolTradedEvent,
+    active_liquidity: f64,
+) -> SolanaSwapObsPreview {
+    let amount0 = if event.a_to_b {
+        event.input_amount as f64
+    } else {
+        -(event.output_amount as f64)
+    };
+    let amount1 = if event.a_to_b {
+        -(event.output_amount as f64)
+    } else {
+        event.input_amount as f64
+    };
+    SolanaSwapObsPreview {
+        amount0,
+        amount1,
+        sqrt_price_x96: event.post_sqrt_price as f64 * TWO_POW_32_F64,
+        liquidity: active_liquidity,
+        tick: sqrt_price_x64_to_tick(event.post_sqrt_price),
+    }
+}
+
+fn sqrt_price_x64_to_tick(sqrt_price_x64: u128) -> i32 {
+    let sqrt_price = sqrt_price_x64 as f64 / TWO_POW_64_F64;
+    if sqrt_price <= 0.0 {
+        return 0;
+    }
+    let price = sqrt_price * sqrt_price;
+    (price.ln() / 1.0001_f64.ln()).floor() as i32
 }
 
 fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a [u8]> {
@@ -8252,6 +8396,31 @@ mod tests {
     }
 
     #[test]
+    fn decodes_orca_whirlpool_traded_event() {
+        let event = decode_orca_whirlpool_traded_event(
+            "4cpJr5MroJagiLqrLe0uP/OPax1CHnJdDCxAWO8Yb0V1+iIh9IY5iQHs+XQLw0dZFAcAAAAAAAAAW1DyDBJGWRQHAAAAAAAAAMhwCAAAAAAACVumAQAAAAAAAAAAAAAAAAAAAAAAAAAAAwMAAAAAAABzAAAAAAAAAA==",
+            "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW",
+        )
+        .expect("valid Orca Whirlpool traded event");
+
+        assert_eq!(
+            event.whirlpool,
+            "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+        );
+        assert!(event.a_to_b);
+        assert_eq!(event.pre_sqrt_price, 130_593_490_572_689_078_764);
+        assert_eq!(event.post_sqrt_price, 130_593_488_712_993_230_939);
+        assert_eq!(event.input_amount, 553_160);
+        assert_eq!(event.output_amount, 27_679_497);
+
+        let preview = orca_event_to_swap_obs_preview(&event, 267_836_504_483_179.0);
+        assert_eq!(preview.amount0, 553_160.0);
+        assert_eq!(preview.amount1, -27_679_497.0);
+        assert_eq!(preview.tick, 39_145);
+        assert_eq!(preview.liquidity, 267_836_504_483_179.0);
+    }
+
+    #[test]
     fn sample_goal_can_require_normalized_rows() {
         let args = SampleSolanaPoolSwapsArgs {
             rpc_url: "http://localhost".to_string(),
@@ -8259,6 +8428,7 @@ mod tests {
             program_id: RAYDIUM_CLMM_PROGRAM_ID.to_string(),
             token0_mint: "token0".to_string(),
             token1_mint: "token1".to_string(),
+            active_liquidity: None,
             limit: 10,
             signature_scan_limit: 100,
             max_signature_pages: 2,
@@ -8500,6 +8670,7 @@ mod tests {
             program_data_count: 1,
             program_data_base64: vec!["data".to_string()],
             raydium_clmm_events: Vec::new(),
+            orca_whirlpool_events: Vec::new(),
             normalized_swap_previews,
         }
     }

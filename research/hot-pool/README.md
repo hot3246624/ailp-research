@@ -169,10 +169,29 @@ net APR and a stable edge over hold before shadow monitoring.
 The latest scout also says the best near-term opportunities are not Raydium-only.
 Current hot candidates are mostly Meteora DLMM and Orca Whirlpool pools. Meteora
 proxy APRs are often much higher, but they require a DLMM replay adapter before they
-are actionable. Orca `SOL-PUMP` remains P0 for replay, but still needs Whirlpool
-liquidity reconstruction. Raydium infrastructure is now useful for EVM/Solana style
-execution research, but current Raydium hot candidates are either CARDS rejected by
-the gate or WSOL-CX rejected as severe-risk until replay proves otherwise.
+are actionable. Orca `SOL-PUMP` is now replayable through the Whirlpool `Traded`
+event adapter, using snapshot active liquidity until historical liquidity snapshots
+are added. Raydium infrastructure is useful for EVM/Solana style execution research,
+but current Raydium hot candidates are either CARDS rejected by the gate or WSOL-CX
+rejected as severe-risk until replay proves otherwise.
+
+Orca `SOL-PUMP` first replay:
+
+```text
+sample A: scanned 408 signatures, kept 80 normalized swaps, tx_errors=0
+sample B: scanned 303 signatures, kept 80 normalized swaps, tx_errors=0
+merged:   160 unique swaps, slot span 429614430..429620972, tick span 39003..39161
+```
+
+With `narrow_half_width=100`, `$10k` capital, SOL marked near `$72.28`, and
+snapshot active liquidity, the merged replay is risk-control evidence rather than
+deployability evidence. `delta_hedged` improved hold by about `$70.31` and cut max
+drawdown to about `$12.99`, but still lost about `$6.02` net on the segment.
+`hedged_wide` reduced drawdown further while earning little fee alpha. Promotion gate
+returned `reject_replay`: 20/40/60-swap windows all beat hold on average, but their
+p05 mechanical APR remained deeply negative. Next useful work is broader Whirlpool
+coverage or historical active-liquidity reconstruction, not overfitting this short
+SOL-PUMP segment.
 
 Schema:
 

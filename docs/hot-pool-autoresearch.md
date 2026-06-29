@@ -246,6 +246,7 @@ cargo run -p autopool-cli -- sample-solana-pool-swaps \
   --program-id whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc \
   --token0-mint So11111111111111111111111111111111111111112 \
   --token1-mint pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn \
+  --active-liquidity 267836504483179 \
   --limit 8 \
   --signature-scan-limit 50 \
   --output data/solana/swaps/orca-sol-pump-sample.json
@@ -258,16 +259,20 @@ This command extracts:
 - signed pool-owned token vault deltas for both pool mints.
 - Raydium CLMM `SwapEvent` fields and a normalized `SwapObs` preview when the
   program is `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`.
+- Orca Whirlpool `Traded` event fields and a normalized `SwapObs` preview when the
+  program is `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc`. Orca events do not emit
+  per-swap active liquidity, so the first adapter pass uses `--active-liquidity`
+  from the discovery/spec snapshot until historical account-state snapshots are added.
 - paginated signature scans via `--max-signature-pages` and
   `--before-signature`, plus `--min-normalized-swaps` so replay collection can
   target decoded rows rather than raw transaction count.
 
 Current result: both Raydium `CARDS-USDC` and Orca `SOL-PUMP` produce clean recent
 swap samples with one program-data payload per swap. Raydium CLMM now decodes into
-post-swap sqrt price, tick, active liquidity, and signed amount preview; the next
-step is collecting a larger multi-window JSONL sample and comparing
-`replay-normalized-swaps` results against proxy APR and passive baselines. Orca needs
-a separate liquidity reconstruction step before it can be replayed with comparable
+post-swap sqrt price, tick, active liquidity, and signed amount preview. Orca
+Whirlpool now decodes `Traded` into post-swap sqrt price, inferred tick, signed
+amounts, and a snapshot-liquidity normalized preview. Orca still needs historical
+active-liquidity reconstruction before its fee-share estimates have Raydium-level
 precision.
 
 First smoke test: scanning 80 recent `CARDS-USDC` pool signatures landed 20 swaps,
@@ -409,9 +414,51 @@ APR is a detector, not a deployment claim.
 Latest scout/proxy read: the active hot-pool surface has shifted toward Meteora DLMM
 and Orca Whirlpool candidates. Meteora proxy APRs can be much higher than the current
 Raydium set, but they are not actionable until DLMM bin/liquidity replay exists. Orca
-`SOL-PUMP` remains the most practical non-Raydium P0, pending Whirlpool replay. Raydium
-is no longer the bottleneck for process quality; it is mainly a solved adapter path
-with no currently promoted hot pool.
+`SOL-PUMP` is now replayable through the Whirlpool event adapter, while Raydium is no
+longer the bottleneck for process quality; it is mainly a solved adapter path with no
+currently promoted hot pool.
+
+### Orca SOL-PUMP Replay
+
+The first Whirlpool normalized replay used two public-RPC pages:
+
+```text
+sample A: scanned 408 signatures, kept 80 normalized swaps, tx_errors=0
+sample B: scanned 303 signatures, kept 80 normalized swaps, tx_errors=0
+merged:   160 unique swaps, slot span 429614430..429620972, tick span 39003..39161
+```
+
+The replay uses `SOL` as token0 and a spot USD anchor near `$72.28`; this is enough
+for research PnL marking but not a trading oracle. With `narrow_half_width=100`,
+`wide_half_width=2500`, `$10k` capital, and the snapshot active liquidity from the
+Orca discovery row, the full merged replay shows the real shape of the opportunity:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | -$76.33 | $0.00 | $0.00 | $0.00 | ~-9199% | $78.29 |
+| narrow_rebalance | -$98.55 | -$22.22 | $16.76 | $6.43 | ~-11877% | $100.75 |
+| hedged_narrow | -$21.74 | +$54.60 | $16.76 | $6.43 | ~-2619% | $27.63 |
+| delta_hedged | -$6.02 | +$70.31 | $16.76 | $6.43 | ~-726% | $12.99 |
+| hedged_wide | -$1.54 | +$74.79 | $0.96 | $0.52 | ~-186% | $1.63 |
+
+Interpretation: the hedge layer clearly reduces directional damage versus hold, but
+this is not yet a positive-fee-alpha strategy. The pool moved through a sharp
+directional segment; pure narrow LP collected fees but was dominated by inventory
+loss. `delta_hedged` and `hedged_wide` are useful risk controls, not evidence of a
+500%+ deployable APR.
+
+Promotion gate on the same 160-row replay returns `reject_replay`:
+
+| window | lagged windows | win vs hold | mean vs hold | p05 APR | worst DD | result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 20 swaps / 10 step | 14 | 93% | +$10.50 | ~-20431% | $5.42 | fail left tail |
+| 40 swaps / 15 step | 8 | 100% | +$19.01 | ~-38415% | $13.71 | fail left tail |
+| 60 swaps / 20 step | 5 | 100% | +$24.69 | ~-12693% | $25.95 | fail left tail |
+
+This result is valuable because it upgrades Orca from proxy APR to replay-based
+rejection. Next useful work is not more tuning on this exact 43-minute segment; it is
+either more Whirlpool coverage across different pools/regimes or historical
+liquidity reconstruction to remove the snapshot-liquidity approximation.
 
 ## Autoresearch Rules Adapted To AILP
 
