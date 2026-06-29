@@ -460,6 +460,49 @@ rejection. Next useful work is not more tuning on this exact 43-minute segment; 
 either more Whirlpool coverage across different pools/regimes or historical
 liquidity reconstruction to remove the snapshot-liquidity approximation.
 
+### Orca SOL-GRASS Replay
+
+Refreshing the hot-pool queue promoted `SOL-GRASS` as the cleanest current Orca P0
+candidate: about `314%` 24h fee APR, `30bps` fee tier, about `$72k` TVL, about
+`$207k` 24h volume, and no discovery warnings. The Whirlpool adapter collected two
+public-RPC pages cleanly:
+
+```text
+sample A: scanned 86 signatures, kept 80 normalized swaps, tx_errors=0
+sample B: scanned 85 signatures, kept 80 normalized swaps, tx_errors=0
+merged:   160 unique swaps, slot span 429623681..429644467, tick span 49488..49876
+```
+
+With `narrow_half_width=384`, `wide_half_width=2500`, `$10k` capital, SOL marked near
+`$72.93`, and snapshot active liquidity, the full merged replay was again risk-control
+evidence rather than a deployable strategy:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hold_50_50 | -$159.08 | $0.00 | $0.00 | $0.00 | ~-6034% | $190.02 |
+| narrow_rebalance | -$247.37 | -$88.29 | $13.56 | $8.51 | ~-9383% | $278.42 |
+| hedged_narrow | -$88.16 | +$70.92 | $13.56 | $8.51 | ~-3344% | $89.63 |
+| delta_hedged | -$21.39 | +$137.69 | $13.56 | $8.51 | ~-811% | $22.91 |
+| hedged_wide | -$7.61 | +$151.47 | $3.33 | $2.51 | ~-289% | $12.65 |
+
+Rolling 20-swap windows gave `hedged_wide` mean net about `+$0.12`, p05 APR about
+`-101%`, and worst drawdown about `$0.52`. The lagged promotion gate returned
+`reject_replay`: 20/40/60-swap windows all had positive mean-vs-hold but p05 APR
+around `-1399%`, `-1238%`, and `-1486%`.
+
+Interpretation: `SOL-GRASS` is more active and cleaner than `SOL-PUMP`, but the same
+strategic issue remains. Hedging reduces directional loss dramatically; it does not
+yet turn Whirlpool hot-pool LP into stable positive APR. Current strategy status is
+not fixed/deployable. The only defensible shape today is:
+
+```text
+hot-pool detector -> normalized replay -> promotion gate -> reject or shadow
+```
+
+The deployable strategy still needs either better pool selection, historical
+liquidity reconstruction, or a different range/hedge rule that clears left-tail APR
+instead of merely improving loss versus hold.
+
 ## Autoresearch Rules Adapted To AILP
 
 Inspired by `karpathy/autoresearch`, every strategy idea must use the same loop:

@@ -193,6 +193,27 @@ p05 mechanical APR remained deeply negative. Next useful work is broader Whirlpo
 coverage or historical active-liquidity reconstruction, not overfitting this short
 SOL-PUMP segment.
 
+Orca `SOL-GRASS` follow-up replay:
+
+```text
+sample A: scanned 86 signatures, kept 80 normalized swaps, tx_errors=0
+sample B: scanned 85 signatures, kept 80 normalized swaps, tx_errors=0
+merged:   160 unique swaps, slot span 429623681..429644467, tick span 49488..49876
+```
+
+This was the current cleanest Orca P0 candidate: ~314% 24h fee APR, ~30bps fee tier,
+~$72k TVL, no discovery warnings, and high sample hit-rate. It still did not promote.
+With `narrow_half_width=384`, `$10k` capital, SOL marked near `$72.93`, and snapshot
+active liquidity, the full merged replay had `delta_hedged` at about `-$21.39` net
+versus hold at about `-$159.08`; `hedged_wide` was about `-$7.61` with ~$12.65 max
+drawdown. Rolling 20-swap windows showed `hedged_wide` mean net around `+$0.12` but
+p05 APR around `-101%`; the lagged promotion gate returned `reject_replay` with p05
+APR around `-1399%`, `-1238%`, and `-1486%` across 20/40/60-swap families.
+
+Current Whirlpool read: the hedge machinery is useful risk control, but it has not
+yet shown a stable positive-fee-alpha strategy. Reported hot-pool APR is still a
+candidate alarm, not a deployable strategy APR.
+
 Schema:
 
 ```text
