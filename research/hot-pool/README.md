@@ -510,6 +510,16 @@ p05 APR about `-11134%`; static mean net `-$1.68`, mean vs hold `+$1.05`, p05 AP
 about `-10580%`; cap/active-liq stayed about `0.03x`. HYPE is capacity-good but still
 not strategy-approved.
 
+Latest continuation: HYPE strict 250-slot remained stalled at 10 joined rows after 95
+flow rows, and the 400-slot scout repeated the same 32 joined rows / 4 windows with
+left-tail rejection. Two other Meteora USDC pools were probed. `cbBTC-USDC` decoded
+25 swaps with active-bin liquidity around `$4.1k`, but joined 0 rows under 250 slots
+and only 2 under 400; capacity for `$1k` is borderline at about `0.24x`.
+`SPCX-USDC` decoded 25 swaps with active-bin liquidity around `$8.6k`, joined 4 rows
+under 250 slots and 6 under 400; capacity is better at about `0.12x`, but no replay
+window exists yet. SPCX is now the more useful live-shadow continuation than HYPE or
+cbBTC, unless a fresh Meteora queue reveals a higher active-liquidity USDC pool.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text

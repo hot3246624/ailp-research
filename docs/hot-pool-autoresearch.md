@@ -1058,6 +1058,26 @@ bounded run is either one more strict 250-slot HYPE collection to reach the firs
 near-slot window, or a switch to another high-capacity Meteora USDC pool if HYPE keeps
 replaying the same left-tail failure.
 
+The next heartbeat reran HYPE and confirmed the stall: strict 250-slot still had 10
+joined rows after 95 flow rows and 14 snapshots, so it remained below the first rolling
+window. The 400-slot scout also stayed on the same 32 joined rows and 4 windows, with
+the same `left_tail_apr` rejection. That makes further HYPE sampling lower priority
+unless fresh flow starts joining near-slot.
+
+Two additional Meteora USDC candidates were then checked with the same live-shadow
+runner:
+
+```text
+cbBTC-USDC 4bps: active-liq ~$4.1k, 25 decoded swaps, 0 joined under 250 slots, 2 joined under 400 slots
+SPCX-USDC 10bps: active-liq ~$8.6k, 25 decoded swaps, 4 joined under 250 slots, 6 joined under 400 slots
+```
+
+cbBTC is too close to the capacity ceiling for `$1k` capital (`~0.24x` cap/active-liq)
+and still lacks replay windows. SPCX has better capacity (`~0.12x`) and clean decoding
+but also lacks enough joined rows for a promotion gate. The next useful heartbeat is
+to continue SPCX same-slot sampling, or refresh the Meteora queue for a higher
+active-liquidity USDC-numeraire pool rather than spending more cycles on HYPE.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
