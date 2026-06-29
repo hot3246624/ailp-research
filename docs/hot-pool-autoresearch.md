@@ -410,6 +410,9 @@ lagged-policy-switch` evaluates a no-lookahead regime switch that chooses the cu
 window's policy from the prior window's regime. The default switch is
 `range=delta_hedged`, `volatile=hedged_wide`, `money_trend=hedged_wide`, and
 `risk_trend=hedged_wide`; the four `--rule-*-policy` flags can override that map.
+`--gate-policy lagged-policy-blend` evaluates a smoother two-sleeve allocation between
+`delta_hedged` and `hedged_wide`, again using only the prior window's regime. The
+`--rule-*-wide-fraction` flags set the capital share allocated to `hedged_wide`.
 A candidate only promotes to `candidate_shadow` when every window family clears
 win-rate, mean edge over hold, left-tail net APR, and drawdown gates. On the 201-row
 CARDS-USDC merged replay, the current lagged regime rule returns `reject_replay`:
@@ -679,6 +682,20 @@ Interpretation: policy switching is now measurable, and the result is a useful
 rejection. The issue is not just choosing between `delta_hedged` and `hedged_wide`
 from coarse prior-window labels; the next strategy needs a sharper adverse-trend
 signal or a smoother hedge-width control.
+
+The first smoother blend test also rejected. `lagged-policy-blend` splits capital
+between `delta_hedged` and `hedged_wide` sleeves. On `SOL-Fartcoin`, the default
+range blend (`range_wide=0.50`, all non-range regimes at `1.00`) produced p05 APR
+about `-1066%`, `-507%`, `-408%`, and `-528%` across 25/40/60/80-swap windows.
+Increasing `range_wide` to `0.75`, `0.90`, and `0.95` improved the 25-swap p05 APR
+to about `-667%`, `-427%`, and `-347%`; the all-wide boundary was still only about
+`-267%`, `-119%`, `-108%`, and `-285%`. Mean net remained positive but small.
+
+Interpretation: continuous capital blending is a better risk-control surface than
+hard switching, but it still cannot produce a positive 500% left tail on the current
+Whirlpool samples. The next useful strategy work is not another coarse blend; it is a
+more timely adverse-trend signal, a different fee source, or a venue with structurally
+higher fee density such as Meteora DLMM.
 
 ### Orca HYPE-USDC Replay
 

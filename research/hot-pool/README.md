@@ -173,6 +173,10 @@ the current window's policy from the prior window's regime, with default mapping
 `--rule-volatile-policy`, `--rule-trend-money-policy`, and
 `--rule-trend-risk-policy`.
 
+It also supports `--gate-policy lagged-policy-blend`, a smoother two-sleeve allocation
+between `delta_hedged` and `hedged_wide` using only the prior window's regime. Use the
+`--rule-*-wide-fraction` flags to set the capital share allocated to `hedged_wide`.
+
 The latest scout also says the best near-term opportunities are not Raydium-only.
 Current hot candidates are mostly Meteora DLMM and Orca Whirlpool pools. Meteora
 proxy APRs are often much higher, but they require a DLMM replay adapter before they
@@ -297,6 +301,14 @@ and `-285%`, but still failed the 500% gate and had small mean net. A trend
 `narrow_rebalance` beta-participation map worsened the tail. The next strategy step
 needs a sharper adverse-trend signal or smoother hedge-width control, not just coarse
 prior-window policy switching.
+
+First policy-blend test on `SOL-Fartcoin`: default `lagged-policy-blend`
+(`range_wide=0.50`, non-range wide fraction `1.00`) rejected with p05 APR about
+`-1066%`, `-507%`, `-408%`, and `-528%`. Raising `range_wide` to `0.75`, `0.90`, and
+`0.95` improved the 25-swap p05 to about `-667%`, `-427%`, and `-347%`, but even the
+all-wide boundary only reached about `-267%`, `-119%`, `-108%`, and `-285%`.
+Conclusion: smoother capital blending helps risk control but still does not create a
+deployable 500%+ left-tail strategy.
 
 Orca `HYPE-USDC` final P1 coverage replay:
 

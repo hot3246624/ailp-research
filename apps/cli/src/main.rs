@@ -81,6 +81,7 @@ impl RiskTokenSide {
 enum PromotionGatePolicy {
     LaggedRegimeRule,
     LaggedPolicySwitch,
+    LaggedPolicyBlend,
     HedgedWide,
     DeltaHedged,
 }
@@ -90,6 +91,7 @@ impl PromotionGatePolicy {
         match self {
             Self::LaggedRegimeRule => "lagged_regime_rule",
             Self::LaggedPolicySwitch => "lagged_policy_switch",
+            Self::LaggedPolicyBlend => "lagged_policy_blend",
             Self::HedgedWide => "hedged_wide",
             Self::DeltaHedged => "delta_hedged",
         }
@@ -583,6 +585,8 @@ enum Command {
         regime_rule: RegimeHedgeRuleArgs,
         #[command(flatten)]
         policy_rule: RegimePolicyRuleArgs,
+        #[command(flatten)]
+        blend_rule: RegimeBlendRuleArgs,
         #[arg(long, default_value_t = 500.0)]
         min_p05_net_apr_pct: f64,
         #[arg(long, default_value_t = 0.0)]
@@ -1115,6 +1119,76 @@ impl RegimePolicyRule {
     }
 }
 
+#[derive(Debug, Clone, Copy, clap::Args)]
+struct RegimeBlendRuleArgs {
+    /// Hedged-wide capital share used after a prior range window.
+    #[arg(long, default_value_t = 0.5)]
+    rule_range_wide_fraction: f64,
+    /// Hedged-wide capital share used after a prior volatile-range window.
+    #[arg(long, default_value_t = 1.0)]
+    rule_volatile_wide_fraction: f64,
+    /// Hedged-wide capital share used after a prior trend toward the money side.
+    #[arg(long, default_value_t = 1.0)]
+    rule_trend_money_wide_fraction: f64,
+    /// Hedged-wide capital share used after a prior trend toward the risk side.
+    #[arg(long, default_value_t = 1.0)]
+    rule_trend_risk_wide_fraction: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct RegimeBlendRule {
+    range_wide_fraction: f64,
+    volatile_wide_fraction: f64,
+    trend_money_wide_fraction: f64,
+    trend_risk_wide_fraction: f64,
+}
+
+impl From<RegimeBlendRuleArgs> for RegimeBlendRule {
+    fn from(value: RegimeBlendRuleArgs) -> Self {
+        Self {
+            range_wide_fraction: value.rule_range_wide_fraction,
+            volatile_wide_fraction: value.rule_volatile_wide_fraction,
+            trend_money_wide_fraction: value.rule_trend_money_wide_fraction,
+            trend_risk_wide_fraction: value.rule_trend_risk_wide_fraction,
+        }
+    }
+}
+
+impl RegimeBlendRule {
+    fn validate(&self) -> Result<()> {
+        for (label, value) in [
+            ("range", self.range_wide_fraction),
+            ("volatile", self.volatile_wide_fraction),
+            ("money_trend", self.trend_money_wide_fraction),
+            ("risk_trend", self.trend_risk_wide_fraction),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                anyhow::bail!("wide fraction for {label} must be in 0.0..=1.0, got {value}");
+            }
+        }
+        Ok(())
+    }
+
+    fn wide_fraction_for_prior_regime(&self, regime: &str) -> f64 {
+        match regime {
+            "trend_down_money" => self.trend_money_wide_fraction,
+            "trend_up_risk" => self.trend_risk_wide_fraction,
+            "volatile_range" => self.volatile_wide_fraction,
+            _ => self.range_wide_fraction,
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "range_wide={:.2},volatile_wide={:.2},money_trend_wide={:.2},risk_trend_wide={:.2}",
+            self.range_wide_fraction,
+            self.volatile_wide_fraction,
+            self.trend_money_wide_fraction,
+            self.trend_risk_wide_fraction
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1518,6 +1592,7 @@ async fn main() -> Result<()> {
             hedge_fractions,
             regime_rule,
             policy_rule,
+            blend_rule,
             min_p05_net_apr_pct,
             min_mean_vs_hold_usd,
             min_win_rate_vs_hold_pct,
@@ -1532,6 +1607,7 @@ async fn main() -> Result<()> {
             hedge_fractions,
             regime_rule.into(),
             policy_rule.into(),
+            blend_rule.into(),
             PromotionGateThresholds {
                 min_p05_net_apr_pct,
                 min_mean_vs_hold_usd,
@@ -6061,6 +6137,7 @@ fn replay_promotion_gate(
     hedge_fractions: Vec<f64>,
     regime_rule: RegimeHedgeRule,
     policy_rule: RegimePolicyRule,
+    blend_rule: RegimeBlendRule,
     thresholds: PromotionGateThresholds,
     overrides: &NormalizedReplayParams,
     format: OutputFormat,
@@ -6097,6 +6174,20 @@ fn replay_promotion_gate(
                     swaps_path.clone(),
                     config,
                     &policy_rule,
+                    overrides,
+                )?;
+                (
+                    row_label,
+                    row_swaps,
+                    promotion_window_row(config, rule_row, &thresholds, max_worst_drawdown_usd),
+                )
+            }
+            PromotionGatePolicy::LaggedPolicyBlend => {
+                let (row_label, row_swaps, rule_row) = evaluate_lagged_policy_blend_window(
+                    &spec_path,
+                    swaps_path.clone(),
+                    config,
+                    &blend_rule,
                     overrides,
                 )?;
                 (
@@ -6161,6 +6252,7 @@ fn replay_promotion_gate(
         hedge_map: match gate_policy {
             PromotionGatePolicy::LaggedRegimeRule => regime_rule.describe(),
             PromotionGatePolicy::LaggedPolicySwitch => policy_rule.describe(),
+            PromotionGatePolicy::LaggedPolicyBlend => blend_rule.describe(),
             PromotionGatePolicy::HedgedWide | PromotionGatePolicy::DeltaHedged => "-".to_string(),
         },
         thresholds,
@@ -6302,6 +6394,34 @@ fn evaluate_lagged_policy_switch_window(
         .with_context(|| {
             format!(
                 "no lagged policy-switch windows for config {}:{}",
+                config.window_swaps, config.step_swaps
+            )
+        })?;
+    Ok((report.label, report.swaps, rule_row))
+}
+
+fn evaluate_lagged_policy_blend_window(
+    spec_path: &Path,
+    swaps_path: Option<PathBuf>,
+    config: PromotionWindowConfig,
+    blend_rule: &RegimeBlendRule,
+    overrides: &NormalizedReplayParams,
+) -> Result<(String, usize, HedgeGridRuleRow)> {
+    blend_rule.validate()?;
+    let report = build_normalized_window_report(
+        spec_path,
+        swaps_path,
+        config.window_swaps,
+        config.step_swaps,
+        config.min_windows,
+        overrides,
+    )?;
+    let rule_row = summarize_lagged_policy_blend_rows(&report.rows, blend_rule)
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "no lagged policy-blend windows for config {}:{}",
                 config.window_swaps, config.step_swaps
             )
         })?;
@@ -6728,6 +6848,141 @@ fn summarize_lagged_policy_switch_rows(
     vec![HedgeGridRuleRow {
         rule: "lagged_policy_switch".to_string(),
         hedge_map: rule.describe(),
+        windows: selected.len(),
+        skipped_windows: skipped,
+        win_rate_vs_hold_pct: mean_values(
+            &selected
+                .iter()
+                .map(|row| {
+                    if row.net_vs_hold_usd > 0.0 {
+                        100.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_pnl_usd: mean_values(
+            &selected
+                .iter()
+                .map(|row| row.net_pnl_usd)
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_vs_hold_usd: mean_values(
+            &selected
+                .iter()
+                .map(|row| row.net_vs_hold_usd)
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_apr_pct: mean_values_opt(&net_aprs),
+        p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
+        worst_max_drawdown_usd: selected
+            .iter()
+            .map(|row| row.max_drawdown_usd)
+            .fold(0.0, f64::max),
+    }]
+}
+
+fn summarize_lagged_policy_blend_rows(
+    rows: &[WindowPolicyRow],
+    rule: &RegimeBlendRule,
+) -> Vec<HedgeGridRuleRow> {
+    let mut window_indices = rows.iter().map(|row| row.window_index).collect::<Vec<_>>();
+    window_indices.sort_unstable();
+    window_indices.dedup();
+
+    let mut selected = Vec::new();
+    let mut skipped = 0usize;
+    for window_index in window_indices {
+        if window_index == 0 {
+            skipped += 1;
+            continue;
+        }
+        let prior_regime = rows
+            .iter()
+            .find(|row| row.window_index + 1 == window_index)
+            .map(|row| row.regime.clone());
+        let Some(prior_regime) = prior_regime else {
+            skipped += 1;
+            continue;
+        };
+        let wide_fraction = rule.wide_fraction_for_prior_regime(&prior_regime);
+        let delta_row = rows
+            .iter()
+            .find(|row| row.window_index == window_index && row.policy == "delta_hedged");
+        let wide_row = rows
+            .iter()
+            .find(|row| row.window_index == window_index && row.policy == "hedged_wide");
+        match (delta_row, wide_row) {
+            (Some(delta), Some(wide)) => selected.push(blend_window_rows(
+                delta,
+                wide,
+                wide_fraction,
+                "lagged_policy_blend",
+            )),
+            _ => skipped += 1,
+        }
+    }
+    summarize_selected_rule_rows("lagged_policy_blend", rule.describe(), selected, skipped)
+}
+
+fn blend_window_rows(
+    delta: &WindowPolicyRow,
+    wide: &WindowPolicyRow,
+    wide_fraction: f64,
+    policy: &str,
+) -> WindowPolicyRow {
+    let delta_fraction = 1.0 - wide_fraction;
+    WindowPolicyRow {
+        window_index: delta.window_index,
+        swap_start: delta.swap_start,
+        swap_end_exclusive: delta.swap_end_exclusive,
+        swaps: delta.swaps,
+        block_first: delta.block_first,
+        block_last: delta.block_last,
+        tick_first: delta.tick_first,
+        tick_last: delta.tick_last,
+        tick_delta: delta.tick_delta,
+        trend_strength: delta.trend_strength,
+        regime: delta.regime.clone(),
+        minutes: delta.minutes,
+        policy: policy.to_string(),
+        net_pnl_usd: delta_fraction * delta.net_pnl_usd + wide_fraction * wide.net_pnl_usd,
+        net_vs_hold_usd: delta_fraction * delta.net_vs_hold_usd
+            + wide_fraction * wide.net_vs_hold_usd,
+        fee_minus_lvr_usd: delta_fraction * delta.fee_minus_lvr_usd
+            + wide_fraction * wide.fee_minus_lvr_usd,
+        net_apr_pct: blend_optional(delta.net_apr_pct, wide.net_apr_pct, wide_fraction),
+        fee_lvr_apr_pct: blend_optional(delta.fee_lvr_apr_pct, wide.fee_lvr_apr_pct, wide_fraction),
+        max_drawdown_usd: delta_fraction * delta.max_drawdown_usd
+            + wide_fraction * wide.max_drawdown_usd,
+        rebalances: ((delta_fraction * delta.rebalances as f64)
+            + (wide_fraction * wide.rebalances as f64))
+            .round() as u32,
+    }
+}
+
+fn blend_optional(left: Option<f64>, right: Option<f64>, right_fraction: f64) -> Option<f64> {
+    Some((1.0 - right_fraction) * left? + right_fraction * right?)
+}
+
+fn summarize_selected_rule_rows(
+    rule_name: &str,
+    hedge_map: String,
+    selected: Vec<WindowPolicyRow>,
+    skipped: usize,
+) -> Vec<HedgeGridRuleRow> {
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let net_aprs = selected
+        .iter()
+        .filter_map(|row| row.net_apr_pct)
+        .collect::<Vec<_>>();
+    vec![HedgeGridRuleRow {
+        rule: rule_name.to_string(),
+        hedge_map,
         windows: selected.len(),
         skipped_windows: skipped,
         win_rate_vs_hold_pct: mean_values(
@@ -8862,6 +9117,40 @@ mod tests {
         assert_eq!(summary[0].mean_net_pnl_usd, 9.0);
         assert_eq!(summary[0].mean_net_vs_hold_usd, 7.0);
         assert_eq!(summary[0].p05_net_apr_pct, Some(900.0));
+    }
+
+    #[test]
+    fn lagged_policy_blend_uses_prior_window_to_weight_sleeves() {
+        let rule = RegimeBlendRule {
+            range_wide_fraction: 0.25,
+            volatile_wide_fraction: 1.0,
+            trend_money_wide_fraction: 1.0,
+            trend_risk_wide_fraction: 1.0,
+        };
+        let rows = vec![
+            policy_window_row(0, "range", "delta_hedged", 1.0, -1.0, 100.0, 4.0),
+            policy_window_row(0, "range", "hedged_wide", 2.0, -2.0, 200.0, 2.0),
+            policy_window_row(
+                1,
+                "trend_down_money",
+                "delta_hedged",
+                10.0,
+                8.0,
+                1000.0,
+                4.0,
+            ),
+            policy_window_row(1, "trend_down_money", "hedged_wide", 2.0, 0.0, 200.0, 1.0),
+        ];
+
+        let summary = summarize_lagged_policy_blend_rows(&rows, &rule);
+
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].windows, 1);
+        assert_eq!(summary[0].skipped_windows, 1);
+        assert!((summary[0].mean_net_pnl_usd - 8.0).abs() < 1e-9);
+        assert!((summary[0].mean_net_vs_hold_usd - 6.0).abs() < 1e-9);
+        assert_eq!(summary[0].p05_net_apr_pct, Some(800.0));
+        assert!((summary[0].worst_max_drawdown_usd - 3.25).abs() < 1e-9);
     }
 
     #[test]
