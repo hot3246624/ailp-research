@@ -166,6 +166,13 @@ mean-vs-hold, and left-tail APR; 60-swap/20-step misses win-rate and left-tail A
 the current business goal directly: a pool/policy must show about 500%+ left-tail
 net APR and a stable edge over hold before shadow monitoring.
 
+The promotion gate now also supports `--gate-policy lagged-policy-switch`. It chooses
+the current window's policy from the prior window's regime, with default mapping
+`range=delta_hedged`, `volatile=hedged_wide`, `money_trend=hedged_wide`, and
+`risk_trend=hedged_wide`. Override it with `--rule-range-policy`,
+`--rule-volatile-policy`, `--rule-trend-money-policy`, and
+`--rule-trend-risk-policy`.
+
 The latest scout also says the best near-term opportunities are not Raydium-only.
 Current hot candidates are mostly Meteora DLMM and Orca Whirlpool pools. Meteora
 proxy APRs are often much higher, but they require a DLMM replay adapter before they
@@ -281,6 +288,15 @@ window APR. Rolling gates exposed the tail: lagged p05 APR was about `-1865%`,
 also rejected; `hedged_wide` improved left tail to about `-245%`, `-106%`, `-97%`,
 and `-263%`, but mean net became small. Treat this as a promising rejection: there is
 fee-alpha signal, but no stable 500%+ left-tail strategy yet.
+
+First policy-switch test on `SOL-Fartcoin`: default `lagged-policy-switch`
+(`range=delta_hedged`, non-range=`hedged_wide`) still rejected, with p05 APR about
+`-1865%`, `-906%`, `-708%`, and `-771%` across 25/40/60/80-swap windows. An
+all-`hedged_wide` switch improved the left tail to about `-267%`, `-119%`, `-108%`,
+and `-285%`, but still failed the 500% gate and had small mean net. A trend
+`narrow_rebalance` beta-participation map worsened the tail. The next strategy step
+needs a sharper adverse-trend signal or smoother hedge-width control, not just coarse
+prior-window policy switching.
 
 Orca `HYPE-USDC` final P1 coverage replay:
 

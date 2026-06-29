@@ -80,6 +80,7 @@ impl RiskTokenSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 enum PromotionGatePolicy {
     LaggedRegimeRule,
+    LaggedPolicySwitch,
     HedgedWide,
     DeltaHedged,
 }
@@ -88,8 +89,30 @@ impl PromotionGatePolicy {
     fn label(self) -> &'static str {
         match self {
             Self::LaggedRegimeRule => "lagged_regime_rule",
+            Self::LaggedPolicySwitch => "lagged_policy_switch",
             Self::HedgedWide => "hedged_wide",
             Self::DeltaHedged => "delta_hedged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+enum RegimeSwitchPolicy {
+    Hold,
+    PassiveWide,
+    NarrowRebalance,
+    DeltaHedged,
+    HedgedWide,
+}
+
+impl RegimeSwitchPolicy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hold => "hold_50_50",
+            Self::PassiveWide => "passive_wide",
+            Self::NarrowRebalance => "narrow_rebalance",
+            Self::DeltaHedged => "delta_hedged",
+            Self::HedgedWide => "hedged_wide",
         }
     }
 }
@@ -558,6 +581,8 @@ enum Command {
         hedge_fractions: Vec<f64>,
         #[command(flatten)]
         regime_rule: RegimeHedgeRuleArgs,
+        #[command(flatten)]
+        policy_rule: RegimePolicyRuleArgs,
         #[arg(long, default_value_t = 500.0)]
         min_p05_net_apr_pct: f64,
         #[arg(long, default_value_t = 0.0)]
@@ -1034,6 +1059,62 @@ impl RegimeHedgeRule {
     }
 }
 
+#[derive(Debug, Clone, Copy, clap::Args)]
+struct RegimePolicyRuleArgs {
+    /// Policy used after a prior range window.
+    #[arg(long, value_enum, default_value_t = RegimeSwitchPolicy::DeltaHedged)]
+    rule_range_policy: RegimeSwitchPolicy,
+    /// Policy used after a prior volatile-range window.
+    #[arg(long, value_enum, default_value_t = RegimeSwitchPolicy::HedgedWide)]
+    rule_volatile_policy: RegimeSwitchPolicy,
+    /// Policy used after a prior trend toward the money side.
+    #[arg(long, value_enum, default_value_t = RegimeSwitchPolicy::HedgedWide)]
+    rule_trend_money_policy: RegimeSwitchPolicy,
+    /// Policy used after a prior trend toward the risk side.
+    #[arg(long, value_enum, default_value_t = RegimeSwitchPolicy::HedgedWide)]
+    rule_trend_risk_policy: RegimeSwitchPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct RegimePolicyRule {
+    range_policy: RegimeSwitchPolicy,
+    volatile_policy: RegimeSwitchPolicy,
+    trend_money_policy: RegimeSwitchPolicy,
+    trend_risk_policy: RegimeSwitchPolicy,
+}
+
+impl From<RegimePolicyRuleArgs> for RegimePolicyRule {
+    fn from(value: RegimePolicyRuleArgs) -> Self {
+        Self {
+            range_policy: value.rule_range_policy,
+            volatile_policy: value.rule_volatile_policy,
+            trend_money_policy: value.rule_trend_money_policy,
+            trend_risk_policy: value.rule_trend_risk_policy,
+        }
+    }
+}
+
+impl RegimePolicyRule {
+    fn policy_for_prior_regime(&self, regime: &str) -> &'static str {
+        match regime {
+            "trend_down_money" => self.trend_money_policy.label(),
+            "trend_up_risk" => self.trend_risk_policy.label(),
+            "volatile_range" => self.volatile_policy.label(),
+            _ => self.range_policy.label(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "range={},volatile={},money_trend={},risk_trend={}",
+            self.range_policy.label(),
+            self.volatile_policy.label(),
+            self.trend_money_policy.label(),
+            self.trend_risk_policy.label()
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1436,6 +1517,7 @@ async fn main() -> Result<()> {
             gate_policy,
             hedge_fractions,
             regime_rule,
+            policy_rule,
             min_p05_net_apr_pct,
             min_mean_vs_hold_usd,
             min_win_rate_vs_hold_pct,
@@ -1449,6 +1531,7 @@ async fn main() -> Result<()> {
             gate_policy,
             hedge_fractions,
             regime_rule.into(),
+            policy_rule.into(),
             PromotionGateThresholds {
                 min_p05_net_apr_pct,
                 min_mean_vs_hold_usd,
@@ -5977,6 +6060,7 @@ fn replay_promotion_gate(
     gate_policy: PromotionGatePolicy,
     hedge_fractions: Vec<f64>,
     regime_rule: RegimeHedgeRule,
+    policy_rule: RegimePolicyRule,
     thresholds: PromotionGateThresholds,
     overrides: &NormalizedReplayParams,
     format: OutputFormat,
@@ -5999,6 +6083,20 @@ fn replay_promotion_gate(
                     config,
                     &hedge_fractions,
                     &regime_rule,
+                    overrides,
+                )?;
+                (
+                    row_label,
+                    row_swaps,
+                    promotion_window_row(config, rule_row, &thresholds, max_worst_drawdown_usd),
+                )
+            }
+            PromotionGatePolicy::LaggedPolicySwitch => {
+                let (row_label, row_swaps, rule_row) = evaluate_lagged_policy_switch_window(
+                    &spec_path,
+                    swaps_path.clone(),
+                    config,
+                    &policy_rule,
                     overrides,
                 )?;
                 (
@@ -6060,10 +6158,10 @@ fn replay_promotion_gate(
         label,
         swaps,
         policy: gate_policy.label().to_string(),
-        hedge_map: if gate_policy == PromotionGatePolicy::LaggedRegimeRule {
-            regime_rule.describe()
-        } else {
-            "-".to_string()
+        hedge_map: match gate_policy {
+            PromotionGatePolicy::LaggedRegimeRule => regime_rule.describe(),
+            PromotionGatePolicy::LaggedPolicySwitch => policy_rule.describe(),
+            PromotionGatePolicy::HedgedWide | PromotionGatePolicy::DeltaHedged => "-".to_string(),
         },
         thresholds,
         max_worst_drawdown_usd,
@@ -6181,6 +6279,33 @@ fn evaluate_lagged_rule_window(
             )
         })?;
     Ok((label, swaps, rule_row))
+}
+
+fn evaluate_lagged_policy_switch_window(
+    spec_path: &Path,
+    swaps_path: Option<PathBuf>,
+    config: PromotionWindowConfig,
+    policy_rule: &RegimePolicyRule,
+    overrides: &NormalizedReplayParams,
+) -> Result<(String, usize, HedgeGridRuleRow)> {
+    let report = build_normalized_window_report(
+        spec_path,
+        swaps_path,
+        config.window_swaps,
+        config.step_swaps,
+        config.min_windows,
+        overrides,
+    )?;
+    let rule_row = summarize_lagged_policy_switch_rows(&report.rows, policy_rule)
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "no lagged policy-switch windows for config {}:{}",
+                config.window_swaps, config.step_swaps
+            )
+        })?;
+    Ok((report.label, report.swaps, rule_row))
 }
 
 fn evaluate_fixed_policy_window(
@@ -6523,6 +6648,85 @@ fn summarize_lagged_regime_rule_rows(
         .collect::<Vec<_>>();
     vec![HedgeGridRuleRow {
         rule: "lagged_regime_rule".to_string(),
+        hedge_map: rule.describe(),
+        windows: selected.len(),
+        skipped_windows: skipped,
+        win_rate_vs_hold_pct: mean_values(
+            &selected
+                .iter()
+                .map(|row| {
+                    if row.net_vs_hold_usd > 0.0 {
+                        100.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_pnl_usd: mean_values(
+            &selected
+                .iter()
+                .map(|row| row.net_pnl_usd)
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_vs_hold_usd: mean_values(
+            &selected
+                .iter()
+                .map(|row| row.net_vs_hold_usd)
+                .collect::<Vec<_>>(),
+        ),
+        mean_net_apr_pct: mean_values_opt(&net_aprs),
+        p05_net_apr_pct: percentile_f64(&net_aprs, 5.0),
+        worst_max_drawdown_usd: selected
+            .iter()
+            .map(|row| row.max_drawdown_usd)
+            .fold(0.0, f64::max),
+    }]
+}
+
+fn summarize_lagged_policy_switch_rows(
+    rows: &[WindowPolicyRow],
+    rule: &RegimePolicyRule,
+) -> Vec<HedgeGridRuleRow> {
+    let mut window_indices = rows.iter().map(|row| row.window_index).collect::<Vec<_>>();
+    window_indices.sort_unstable();
+    window_indices.dedup();
+
+    let mut selected = Vec::new();
+    let mut skipped = 0usize;
+    for window_index in window_indices {
+        if window_index == 0 {
+            skipped += 1;
+            continue;
+        }
+        let prior_regime = rows
+            .iter()
+            .find(|row| row.window_index + 1 == window_index)
+            .map(|row| row.regime.clone());
+        let Some(prior_regime) = prior_regime else {
+            skipped += 1;
+            continue;
+        };
+        let target_policy = rule.policy_for_prior_regime(&prior_regime);
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.window_index == window_index && row.policy == target_policy)
+        {
+            selected.push(row.clone());
+        } else {
+            skipped += 1;
+        }
+    }
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let net_aprs = selected
+        .iter()
+        .filter_map(|row| row.net_apr_pct)
+        .collect::<Vec<_>>();
+    vec![HedgeGridRuleRow {
+        rule: "lagged_policy_switch".to_string(),
         hedge_map: rule.describe(),
         windows: selected.len(),
         skipped_windows: skipped,
@@ -8636,6 +8840,31 @@ mod tests {
     }
 
     #[test]
+    fn lagged_policy_switch_uses_prior_window_to_select_policy() {
+        let rule = RegimePolicyRule {
+            range_policy: RegimeSwitchPolicy::DeltaHedged,
+            volatile_policy: RegimeSwitchPolicy::HedgedWide,
+            trend_money_policy: RegimeSwitchPolicy::HedgedWide,
+            trend_risk_policy: RegimeSwitchPolicy::HedgedWide,
+        };
+        let rows = vec![
+            policy_window_row(0, "range", "delta_hedged", 1.0, -1.0, 100.0, 4.0),
+            policy_window_row(0, "range", "hedged_wide", 2.0, -2.0, 200.0, 2.0),
+            policy_window_row(1, "trend_down_money", "delta_hedged", 9.0, 7.0, 900.0, 1.0),
+            policy_window_row(1, "trend_down_money", "hedged_wide", 3.0, -3.0, 300.0, 3.0),
+        ];
+
+        let summary = summarize_lagged_policy_switch_rows(&rows, &rule);
+
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].windows, 1);
+        assert_eq!(summary[0].skipped_windows, 1);
+        assert_eq!(summary[0].mean_net_pnl_usd, 9.0);
+        assert_eq!(summary[0].mean_net_vs_hold_usd, 7.0);
+        assert_eq!(summary[0].p05_net_apr_pct, Some(900.0));
+    }
+
+    #[test]
     fn normalized_swap_key_dedupes_across_local_log_indices() {
         let mut left = swap_obs_fixture(10, 1, 100);
         let mut right = left;
@@ -8798,6 +9027,26 @@ mod tests {
         net_apr_pct: f64,
         max_drawdown_usd: f64,
     ) -> WindowPolicyRow {
+        policy_window_row(
+            window_index,
+            regime,
+            "hedged_narrow",
+            net_pnl_usd,
+            net_vs_hold_usd,
+            net_apr_pct,
+            max_drawdown_usd,
+        )
+    }
+
+    fn policy_window_row(
+        window_index: usize,
+        regime: &str,
+        policy: &str,
+        net_pnl_usd: f64,
+        net_vs_hold_usd: f64,
+        net_apr_pct: f64,
+        max_drawdown_usd: f64,
+    ) -> WindowPolicyRow {
         WindowPolicyRow {
             window_index,
             swap_start: window_index,
@@ -8811,7 +9060,7 @@ mod tests {
             trend_strength: 0.0,
             regime: regime.to_string(),
             minutes: 1.0,
-            policy: "hedged_narrow".to_string(),
+            policy: policy.to_string(),
             net_pnl_usd,
             net_vs_hold_usd,
             fee_minus_lvr_usd: 0.0,

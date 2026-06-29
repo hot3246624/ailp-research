@@ -405,13 +405,17 @@ cargo run -p autopool-cli -- replay-promotion-gate \
 
 Default windows are 25:10, 40:15, 60:20, and 80:25 swaps. The default gate policy is
 `lagged-regime-rule`; the command can also gate defensive controls directly with
-`--gate-policy hedged-wide` or `--gate-policy delta-hedged`. A candidate only
-promotes to `candidate_shadow` when every window family clears win-rate, mean edge
-over hold, left-tail net APR, and drawdown gates. On the 201-row CARDS-USDC merged
-replay, the current lagged regime rule returns `reject_replay`: short windows nearly
-work on left-tail APR but lose to hold on average, while longer windows expose
-unstable left tails. This is the intended behavior for the current research stage:
-headline APR is a detector, not a deployment claim.
+`--gate-policy hedged-wide` or `--gate-policy delta-hedged`. `--gate-policy
+lagged-policy-switch` evaluates a no-lookahead regime switch that chooses the current
+window's policy from the prior window's regime. The default switch is
+`range=delta_hedged`, `volatile=hedged_wide`, `money_trend=hedged_wide`, and
+`risk_trend=hedged_wide`; the four `--rule-*-policy` flags can override that map.
+A candidate only promotes to `candidate_shadow` when every window family clears
+win-rate, mean edge over hold, left-tail net APR, and drawdown gates. On the 201-row
+CARDS-USDC merged replay, the current lagged regime rule returns `reject_replay`:
+short windows nearly work on left-tail APR but lose to hold on average, while longer
+windows expose unstable left tails. This is the intended behavior for the current
+research stage: headline APR is a detector, not a deployment claim.
 
 Latest scout/proxy read: the active hot-pool surface has shifted toward Meteora DLMM
 and Orca Whirlpool candidates. Meteora proxy APRs can be much higher than the current
@@ -662,6 +666,19 @@ the current policy still cannot turn volatility into a stable 500%+ left-tail AP
 The next strategy work should target this failure mode: preserve more of the
 `delta_hedged` mean edge while using `hedged_wide`-style tail control around trend
 windows.
+
+The first no-lookahead policy-switch test did not solve the tail. The default
+`lagged-policy-switch` map (`range=delta_hedged`, all non-range regimes
+`hedged_wide`) still rejected `SOL-Fartcoin`: 25/40/60/80-swap p05 APR was about
+`-1865%`, `-906%`, `-708%`, and `-771%`. An all-`hedged_wide` map improved the left
+tail materially to about `-267%`, `-119%`, `-108%`, and `-285%`, but that still falls
+far below the 500% left-tail gate and sacrifices mean return. A beta-participation
+map using `narrow_rebalance` after trend regimes made the tail much worse.
+
+Interpretation: policy switching is now measurable, and the result is a useful
+rejection. The issue is not just choosing between `delta_hedged` and `hedged_wide`
+from coarse prior-window labels; the next strategy needs a sharper adverse-trend
+signal or a smoother hedge-width control.
 
 ### Orca HYPE-USDC Replay
 
