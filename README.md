@@ -161,6 +161,10 @@ reports win-rate-vs-hold, mechanical APR percentiles, fee-LVR APR, and worst
 drawdown. A 72-swap `CARDS-USDC` check confirmed that fee capture can be very high,
 but short-window left-tail APR and hedge-vs-beta tradeoffs are still too unstable
 for capital.
+`replay-normalized-hedge-grid` now sweeps fixed hedge fractions over the same rolling
+windows. On the latest 77-row `CARDS-USDC` sample, 0.75 fixed hedge had the best
+left-tail/drawdown score, while lower hedge fractions earned more upside beta but
+worsened p05 APR and drawdown.
 
 ## External References
 

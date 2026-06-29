@@ -224,6 +224,22 @@ cargo run -p autopool-cli -- replay-normalized-windows \
   --min-windows 4
 ```
 
+Sweep fixed hedge fractions for the hedged narrow policy:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-hedge-grid \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl \
+  --window-swaps 40 \
+  --step-swaps 15 \
+  --min-windows 3 \
+  --grid-hedge-fraction 0 \
+  --grid-hedge-fraction 0.25 \
+  --grid-hedge-fraction 0.5 \
+  --grid-hedge-fraction 0.75 \
+  --grid-hedge-fraction 1
+```
+
 ```bash
 cargo run -p autopool-cli -- sample-solana-pool-swaps \
   --pool-address BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW \
@@ -300,6 +316,22 @@ all inventory-long variants. Fixed hedging keeps drawdown small and now has a po
 left tail for `delta_hedged`, but it still lags hold on the full 77-row segment.
 Unhedged/adaptive variants look economically attractive only if later windows confirm
 the result outside this single short regime.
+
+Latest hedge-grid check on the same 77-row sample:
+
+| hedge fraction | policy | win rate vs hold | mean net | mean vs hold | mean APR window | p05 APR window | worst DD |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.75 | hedged_narrow | 66.7% | $9.21 | -$8.00 | ~3126% | ~1074% | $3.48 |
+| dynamic | delta_hedged | 66.7% | $6.13 | -$11.07 | ~1479% | ~1060% | $3.07 |
+| 0.50 | hedged_narrow | 66.7% | $13.50 | -$3.70 | ~5367% | ~408% | $8.82 |
+| 0.25 | hedged_narrow | 66.7% | $17.79 | $0.59 | ~7608% | ~-258% | $14.16 |
+| 0.00 | hedged_narrow | 66.7% | $22.08 | $4.88 | ~9849% | ~-924% | $19.49 |
+
+Interpretation: the best left-tail/drawdown point in this short sample is around
+`0.75` fixed hedge, while lower hedge fractions harvest more upside beta but degrade
+p05 APR and drawdown. `delta_hedged` is a dynamic control and does not use the fixed
+`hedge_fraction` parameter. This pushes the next research step toward regime-aware
+hedge sizing, not a static all-or-nothing hedge.
 
 ## Autoresearch Rules Adapted To AILP
 

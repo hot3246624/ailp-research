@@ -490,6 +490,29 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
+    /// Sweep hedge fractions over rolling normalized replay windows to find
+    /// robust hedge sizing under current hot-pool regimes.
+    ReplayNormalizedHedgeGrid {
+        #[arg(long)]
+        spec: PathBuf,
+        /// JSONL file of normalized SwapObs rows. Defaults to `swaps.jsonl` next to
+        /// the spec file.
+        #[arg(long)]
+        swaps: Option<PathBuf>,
+        #[arg(long, default_value_t = 40)]
+        window_swaps: usize,
+        #[arg(long, default_value_t = 15)]
+        step_swaps: usize,
+        #[arg(long, default_value_t = 2)]
+        min_windows: usize,
+        /// Hedge fractions to test. Repeat the flag, e.g. --grid-hedge-fraction 0.25.
+        #[arg(long = "grid-hedge-fraction", default_values_t = vec![0.0, 0.25, 0.5, 0.75, 1.0])]
+        hedge_fractions: Vec<f64>,
+        #[command(flatten)]
+        params: NormalizedReplayParams,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
     /// Stress-test the range policies against a synthetic price scenario
     /// (calm / pump / crash / chop) when collected data lacks that regime.
     ReplayScenario {
@@ -1244,6 +1267,25 @@ async fn main() -> Result<()> {
             window_swaps,
             step_swaps,
             min_windows,
+            &params,
+            format,
+        )?,
+        Command::ReplayNormalizedHedgeGrid {
+            spec,
+            swaps,
+            window_swaps,
+            step_swaps,
+            min_windows,
+            hedge_fractions,
+            params,
+            format,
+        } => replay_normalized_hedge_grid(
+            spec,
+            swaps,
+            window_swaps,
+            step_swaps,
+            min_windows,
+            hedge_fractions,
             &params,
             format,
         )?,
@@ -4720,6 +4762,32 @@ struct WindowPolicySummary {
     mean_rebalances: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct HedgeGridReport {
+    label: String,
+    swaps: usize,
+    window_swaps: usize,
+    step_swaps: usize,
+    windows: usize,
+    config: serde_json::Value,
+    rows: Vec<HedgeGridRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct HedgeGridRow {
+    hedge_fraction: f64,
+    policy: String,
+    windows: usize,
+    win_rate_vs_hold_pct: f64,
+    mean_net_pnl_usd: f64,
+    mean_net_vs_hold_usd: f64,
+    mean_net_apr_pct: Option<f64>,
+    p05_net_apr_pct: Option<f64>,
+    mean_fee_lvr_apr_pct: Option<f64>,
+    worst_max_drawdown_usd: f64,
+    score: Option<f64>,
+}
+
 fn params_json(params: &ReplayParams) -> serde_json::Value {
     json!({
         "fee_bps": params.fee_bps,
@@ -5099,7 +5167,26 @@ fn replay_normalized_windows(
     if window_swaps == 0 || step_swaps == 0 {
         anyhow::bail!("window_swaps and step_swaps must be positive");
     }
-    let spec = read_replay_pool_spec(&spec_path)?;
+    let report = build_normalized_window_report(
+        &spec_path,
+        swaps_path,
+        window_swaps,
+        step_swaps,
+        min_windows,
+        overrides,
+    )?;
+    emit_normalized_window_report(report, format)
+}
+
+fn build_normalized_window_report(
+    spec_path: &Path,
+    swaps_path: Option<PathBuf>,
+    window_swaps: usize,
+    step_swaps: usize,
+    min_windows: usize,
+    overrides: &NormalizedReplayParams,
+) -> Result<NormalizedWindowReplayReport> {
+    let spec = read_replay_pool_spec(spec_path)?;
     if spec.replay_model != "clmm_tick_replay" {
         anyhow::bail!(
             "unsupported replay_model `{}` in {}; normalized windows currently supports clmm_tick_replay only",
@@ -5128,16 +5215,50 @@ fn replay_normalized_windows(
             swaps_path.display()
         );
     }
+    let rows = build_window_rows(&swaps, &params, window_swaps, step_swaps);
+    let windows = rows
+        .iter()
+        .map(|row| row.window_index)
+        .max()
+        .map(|max| max + 1)
+        .unwrap_or(0);
+    if windows < min_windows {
+        anyhow::bail!(
+            "need at least {} windows, got {} (swaps={}, window_swaps={}, step_swaps={})",
+            min_windows,
+            windows,
+            swaps.len(),
+            window_swaps,
+            step_swaps
+        );
+    }
+    Ok(NormalizedWindowReplayReport {
+        label: format!("{} ({})", spec.symbol, spec.pool_address),
+        swaps: swaps.len(),
+        window_swaps,
+        step_swaps,
+        windows,
+        config: params_json(&params),
+        summaries: summarize_window_rows(&rows),
+        rows,
+    })
+}
 
+fn build_window_rows(
+    swaps: &[autopool_backtest::SwapObs],
+    params: &ReplayParams,
+    window_swaps: usize,
+    step_swaps: usize,
+) -> Vec<WindowPolicyRow> {
     let mut rows = Vec::new();
     let mut window_index = 0usize;
     let mut start = 0usize;
     while start + window_swaps <= swaps.len() {
         let end = start + window_swaps;
         let window = &swaps[start..end];
-        let years = replay_window_years_from_swaps(window, &params);
+        let years = replay_window_years_from_swaps(window, params);
         let minutes = years.unwrap_or(0.0) * 365.0 * 24.0 * 60.0;
-        let policies = run_battery(&params, window);
+        let policies = run_battery(params, window);
         for policy in policies {
             rows.push(WindowPolicyRow {
                 window_index,
@@ -5164,28 +5285,167 @@ fn replay_normalized_windows(
         window_index += 1;
         start += step_swaps;
     }
-    if window_index < min_windows {
-        anyhow::bail!(
-            "need at least {} windows, got {} (swaps={}, window_swaps={}, step_swaps={})",
-            min_windows,
-            window_index,
-            swaps.len(),
-            window_swaps,
-            step_swaps
-        );
-    }
+    rows
+}
 
-    let report = NormalizedWindowReplayReport {
-        label: format!("{} ({})", spec.symbol, spec.pool_address),
-        swaps: swaps.len(),
+#[allow(clippy::too_many_arguments)]
+fn replay_normalized_hedge_grid(
+    spec_path: PathBuf,
+    swaps_path: Option<PathBuf>,
+    window_swaps: usize,
+    step_swaps: usize,
+    min_windows: usize,
+    hedge_fractions: Vec<f64>,
+    overrides: &NormalizedReplayParams,
+    format: OutputFormat,
+) -> Result<()> {
+    if hedge_fractions.is_empty() {
+        anyhow::bail!("pass at least one --hedge-fraction");
+    }
+    let mut rows = Vec::new();
+    let mut label = String::new();
+    let mut swaps = 0usize;
+    let mut windows = 0usize;
+    let mut config = serde_json::Value::Null;
+    let mut fractions = hedge_fractions;
+    fractions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    fractions.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    let control_fraction = *fractions.first().unwrap_or(&0.0);
+
+    for hedge_fraction in fractions {
+        if !(0.0..=1.5).contains(&hedge_fraction) {
+            anyhow::bail!("hedge fraction {hedge_fraction} outside supported range 0.0..=1.5");
+        }
+        let grid_overrides = overrides.with_hedge_fraction(hedge_fraction);
+        let report = build_normalized_window_report(
+            &spec_path,
+            swaps_path.clone(),
+            window_swaps,
+            step_swaps,
+            min_windows,
+            &grid_overrides,
+        )?;
+        if label.is_empty() {
+            label = report.label.clone();
+            swaps = report.swaps;
+            windows = report.windows;
+        }
+        config = report.config.clone();
+        for summary in report.summaries.into_iter().filter(|summary| {
+            summary.policy == "hedged_narrow"
+                || ((summary.policy == "delta_hedged" || summary.policy == "hedged_wide")
+                    && (hedge_fraction - control_fraction).abs() < 1e-9)
+        }) {
+            let score = hedge_grid_score(&summary);
+            rows.push(HedgeGridRow {
+                hedge_fraction,
+                policy: summary.policy,
+                windows: summary.windows,
+                win_rate_vs_hold_pct: summary.win_rate_vs_hold_pct,
+                mean_net_pnl_usd: summary.mean_net_pnl_usd,
+                mean_net_vs_hold_usd: summary.mean_net_vs_hold_usd,
+                mean_net_apr_pct: summary.mean_net_apr_pct,
+                p05_net_apr_pct: summary.p05_net_apr_pct,
+                mean_fee_lvr_apr_pct: summary.mean_fee_lvr_apr_pct,
+                worst_max_drawdown_usd: summary.worst_max_drawdown_usd,
+                score,
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.policy.cmp(&b.policy))
+            .then_with(|| {
+                a.hedge_fraction
+                    .partial_cmp(&b.hedge_fraction)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let report = HedgeGridReport {
+        label,
+        swaps,
         window_swaps,
         step_swaps,
-        windows: window_index,
-        config: params_json(&params),
-        summaries: summarize_window_rows(&rows),
+        windows,
+        config,
         rows,
     };
-    emit_normalized_window_report(report, format)
+    emit_hedge_grid_report(report, format)
+}
+
+impl NormalizedReplayParams {
+    fn with_hedge_fraction(&self, hedge_fraction: f64) -> Self {
+        Self {
+            token0_usd: self.token0_usd,
+            capital_usd: self.capital_usd,
+            rebalance_gas_usd: self.rebalance_gas_usd,
+            rebalance_slippage_bps: self.rebalance_slippage_bps,
+            narrow_half_width: self.narrow_half_width,
+            wide_half_width: self.wide_half_width,
+            vol_k: self.vol_k,
+            action_delay_blocks: self.action_delay_blocks,
+            block_seconds: self.block_seconds,
+            risk_token_side: self.risk_token_side,
+            funding_bps_per_day: self.funding_bps_per_day,
+            hedge_fraction,
+            trend_exit_threshold: self.trend_exit_threshold,
+            reward_apr: self.reward_apr,
+            reward_haircut: self.reward_haircut,
+        }
+    }
+}
+
+fn hedge_grid_score(summary: &WindowPolicySummary) -> Option<f64> {
+    let p05 = summary.p05_net_apr_pct?;
+    let mean = summary.mean_net_apr_pct.unwrap_or(0.0);
+    let drawdown_penalty = summary.worst_max_drawdown_usd * 25.0;
+    Some(p05 + summary.win_rate_vs_hold_pct * 20.0 + mean * 0.05 - drawdown_penalty)
+}
+
+fn emit_hedge_grid_report(report: HedgeGridReport, format: OutputFormat) -> Result<()> {
+    if format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "hedge grid {} swaps={} windows={} window_swaps={} step_swaps={}",
+        report.label, report.swaps, report.windows, report.window_swaps, report.step_swaps
+    );
+    println!(
+        "score = p05APR + 20*win_rate_pct + 0.05*meanAPR - 25*worstDD; APR is mechanical window annualization"
+    );
+    println!("delta_hedged and hedged_wide are dynamic controls and are shown once");
+    println!(
+        "{:<14} {:<16} {:>4} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9} {:>10}",
+        "hedge",
+        "policy",
+        "n",
+        "win%",
+        "meanNet",
+        "meanVsH",
+        "meanAPR",
+        "p05APR",
+        "worstDD",
+        "score"
+    );
+    for row in &report.rows {
+        println!(
+            "{:<14.2} {:<16} {:>4} {:>7.0}% {:>10.2} {:>10.2} {:>9} {:>9} {:>9.2} {:>10}",
+            row.hedge_fraction,
+            row.policy,
+            row.windows,
+            row.win_rate_vs_hold_pct,
+            row.mean_net_pnl_usd,
+            row.mean_net_vs_hold_usd,
+            optional_pct(row.mean_net_apr_pct),
+            optional_pct(row.p05_net_apr_pct),
+            row.worst_max_drawdown_usd,
+            optional_f64(row.score)
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

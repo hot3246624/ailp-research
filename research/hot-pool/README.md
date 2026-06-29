@@ -98,6 +98,26 @@ in 66.7% of windows with positive p05 net APR (~656%), while `delta_hedged` won 
 66.7% with much lower worst drawdown (~$3.07). Caveat: this is still one short
 directional regime, so the left tail is less bad than before but not yet deployable.
 
+Hedge fraction sweep:
+
+```bash
+cargo run -p autopool-cli -- replay-normalized-hedge-grid \
+  --spec data/solana/hot-pool/specs/raydium-cardsusdc-hnhpjpjg.json \
+  --swaps data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl \
+  --window-swaps 40 \
+  --step-swaps 15 \
+  --min-windows 3 \
+  --grid-hedge-fraction 0 \
+  --grid-hedge-fraction 0.25 \
+  --grid-hedge-fraction 0.5 \
+  --grid-hedge-fraction 0.75 \
+  --grid-hedge-fraction 1
+```
+
+Latest grid result: `hedged_narrow` at 0.75 fixed hedge had the best score, with
+~1074% p05 mechanical net APR and ~$3.48 worst drawdown. Lower hedge fractions had
+higher mean net, but the p05 APR and drawdown deteriorated quickly.
+
 Schema:
 
 ```text
