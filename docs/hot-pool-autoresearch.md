@@ -926,6 +926,43 @@ signal than the prior full-only smoke, but still not deployable: the sample is
 minutes-long, active liquidity is nearest-snapshot proxy, and the active-bin liquidity
 fell sharply as price moved.
 
+### Meteora Live Shadow Runner
+
+The live shadow flow is now one command:
+
+```bash
+scripts/meteora-dlmm-live-shadow.sh \
+  --flow-limit 25 \
+  --signature-scan-limit 180 \
+  --max-signature-pages 2 \
+  --max-slot-distance 250 \
+  --request-sleep-ms 100
+```
+
+The runner takes a pre-flow snapshot, samples real swap flow, takes a post-flow
+snapshot, joins with a strict slot-distance gate, and then runs full + rolling DLMM
+proxy replay. It writes the latest text report to
+`data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-live-shadow.latest.txt`.
+
+2026-06-30 strict refresh:
+
+```text
+snapshot before: slot 429741140, active bin -6465, active-liq ~$11,354
+flow scan:       scanned 52 signatures, decoded 25 swaps, tx_errors=0
+snapshot after:  slot 429741214, active bin -6465, active-liq ~$11,354
+join gate:       89 flow rows, 8 snapshots, 40 joined, 49 stale skipped
+slot distance:   max 242, avg 133.5, max allowed 250
+full proxy:      centered +$2.03 net, $2.83 fees, $3.30 maxDD, 2 rebalances
+rolling gate:    centered/static/hold all reject_proxy
+```
+
+The key change is the left tail: under 15-row/5-step windows, centered still had
+positive mean edge (`+$0.64` versus hold) and acceptable capacity (`~0.14x`), but p05
+mechanical APR was about `-1,250%`, so the default gate rejected it for
+`left_tail_apr`. Static also rejected on left tail. This supersedes the prior
+`pass_proxy_gate` as the current SOL-USDC read: the pool remains interesting, but not
+strategy-approved.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

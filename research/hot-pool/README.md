@@ -449,6 +449,25 @@ versus hold >= `60%`, worst drawdown <= `5%` of capital, and mean capital/active
 mechanical APR about `4,976%`, worst drawdown about `$0.39`, and cap/active-liq about
 `0.14x`. This remains live-shadow proxy evidence, not a deployable APR.
 
+Live shadow runner:
+
+```bash
+scripts/meteora-dlmm-live-shadow.sh \
+  --flow-limit 25 \
+  --signature-scan-limit 180 \
+  --max-signature-pages 2 \
+  --max-slot-distance 250 \
+  --request-sleep-ms 100
+```
+
+The 2026-06-30 strict refresh took snapshots at slots `429741140` and `429741214`
+around a 25-swap flow scan. The join admitted 40 rows from 89 total flow rows and
+skipped 49 stale rows under a 250-slot max distance. Full proxy replay still showed
+centered positive (`+$2.03` net, `$2.83` fees), but rolling gate rejected every policy:
+centered failed only `left_tail_apr` with p05 about `-1,250%`; static also failed
+`left_tail_apr` with p05 about `-1,134%`. Current SOL-USDC status is therefore
+`proxy_candidate_rejected_on_latest_strict_refresh`, not strategy-approved.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
