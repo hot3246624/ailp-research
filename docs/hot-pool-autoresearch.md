@@ -820,6 +820,38 @@ active-bin liquidity. Therefore replay-grade DLMM observations now need one of:
 - add a documented approximation that maps average execution price to a bin id, but
   gate it as proxy-only until active-bin liquidity is reconstructed.
 
+### Meteora Account Reconstruction Probe
+
+The account-level feasibility probe is now scripted:
+
+```bash
+scripts/meteora-dlmm-account-probe.sh \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --flow data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.jsonl \
+  --limit 5 \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-account-probe.latest.json
+```
+
+2026-06-30 result:
+
+```text
+sampled flow rows:       5
+decoded swap ix:         5
+parseable events:        0
+touched bin arrays:      3, indexes -93/-92/-91
+current active id:       -6462, active bin array -93
+status:                  blocked_without_archival_account_state
+```
+
+This is useful because it separates two questions. We can identify which DLMM
+program accounts a swap touched, and the official SDK can decode current `lbPair`,
+`binArray`, `oracle`, and bitmap-extension accounts. But Solana `getTransaction`
+does not return historical account data, public `getAccountInfo` returns current
+state only, and these sampled logs still produce no official `Swap` / `Swap2Evt`
+events with historical active-bin liquidity. Replay-grade active liquidity therefore
+requires either an archival account-state/indexer source, or a live same-slot/near-slot
+snapshot pipeline that is explicitly gated as shadow evidence.
+
 ### Meteora Flow/Snapshot Proxy Join
 
 The first bounded live-shadow join is now available:

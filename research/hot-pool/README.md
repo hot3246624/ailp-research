@@ -386,6 +386,24 @@ and decoded `swap` instructions only contain `amountIn` / `minAmountOut`. We now
 need to join this flow stream to repeated active-bin snapshots or archival bin-array
 state.
 
+Account reconstruction probe:
+
+```bash
+scripts/meteora-dlmm-account-probe.sh \
+  --spec data/solana/hot-pool/specs/meteora-solusdc-5rcf1dm8.json \
+  --flow data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-swap-flow.jsonl \
+  --limit 5 \
+  --raw-out data/solana/hot-pool/swaps/meteora-sol-usdc/dlmm-account-probe.latest.json
+```
+
+The 2026-06-30 run decoded 5/5 swap instructions and identified 3 touched bin arrays
+(`-93`, `-92`, `-91`), while official EventParser produced 0 swap events. Current
+`lbPair` / `binArray` decoding works, but it is latest state only; public RPC
+`getTransaction` does not include historical account data and `getAccountInfo` is not
+slot-historical. Status: `blocked_without_archival_account_state` for replay-grade
+historical active liquidity unless we use an archival/indexer source or a same-slot
+live snapshot pipeline.
+
 Flow/snapshot proxy join is now wired:
 
 ```bash
