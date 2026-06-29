@@ -303,6 +303,14 @@ enum Command {
         limit: usize,
         #[arg(long, default_value_t = 100)]
         signature_scan_limit: usize,
+        #[arg(long, default_value_t = 1)]
+        max_signature_pages: usize,
+        /// Optional signature cursor for Solana getSignaturesForAddress pagination.
+        #[arg(long)]
+        before_signature: Option<String>,
+        /// Keep scanning until this many decoded normalized rows are available.
+        #[arg(long)]
+        min_normalized_swaps: Option<usize>,
         #[arg(long, default_value_t = 150)]
         request_sleep_ms: u64,
         /// Optional JSON output path for sampled swap rows.
@@ -1050,6 +1058,9 @@ async fn main() -> Result<()> {
             token1_mint,
             limit,
             signature_scan_limit,
+            max_signature_pages,
+            before_signature,
+            min_normalized_swaps,
             request_sleep_ms,
             output,
             normalized_output,
@@ -1063,6 +1074,9 @@ async fn main() -> Result<()> {
                 token1_mint,
                 limit,
                 signature_scan_limit,
+                max_signature_pages,
+                before_signature,
+                min_normalized_swaps,
                 request_sleep_ms,
                 output,
                 normalized_output,
@@ -2682,6 +2696,8 @@ fn proxy_verdict(net_apr: f64, risk_grade: &str, candidate: &SolanaPoolCandidate
 }
 
 const RAYDIUM_CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const RAYDIUM_CLMM_SWAP_EVENT_DISCRIMINATOR: [u8; 8] =
+    [0x40, 0xc6, 0xcd, 0xe8, 0x26, 0x08, 0x71, 0xe2];
 const RAYDIUM_CLMM_SWAP_EVENT_LEN: usize = 221;
 const TWO_POW_32_F64: f64 = 4_294_967_296.0;
 
@@ -2694,6 +2710,9 @@ struct SampleSolanaPoolSwapsArgs {
     token1_mint: String,
     limit: usize,
     signature_scan_limit: usize,
+    max_signature_pages: usize,
+    before_signature: Option<String>,
+    min_normalized_swaps: Option<usize>,
     request_sleep_ms: u64,
     output: Option<PathBuf>,
     normalized_output: Option<PathBuf>,
@@ -2716,8 +2735,8 @@ struct SolanaPoolSwapSample {
     token1_in: bool,
     program_data_count: usize,
     program_data_base64: Vec<String>,
-    raydium_clmm_event: Option<RaydiumClmmSwapEvent>,
-    normalized_swap_preview: Option<SolanaSwapObsPreview>,
+    raydium_clmm_events: Vec<RaydiumClmmSwapEvent>,
+    normalized_swap_previews: Vec<SolanaSwapObsPreview>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2758,6 +2777,12 @@ struct SolanaSignatureInfo {
     err: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone)]
+struct SolanaProgramSwapInvocation {
+    instruction: String,
+    program_data_base64: Vec<String>,
+}
+
 fn serialize_u128_as_string<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -2767,16 +2792,43 @@ where
 
 async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()> {
     let rpc = SolanaLightRpc::new(args.rpc_url.clone());
-    let signatures = rpc
-        .get_signatures_for_address(&args.pool_address, args.signature_scan_limit)
-        .await?;
     let mut samples = Vec::new();
-    for sig in signatures.into_iter().filter(|sig| sig.err.is_none()) {
-        let tx = rpc.get_transaction(&sig.signature).await?;
-        if let Some(sample) = parse_solana_pool_swap_sample(&args, &sig, &tx) {
-            samples.push(sample);
+    let mut scanned_signatures = 0usize;
+    let mut transaction_errors = 0usize;
+    let mut cursor = args.before_signature.clone();
+    let max_pages = args.max_signature_pages.max(1);
+    'pages: for _ in 0..max_pages {
+        let signatures = rpc
+            .get_signatures_for_address(
+                &args.pool_address,
+                args.signature_scan_limit,
+                cursor.as_deref(),
+            )
+            .await?;
+        if signatures.is_empty() {
+            break;
         }
-        if samples.len() >= args.limit {
+        cursor = signatures.last().map(|sig| sig.signature.clone());
+        for sig in signatures.into_iter().filter(|sig| sig.err.is_none()) {
+            scanned_signatures += 1;
+            let tx = match rpc.get_transaction(&sig.signature).await {
+                Ok(tx) => tx,
+                Err(_) => {
+                    transaction_errors += 1;
+                    continue;
+                }
+            };
+            if let Some(sample) = parse_solana_pool_swap_sample(&args, &sig, &tx) {
+                samples.push(sample);
+            }
+            if sample_goal_reached(&args, &samples) {
+                break 'pages;
+            }
+            if args.request_sleep_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(args.request_sleep_ms)).await;
+            }
+        }
+        if sample_goal_reached(&args, &samples) {
             break;
         }
         if args.request_sleep_ms > 0 {
@@ -2804,11 +2856,12 @@ async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()>
     }
 
     println!(
-        "solana pool swap samples pool={} program={} scanned={} kept={}",
+        "solana pool swap samples pool={} program={} scanned={} kept={} tx_errors={}",
         args.pool_address,
         args.program_id,
-        args.signature_scan_limit,
-        samples.len()
+        scanned_signatures,
+        samples.len(),
+        transaction_errors
     );
     if let Some(normalized_rows) = normalized_rows {
         println!(
@@ -2833,8 +2886,15 @@ async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()>
             "-"
         };
         let tick = sample
-            .normalized_swap_preview
-            .map(|preview| preview.tick.to_string())
+            .normalized_swap_previews
+            .first()
+            .map(|preview| {
+                if sample.normalized_swap_previews.len() > 1 {
+                    format!("{}+", preview.tick)
+                } else {
+                    preview.tick.to_string()
+                }
+            })
             .unwrap_or_else(|| "-".to_string());
         println!(
             "{:<12} {:>10} {:<8} {:>18} {:>18} {:>5} {:>8}  {}",
@@ -2852,11 +2912,22 @@ async fn sample_solana_pool_swaps(args: SampleSolanaPoolSwapsArgs) -> Result<()>
     Ok(())
 }
 
+fn sample_goal_reached(args: &SampleSolanaPoolSwapsArgs, samples: &[SolanaPoolSwapSample]) -> bool {
+    if let Some(min_normalized_swaps) = args.min_normalized_swaps {
+        return samples
+            .iter()
+            .map(|sample| sample.normalized_swap_previews.len())
+            .sum::<usize>()
+            >= min_normalized_swaps;
+    }
+    samples.len() >= args.limit
+}
+
 fn write_normalized_swap_jsonl(path: &Path, samples: &[SolanaPoolSwapSample]) -> Result<usize> {
     let mut swaps = samples
         .iter()
         .enumerate()
-        .filter_map(|(idx, sample)| sample_to_swap_obs(sample, idx as u64))
+        .flat_map(|(idx, sample)| sample_to_swap_obs(sample, idx as u64))
         .collect::<Vec<_>>();
     swaps.sort_by(|a, b| {
         a.block
@@ -2882,17 +2953,21 @@ fn write_normalized_swap_jsonl(path: &Path, samples: &[SolanaPoolSwapSample]) ->
 fn sample_to_swap_obs(
     sample: &SolanaPoolSwapSample,
     log_index: u64,
-) -> Option<autopool_backtest::SwapObs> {
-    let preview = sample.normalized_swap_preview?;
-    Some(autopool_backtest::SwapObs {
-        block: sample.slot,
-        log_index,
-        amount0: preview.amount0,
-        amount1: preview.amount1,
-        sqrt_price_x96: preview.sqrt_price_x96,
-        liquidity: preview.liquidity,
-        tick: preview.tick,
-    })
+) -> Vec<autopool_backtest::SwapObs> {
+    sample
+        .normalized_swap_previews
+        .iter()
+        .enumerate()
+        .map(|(idx, preview)| autopool_backtest::SwapObs {
+            block: sample.slot,
+            log_index: log_index * 1_000 + idx as u64,
+            amount0: preview.amount0,
+            amount1: preview.amount1,
+            sqrt_price_x96: preview.sqrt_price_x96,
+            liquidity: preview.liquidity,
+            tick: preview.tick,
+        })
+        .collect()
 }
 
 struct SolanaLightRpc {
@@ -2948,12 +3023,14 @@ impl SolanaLightRpc {
         &self,
         address: &str,
         limit: usize,
+        before: Option<&str>,
     ) -> Result<Vec<SolanaSignatureInfo>> {
+        let mut config = json!({"limit": limit.min(1_000)});
+        if let Some(before) = before {
+            config["before"] = json!(before);
+        }
         let result = self
-            .call(
-                "getSignaturesForAddress",
-                json!([address, {"limit": limit.min(1_000)}]),
-            )
+            .call("getSignaturesForAddress", json!([address, config]))
             .await?;
         serde_json::from_value(result).context("parsing getSignaturesForAddress result")
     }
@@ -2980,7 +3057,10 @@ fn parse_solana_pool_swap_sample(
         .filter_map(serde_json::Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let (instruction, program_data_base64) = target_program_swap_data(&logs, &args.program_id)?;
+    let invocations = target_program_swap_invocations(&logs, &args.program_id);
+    if invocations.is_empty() {
+        return None;
+    }
     let (token0_pool_delta_raw, token0_decimals) =
         pool_token_delta(tx, &args.pool_address, &args.token0_mint);
     let (token1_pool_delta_raw, token1_decimals) =
@@ -2988,16 +3068,34 @@ fn parse_solana_pool_swap_sample(
     if token0_pool_delta_raw == 0 && token1_pool_delta_raw == 0 {
         return None;
     }
-    let raydium_clmm_event = if args.program_id == RAYDIUM_CLMM_PROGRAM_ID {
-        program_data_base64
-            .iter()
-            .find_map(|data| decode_raydium_clmm_swap_event(data, &args.pool_address))
+    let raydium_matches = if args.program_id == RAYDIUM_CLMM_PROGRAM_ID {
+        matching_raydium_clmm_swap_events(&invocations, &args.pool_address)
     } else {
-        None
+        Vec::new()
     };
-    let normalized_swap_preview = raydium_clmm_event
-        .as_ref()
-        .map(raydium_event_to_swap_obs_preview);
+    let instruction = raydium_matches
+        .first()
+        .map(|(instruction, _, _)| instruction.clone())
+        .unwrap_or_else(|| invocations[0].instruction.clone());
+    let program_data_base64 = if raydium_matches.is_empty() {
+        invocations
+            .iter()
+            .flat_map(|invocation| invocation.program_data_base64.iter().cloned())
+            .collect::<Vec<_>>()
+    } else {
+        raydium_matches
+            .iter()
+            .map(|(_, data, _)| data.clone())
+            .collect::<Vec<_>>()
+    };
+    let raydium_clmm_events = raydium_matches
+        .into_iter()
+        .map(|(_, _, event)| event)
+        .collect::<Vec<_>>();
+    let normalized_swap_previews = raydium_clmm_events
+        .iter()
+        .map(raydium_event_to_swap_obs_preview)
+        .collect::<Vec<_>>();
 
     Some(SolanaPoolSwapSample {
         signature: sig.signature.clone(),
@@ -3014,8 +3112,8 @@ fn parse_solana_pool_swap_sample(
         token1_in: token1_pool_delta_raw > 0,
         program_data_count: program_data_base64.len(),
         program_data_base64,
-        raydium_clmm_event,
-        normalized_swap_preview,
+        raydium_clmm_events,
+        normalized_swap_previews,
     })
 }
 
@@ -3027,6 +3125,9 @@ fn decode_raydium_clmm_swap_event(
         .decode(program_data_base64)
         .ok()?;
     if bytes.len() < RAYDIUM_CLMM_SWAP_EVENT_LEN {
+        return None;
+    }
+    if bytes.get(0..8)? != RAYDIUM_CLMM_SWAP_EVENT_DISCRIMINATOR {
         return None;
     }
     let mut offset = 8; // Anchor event discriminator.
@@ -3063,6 +3164,21 @@ fn decode_raydium_clmm_swap_event(
         trade_fee_0,
         trade_fee_1,
     })
+}
+
+fn matching_raydium_clmm_swap_events(
+    invocations: &[SolanaProgramSwapInvocation],
+    expected_pool_address: &str,
+) -> Vec<(String, String, RaydiumClmmSwapEvent)> {
+    invocations
+        .iter()
+        .flat_map(|invocation| {
+            invocation.program_data_base64.iter().filter_map(|data| {
+                decode_raydium_clmm_swap_event(data, expected_pool_address)
+                    .map(|event| (invocation.instruction.clone(), data.clone(), event))
+            })
+        })
+        .collect()
 }
 
 fn raydium_event_to_swap_obs_preview(event: &RaydiumClmmSwapEvent) -> SolanaSwapObsPreview {
@@ -3122,10 +3238,14 @@ fn read_bool(bytes: &[u8], offset: &mut usize) -> Option<bool> {
     }
 }
 
-fn target_program_swap_data(logs: &[String], program_id: &str) -> Option<(String, Vec<String>)> {
+fn target_program_swap_invocations(
+    logs: &[String],
+    program_id: &str,
+) -> Vec<SolanaProgramSwapInvocation> {
     let mut in_target = false;
     let mut instruction: Option<String> = None;
     let mut data = Vec::new();
+    let mut invocations = Vec::new();
     let invoke_prefix = format!("Program {program_id} invoke");
     let success_prefix = format!("Program {program_id} success");
     let failed_prefix = format!("Program {program_id} failed");
@@ -3151,13 +3271,16 @@ fn target_program_swap_data(logs: &[String], program_id: &str) -> Option<(String
         }
         if in_target && (log.starts_with(&success_prefix) || log.starts_with(&failed_prefix)) {
             if let Some(ix) = instruction.clone() {
-                return Some((ix, data.clone()));
+                invocations.push(SolanaProgramSwapInvocation {
+                    instruction: ix,
+                    program_data_base64: data.clone(),
+                });
             }
             in_target = false;
             data.clear();
         }
     }
-    None
+    invocations
 }
 
 fn pool_token_delta(tx: &serde_json::Value, pool_address: &str, mint: &str) -> (i128, Option<u8>) {
@@ -4566,6 +4689,13 @@ fn emit_replay_report(
         optional_i32(report.tick_first),
         optional_i32(report.tick_last),
     );
+    let window_years = replay_window_years(&report, params);
+    if let Some(years) = window_years {
+        println!(
+            "window: {:.1}min; APR columns are mechanical window annualization, not a forecast",
+            years * 365.0 * 24.0 * 60.0
+        );
+    }
     println!(
         "config: fee={:.2}bps capital=${:.0} token0=${:.0} gas=${:.3}/reb delay={}blk block_s={:.2} risk={} fund={}bps/d hedge={} narrow=±{} wide=±{}",
         params.fee_bps,
@@ -4581,12 +4711,22 @@ fn emit_replay_report(
         params.wide_half_width,
     );
     println!(
-        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>9} {:>10} {:>9} {:>8}",
-        "policy", "net_pnl", "vs_hold", "fees", "reward", "LVR", "fee-LVR", "maxDD", "rebals"
+        "{:<22} {:>10} {:>10} {:>9} {:>9} {:>9} {:>10} {:>9} {:>10} {:>9} {:>8}",
+        "policy",
+        "net_pnl",
+        "vs_hold",
+        "fees",
+        "reward",
+        "LVR",
+        "fee-LVR",
+        "netAPR",
+        "feeLVRAPR",
+        "maxDD",
+        "rebals"
     );
     for policy in &report.policies {
         println!(
-            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>9.2} {:>10.2} {:>9.2} {:>8}",
+            "{:<22} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>9.2} {:>10.2} {:>9} {:>10} {:>9.2} {:>8}",
             policy.policy,
             policy.net_pnl_usd,
             policy.net_vs_hold_usd,
@@ -4594,11 +4734,31 @@ fn emit_replay_report(
             policy.reward_income_usd,
             policy.lvr_usd,
             policy.fee_minus_lvr_usd,
+            format_window_apr(policy.net_pnl_usd, params.capital_usd, window_years),
+            format_window_apr(policy.fee_minus_lvr_usd, params.capital_usd, window_years),
             policy.max_drawdown_usd,
             policy.rebalances,
         );
     }
     Ok(())
+}
+
+fn replay_window_years(report: &ReplayReport, params: &ReplayParams) -> Option<f64> {
+    let first = report.block_first?;
+    let last = report.block_last?;
+    if last <= first || params.block_seconds <= 0.0 {
+        return None;
+    }
+    Some(((last - first) as f64 * params.block_seconds) / (365.0 * 24.0 * 60.0 * 60.0))
+}
+
+fn format_window_apr(value_usd: f64, capital_usd: f64, window_years: Option<f64>) -> String {
+    match window_years {
+        Some(years) if years > 0.0 && capital_usd > 0.0 => {
+            format!("{:.0}%", value_usd / capital_usd / years * 100.0)
+        }
+        _ => "-".to_string(),
+    }
 }
 
 fn replay_events(
@@ -6502,6 +6662,97 @@ mod tests {
         assert_eq!(preview.amount0, -489_212_126.0);
         assert_eq!(preview.amount1, 120_030_215.0);
         assert_eq!(preview.tick, -14_092);
+    }
+
+    #[test]
+    fn raydium_matching_skips_routed_swap_from_other_pool() {
+        let invocations = vec![
+            SolanaProgramSwapInvocation {
+                instruction: "Swap".to_string(),
+                program_data_base64: vec![
+                    "QMbN6CYIceLQlIab3eXILQlyo9aqQY3bkiekql1sLmkJya8CAmKcP9laNTE8ekSIS9fREtHki/5hop//6Ko66Xbj3oFZpS1ro73UDi422zGrqgUtijMcRl2LF39ZXfIplXkzkOUqkdC2YHy19tWHdGMRTa1dw1pJQJO2QjC99moyLrIur/RE5J24MxsAAAAAAAAAAAAAAABvxaoGAAAAAAAAAAAAAAAAALsOzY6MMMl+AAAAAAAAAAAoj3WFLQAAAAAAAAAAAAAAGcn//wAAAAAAAAAAxq4AAAAAAAA=".to_string(),
+                ],
+            },
+            SolanaProgramSwapInvocation {
+                instruction: "SwapV2".to_string(),
+                program_data_base64: vec![
+                    "QMbN6CYIceL5cEcIwJ0doJ606WjQpCy4c1fKQWkhV+rJ9GWEcQ0Beqx+qMoro1HpabFjovKAi6Xg2hc3AOJa/INrzLINjURgJ+pZMQTN1cdziJMBFtZsa/jPU5cifiYm349rv58fllzmMP246IpMm+Wt1jXLWP5a94u9i6w4S5ssqbnw+uUHH97IKB0AAAAAAAAAAAAAAAAHhCcHAAAAAAAAAAAAAAAAAMHWr0ETYI1+AAAAAAAAAACpeeHOew0AAAAAAAAAAAAA9Mj//wAAAAAAAAAAeVMHAAAAAAA=".to_string(),
+                ],
+            },
+        ];
+        let matches = matching_raydium_clmm_swap_events(
+            &invocations,
+            "HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD",
+        );
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, "SwapV2");
+        assert_eq!(
+            matches[0].2.pool_state,
+            "HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD"
+        );
+        assert_eq!(matches[0].2.tick, -14_092);
+    }
+
+    #[test]
+    fn sample_goal_can_require_normalized_rows() {
+        let args = SampleSolanaPoolSwapsArgs {
+            rpc_url: "http://localhost".to_string(),
+            pool_address: "pool".to_string(),
+            program_id: RAYDIUM_CLMM_PROGRAM_ID.to_string(),
+            token0_mint: "token0".to_string(),
+            token1_mint: "token1".to_string(),
+            limit: 10,
+            signature_scan_limit: 100,
+            max_signature_pages: 2,
+            before_signature: None,
+            min_normalized_swaps: Some(2),
+            request_sleep_ms: 0,
+            output: None,
+            normalized_output: None,
+            format: OutputFormat::Table,
+        };
+        let mut samples = Vec::new();
+        samples.push(solana_sample_fixture(Vec::new()));
+        samples.push(solana_sample_fixture(vec![SolanaSwapObsPreview {
+            amount0: 1.0,
+            amount1: -1.0,
+            sqrt_price_x96: 1.0,
+            liquidity: 1.0,
+            tick: 1,
+        }]));
+        assert!(!sample_goal_reached(&args, &samples));
+        samples.push(solana_sample_fixture(vec![SolanaSwapObsPreview {
+            amount0: 2.0,
+            amount1: -2.0,
+            sqrt_price_x96: 2.0,
+            liquidity: 2.0,
+            tick: 2,
+        }]));
+        assert!(sample_goal_reached(&args, &samples));
+    }
+
+    fn solana_sample_fixture(
+        normalized_swap_previews: Vec<SolanaSwapObsPreview>,
+    ) -> SolanaPoolSwapSample {
+        SolanaPoolSwapSample {
+            signature: "sig".to_string(),
+            slot: 1,
+            block_time: None,
+            instruction: "SwapV2".to_string(),
+            token0_mint: "token0".to_string(),
+            token1_mint: "token1".to_string(),
+            token0_pool_delta_raw: 1,
+            token1_pool_delta_raw: -1,
+            token0_decimals: Some(6),
+            token1_decimals: Some(6),
+            token0_in: true,
+            token1_in: false,
+            program_data_count: 1,
+            program_data_base64: vec!["data".to_string()],
+            raydium_clmm_events: Vec::new(),
+            normalized_swap_previews,
+        }
     }
 
     fn hot_pool_candidate_fixture(

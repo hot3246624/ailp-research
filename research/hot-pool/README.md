@@ -63,14 +63,22 @@ cargo run -p autopool-cli -- sample-solana-pool-swaps \
   --program-id CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK \
   --token0-mint CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp \
   --token1-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
-  --limit 8 \
-  --signature-scan-limit 30 \
+  --signature-scan-limit 250 \
+  --max-signature-pages 4 \
+  --min-normalized-swaps 200 \
+  --request-sleep-ms 250 \
   --output data/solana/swaps/raydium-cards-usdc-sample.json \
   --normalized-output data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl
 ```
 
 For Raydium CLMM this also decodes `SwapEvent` into a normalized swap preview
-containing signed amounts, `sqrt_price_x96`, active liquidity, and tick.
+containing signed amounts, `sqrt_price_x96`, active liquidity, and tick. Use
+`--max-signature-pages` plus `--min-normalized-swaps` for larger replay windows.
+
+Latest `CARDS-USDC` real replay check: 58 signatures -> 50 target swaps -> 50
+normalized rows, replay window ~47.5 minutes. Hedged narrow/delta hedged produced
+about $8.23 net on $10k with $0.33 max drawdown; vol-scaled/adaptive captured more
+fee-LVR but stayed net negative because inventory drift dominated the short window.
 
 Schema:
 

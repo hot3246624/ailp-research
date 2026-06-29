@@ -197,8 +197,10 @@ cargo run -p autopool-cli -- sample-solana-pool-swaps \
   --program-id CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK \
   --token0-mint CARDSccUMFKoPRZxt5vt3ksUbxEFEcnZ3H2pd3dKxYjp \
   --token1-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
-  --limit 8 \
-  --signature-scan-limit 30 \
+  --signature-scan-limit 250 \
+  --max-signature-pages 4 \
+  --min-normalized-swaps 200 \
+  --request-sleep-ms 250 \
   --output data/solana/swaps/raydium-cards-usdc-sample.json \
   --normalized-output data/solana/hot-pool/swaps/raydium-cards-usdc/swaps.jsonl
 ```
@@ -229,6 +231,9 @@ This command extracts:
 - signed pool-owned token vault deltas for both pool mints.
 - Raydium CLMM `SwapEvent` fields and a normalized `SwapObs` preview when the
   program is `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`.
+- paginated signature scans via `--max-signature-pages` and
+  `--before-signature`, plus `--min-normalized-swaps` so replay collection can
+  target decoded rows rather than raw transaction count.
 
 Current result: both Raydium `CARDS-USDC` and Orca `SOL-PUMP` produce clean recent
 swap samples with one program-data payload per swap. Raydium CLMM now decodes into
@@ -240,9 +245,26 @@ precision.
 
 First smoke test: scanning 80 recent `CARDS-USDC` pool signatures landed 20 swaps,
 decoded 19 Raydium `SwapEvent` rows into `SwapObs` JSONL, and `replay-normalized-swaps`
-successfully ran the existing policy battery over those rows. This is not enough
-history for APR claims, but it proves the real-data business loop:
-RPC swaps -> Raydium event decode -> normalized swap JSONL -> replay.
+successfully ran the existing policy battery over those rows. The missing row was a
+routed Jupiter transaction where the first Raydium invocation belonged to another
+pool; the sampler now scans all Raydium swap invocations and keeps the event whose
+`pool_state` matches the requested pool.
+
+Latest real replay check: scanning 58 recent `CARDS-USDC` signatures landed 50 target
+pool swaps, decoded 50/50 normalized rows with zero transaction errors, and replayed
+a 47.5 minute window. Mechanical annualization is not a forecast, but it gives the
+current hot-pool magnitude:
+
+| policy | net PnL | vs hold | fees | fee-LVR | net APR window | fee-LVR APR window | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| hedged_narrow / delta_hedged | $8.23 | $31.65 | $10.08 | $7.59 | ~910% | ~839% | $0.33 |
+| vol_scaled / adaptive | -$7.83 | $15.59 | $19.24 | $14.29 | ~-866% | ~1580% | $22.32 |
+| hedged_wide | $0.92 | $24.34 | $1.12 | $0.86 | ~102% | ~95% | $0.03 |
+
+Interpretation: the fee engine is hot enough to justify continued work, but inventory
+direction dominates unhedged PnL even in a short window. The next useful milestone is
+multi-window replay that tests whether hedged narrow/vol-scaled variants repeatedly
+beat hold and passive wide after churn and capacity constraints.
 
 ## Autoresearch Rules Adapted To AILP
 

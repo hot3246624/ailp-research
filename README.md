@@ -153,6 +153,9 @@ raw `Program data`, and computes signed pool vault deltas for the two pool mints
 For Raydium CLMM it now decodes `SwapEvent` into post-swap sqrt price, active
 liquidity, tick, and normalized `SwapObs` JSONL. Orca follows after liquidity can
 be reconstructed, while Meteora remains a separate DLMM/bin replay track.
+The latest real Raydium `CARDS-USDC` replay smoke test decoded 50/50 recent swaps
+over a ~47.5 minute window; hedged narrow produced about $8.23 net on $10k with
+~$0.33 max drawdown, while unhedged fee-rich variants still showed inventory drag.
 
 ## External References
 
