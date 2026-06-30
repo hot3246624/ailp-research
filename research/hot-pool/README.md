@@ -538,6 +538,13 @@ outside the live snapshot window. A 400-slot proxy join produced the first 15-ro
 This is still not a strategy promotion. The live-shadow runner now also supports
 `--cursor-file` to persist `next_before_signature` across small batches.
 
+The wait-aligned MU run proved the stricter data path can work. Adding
+`--pre-flow-wait-seconds 360` raised strict 250-slot joined rows to 22 and produced 2
+rolling windows. It still rejected: centered mean net `-$6.29`, mean vs hold `+$0.65`,
+mean fees `$1.16`, p05 APR about `-5930%`, worst drawdown `$7.42`, cap/active-liq
+about `0.08x`. This is the best strict MU evidence yet, but it is not a promoted
+strategy.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text

@@ -17,6 +17,7 @@ MAX_SIGNATURE_PAGES="${MAX_SIGNATURE_PAGES:-2}"
 REQUEST_SLEEP_MS="${REQUEST_SLEEP_MS:-100}"
 BEFORE_SIGNATURE="${BEFORE_SIGNATURE:-}"
 CURSOR_FILE="${CURSOR_FILE:-}"
+PRE_FLOW_WAIT_SECONDS="${PRE_FLOW_WAIT_SECONDS:-0}"
 MAX_SLOT_DISTANCE="${MAX_SLOT_DISTANCE:-250}"
 WINDOW_OBSERVATIONS="${WINDOW_OBSERVATIONS:-15}"
 STEP_OBSERVATIONS="${STEP_OBSERVATIONS:-5}"
@@ -39,6 +40,7 @@ Options:
   --request-sleep-ms <n>           Sleep between transaction requests.
   --before-signature <sig>         Start swap-flow scan before this signature.
   --cursor-file <path>             Read/write the next before-signature cursor.
+  --pre-flow-wait-seconds <n>      Sleep after the first snapshot before fetching flow.
   --max-slot-distance <n>          Strict join distance in slots.
   --window-observations <n>        Rolling DLMM replay window size.
   --step-observations <n>          Rolling DLMM replay step size.
@@ -85,6 +87,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cursor-file)
       CURSOR_FILE="$2"
+      shift 2
+      ;;
+    --pre-flow-wait-seconds)
+      PRE_FLOW_WAIT_SECONDS="$2"
       shift 2
       ;;
     --max-slot-distance)
@@ -158,6 +164,9 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
   if [[ -n "${CURSOR_FILE}" ]]; then
     echo "cursor_file=${CURSOR_FILE}"
   fi
+  if [[ "${PRE_FLOW_WAIT_SECONDS}" != "0" ]]; then
+    echo "pre_flow_wait_seconds=${PRE_FLOW_WAIT_SECONDS}"
+  fi
   echo "max_slot_distance=${MAX_SLOT_DISTANCE} window_observations=${WINDOW_OBSERVATIONS} step_observations=${STEP_OBSERVATIONS} capital_usd=${CAPITAL_USD}"
   echo
 
@@ -169,6 +178,12 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
     --raw-jsonl-out "${SNAPSHOTS_RAW}" \
     --rpc "${RPC}" \
     --append
+  if [[ "${PRE_FLOW_WAIT_SECONDS}" != "0" ]]; then
+    echo
+    echo "== wait for RPC transaction availability =="
+    echo "sleep_seconds=${PRE_FLOW_WAIT_SECONDS}"
+    sleep "${PRE_FLOW_WAIT_SECONDS}"
+  fi
 
   echo
   echo "== swap flow =="

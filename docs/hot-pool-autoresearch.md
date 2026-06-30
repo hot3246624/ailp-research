@@ -1114,6 +1114,24 @@ supports `--cursor-file`, which reads and writes the `next_before_signature` cur
 future heartbeats can run small continuous backfill batches without manually copying
 signatures.
 
+The next strict live-shadow test added a more important fix: `--pre-flow-wait-seconds`.
+Public RPC transaction details for this pool were lagging current account snapshots by
+roughly several hundred slots, so immediate `snapshot -> flow` collection missed strict
+joins. Running `snapshot -> wait 360s -> flow -> snapshot` aligned the newest visible
+swaps with the first snapshot and raised strict 250-slot joined rows from 12 to 22:
+
+```text
+MU-USDC 20bps, strict 250-slot wait-aligned proxy: observations=22, windows=2, cap/active-liq ~0.08x
+centered: reject_proxy, meanNet -$6.29, meanVsH +$0.65, meanFee $1.16, p05APR -5930%, worstDD $7.42
+static:   reject_proxy, meanNet -$6.13, meanVsH +$0.81, meanFee $0.81, p05APR -5987%, worstDD $6.94
+hold:     reject_proxy, meanNet -$6.94, p05APR -6334%
+```
+
+This is the cleanest MU evidence so far: the data path now produces strict windows,
+and centered/static did beat hold in both tiny windows, but inventory drift still
+overwhelmed fees. MU remains a live-shadow candidate for more windows, not a promoted
+strategy.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
