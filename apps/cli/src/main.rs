@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SOLANA_HTTP_TIMEOUT_SECS: u64 = 20;
+const BASE_WETH: &str = "0x4200000000000000000000000000000000000006";
+const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const BASE_USDBC: &str = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca";
+const BASE_USDT: &str = "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2";
+const BASE_DAI: &str = "0x50c5725949a6f0c72e6c4a641f24049a917db0cb";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputFormat {
@@ -904,6 +909,34 @@ enum Command {
         /// account fetches are unreliable.
         #[arg(long, default_value_t = false)]
         skip_quoter: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Audit the difference between pool TVL, active in-range LP capacity, and
+    /// same-pool rebalance swap impact for explicit Slipstream pools. This is a
+    /// read-only capacity sanity check; it never signs or broadcasts.
+    CapacityTruthAudit {
+        #[arg(long, env = "BASE_RPC_URL")]
+        rpc_url: String,
+        /// Explicit pool spec, repeatable: SYMBOL:0xADDRESS.
+        #[arg(long = "pool")]
+        pools: Vec<String>,
+        /// Capital sizes to audit.
+        #[arg(long = "capital-usd", default_values_t = [10_000.0, 50_000.0, 100_000.0])]
+        capitals_usd: Vec<f64>,
+        /// Target LP band half-width in ticks, snapped to the pool spacing.
+        #[arg(long, default_value_t = 600)]
+        half_width_ticks: i32,
+        /// Same-pool rebalance impact gate in bps.
+        #[arg(long, default_value_t = 30.0)]
+        impact_gate_bps: f64,
+        /// Optional fallback USD value for token0 when it cannot be inferred from a
+        /// stablecoin side or the WETH-USDC reference pool.
+        #[arg(long)]
+        token0_usd: Option<f64>,
+        /// Base WETH-USDC reference pool used to infer WETH/USD for non-stable pairs.
+        #[arg(long, default_value = "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59")]
+        weth_usdc_reference_pool: String,
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
     },
@@ -1906,6 +1939,28 @@ async fn main() -> Result<()> {
                 risk_token_side,
                 max_risk_token_share,
                 skip_quoter,
+                format,
+            })
+            .await?
+        }
+        Command::CapacityTruthAudit {
+            rpc_url,
+            pools,
+            capitals_usd,
+            half_width_ticks,
+            impact_gate_bps,
+            token0_usd,
+            weth_usdc_reference_pool,
+            format,
+        } => {
+            capacity_truth_audit(CapacityTruthAuditArgs {
+                rpc_url,
+                pools,
+                capitals_usd,
+                half_width_ticks,
+                impact_gate_bps,
+                token0_usd,
+                weth_usdc_reference_pool,
                 format,
             })
             .await?
@@ -9135,6 +9190,362 @@ async fn dry_run_rebalance(args: DryRunArgs) -> Result<()> {
     Ok(())
 }
 
+struct CapacityTruthAuditArgs {
+    rpc_url: String,
+    pools: Vec<String>,
+    capitals_usd: Vec<f64>,
+    half_width_ticks: i32,
+    impact_gate_bps: f64,
+    token0_usd: Option<f64>,
+    weth_usdc_reference_pool: String,
+    format: OutputFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct CapacityTruthPoolReport {
+    symbol: String,
+    pool_address: String,
+    token0: String,
+    token1: String,
+    decimals0: u8,
+    decimals1: u8,
+    token0_usd: f64,
+    token0_usd_source: String,
+    price_token1_per_token0: f64,
+    fee_bps: f64,
+    current_tick: i32,
+    tick_spacing: i32,
+    half_width_ticks: i32,
+    target_lower: i32,
+    target_upper: i32,
+    pool_active_liquidity_raw: String,
+    rows: Vec<CapacityTruthRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct CapacityTruthRow {
+    capital_usd: f64,
+    target_position_liquidity_raw: f64,
+    active_capacity_usd_same_range: f64,
+    position_to_active_liquidity_pct: f64,
+    share_after_mint_pct: f64,
+    token0_only_rebalance_impact_bps: f64,
+    token1_only_rebalance_impact_bps: f64,
+    worst_same_pool_rebalance_impact_bps: f64,
+    same_pool_rebalance_gate: String,
+    note: String,
+}
+
+async fn capacity_truth_audit(args: CapacityTruthAuditArgs) -> Result<()> {
+    let pool_specs = if args.pools.is_empty() {
+        vec![
+            "WETH-USDC-200bps:0x56aeaf4af2df4bdfd9d865830fefdd278b25e7ef".to_string(),
+            "WETH-USDC-0.5bps:0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59".to_string(),
+            "WETH-AERO-21bps:0x4e506648d493c8870f55e870480f92f2f33ece51".to_string(),
+        ]
+    } else {
+        args.pools.clone()
+    };
+    let pools = pool_specs
+        .iter()
+        .map(|spec| parse_manual_pool(spec))
+        .collect::<Result<Vec<_>>>()?;
+    if args.capitals_usd.is_empty() {
+        anyhow::bail!("at least one --capital-usd value is required");
+    }
+
+    let rpc = JsonRpcClient::new(args.rpc_url.clone());
+    let weth_usd = infer_base_weth_usd(&rpc, &args.weth_usdc_reference_pool)
+        .await
+        .ok()
+        .flatten();
+    let mut reports = Vec::new();
+
+    for pool in pools {
+        let state = rpc
+            .read_cl_pool_state(&pool.pool_address)
+            .await
+            .with_context(|| format!("reading pool state for {}", pool.pool_address))?;
+        let fee_bps = read_pool_fee_bps(&rpc, &pool.pool_address)
+            .await
+            .unwrap_or(0.0);
+        let (token0, token1) = read_pool_tokens(&rpc, &pool.pool_address).await?;
+        let decimals0 = read_erc20_decimals(&rpc, &token0)
+            .await?
+            .with_context(|| format!("token0 {token0} decimals unavailable"))?;
+        let decimals1 = read_erc20_decimals(&rpc, &token1)
+            .await?
+            .with_context(|| format!("token1 {token1} decimals unavailable"))?;
+        let sqrt_x96 = hex_word_to_f64(&state.sqrt_price_x96_hex);
+        let price_token1_per_token0 = price_token1_per_token0(sqrt_x96, decimals0, decimals1);
+        let (token0_usd, token0_usd_source) = infer_token0_usd(
+            &token0,
+            &token1,
+            price_token1_per_token0,
+            args.token0_usd,
+            weth_usd,
+        )
+        .with_context(|| {
+            format!(
+                "cannot infer token0 USD for {}; pass --token0-usd or include a WETH-USDC reference",
+                pool.candidate.symbol
+            )
+        })?;
+        let spacing = state.tick_spacing.max(1);
+        let lower = snap_to_spacing(state.current_tick - args.half_width_ticks, spacing);
+        let upper = snap_to_spacing(state.current_tick + args.half_width_ticks, spacing);
+        let pool_liquidity = state.liquidity.parse::<f64>().unwrap_or(0.0);
+        let fee_fraction = fee_bps / 10_000.0;
+        let mut rows = Vec::new();
+
+        for capital_usd in &args.capitals_usd {
+            let capital_token0 = capital_usd / token0_usd;
+            let (target0, target1, target_liquidity) = autopool_backtest::cl_mint_amounts(
+                decimals0,
+                decimals1,
+                lower,
+                upper,
+                sqrt_x96,
+                capital_token0,
+            );
+            let target_ratio_1_per_0 = if target0 > 0.0 {
+                target1 / target0
+            } else {
+                f64::INFINITY
+            };
+            let active_capacity_usd_same_range = if target_liquidity > 0.0 {
+                capital_usd * pool_liquidity / target_liquidity
+            } else {
+                0.0
+            };
+            let position_to_active_liquidity_pct = if pool_liquidity > 0.0 {
+                target_liquidity / pool_liquidity * 100.0
+            } else {
+                0.0
+            };
+            let share_after_mint_pct = if pool_liquidity + target_liquidity > 0.0 {
+                target_liquidity / (pool_liquidity + target_liquidity) * 100.0
+            } else {
+                0.0
+            };
+            let token1_equiv = capital_token0 * price_token1_per_token0;
+            let token0_impact = solve_inventory_swap(
+                sqrt_x96,
+                pool_liquidity,
+                fee_fraction,
+                decimals0,
+                decimals1,
+                capital_token0,
+                0.0,
+                target_ratio_1_per_0,
+            )
+            .map(|plan| plan.price_impact_bps)
+            .unwrap_or(0.0);
+            let token1_impact = solve_inventory_swap(
+                sqrt_x96,
+                pool_liquidity,
+                fee_fraction,
+                decimals0,
+                decimals1,
+                0.0,
+                token1_equiv,
+                target_ratio_1_per_0,
+            )
+            .map(|plan| plan.price_impact_bps)
+            .unwrap_or(0.0);
+            let worst_impact = token0_impact.max(token1_impact);
+            let same_pool_rebalance_gate = if worst_impact <= args.impact_gate_bps {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            };
+            let note = capacity_truth_note(
+                position_to_active_liquidity_pct,
+                worst_impact,
+                args.impact_gate_bps,
+            );
+            rows.push(CapacityTruthRow {
+                capital_usd: round2(*capital_usd),
+                target_position_liquidity_raw: target_liquidity,
+                active_capacity_usd_same_range: round2(active_capacity_usd_same_range),
+                position_to_active_liquidity_pct: round2(position_to_active_liquidity_pct),
+                share_after_mint_pct: round2(share_after_mint_pct),
+                token0_only_rebalance_impact_bps: round2(token0_impact),
+                token1_only_rebalance_impact_bps: round2(token1_impact),
+                worst_same_pool_rebalance_impact_bps: round2(worst_impact),
+                same_pool_rebalance_gate,
+                note,
+            });
+        }
+
+        reports.push(CapacityTruthPoolReport {
+            symbol: pool.candidate.symbol,
+            pool_address: pool.pool_address,
+            token0,
+            token1,
+            decimals0,
+            decimals1,
+            token0_usd: round4(token0_usd),
+            token0_usd_source,
+            price_token1_per_token0: round6(price_token1_per_token0),
+            fee_bps: round2(fee_bps),
+            current_tick: state.current_tick,
+            tick_spacing: spacing,
+            half_width_ticks: args.half_width_ticks,
+            target_lower: lower,
+            target_upper: upper,
+            pool_active_liquidity_raw: state.liquidity,
+            rows,
+        });
+    }
+
+    if args.format == OutputFormat::Json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+        return Ok(());
+    }
+
+    println!(
+        "capacity truth audit  half_width=±{} ticks  same_pool_impact_gate={:.1}bps",
+        args.half_width_ticks, args.impact_gate_bps
+    );
+    println!(
+        "{:<20} {:>7} {:>9} {:>13} {:>11} {:>11} {:>11} {:>7}  {}",
+        "pool", "fee", "capital", "act_cap", "pos/act%", "t0_imp", "t1_imp", "gate", "note"
+    );
+    for report in &reports {
+        for row in &report.rows {
+            println!(
+                "{:<20} {:>7.2} {:>9.0} {:>13.0} {:>11.2} {:>11.2} {:>11.2} {:>7}  {}",
+                report.symbol,
+                report.fee_bps,
+                row.capital_usd,
+                row.active_capacity_usd_same_range,
+                row.position_to_active_liquidity_pct,
+                row.token0_only_rebalance_impact_bps,
+                row.token1_only_rebalance_impact_bps,
+                row.same_pool_rebalance_gate,
+                row.note
+            );
+        }
+    }
+    println!(
+        "act_cap = current active liquidity converted to the same target range; t0/t1_imp = one-sided inventory -> target range via the same pool."
+    );
+    println!(
+        "This does not estimate external-router capacity; a failed same-pool impact gate is not a proof that the LP position itself cannot be sized."
+    );
+
+    Ok(())
+}
+
+async fn read_pool_tokens(rpc: &JsonRpcClient, pool_address: &str) -> Result<(String, String)> {
+    let token0 = decode_address_result_word(&rpc.eth_call(pool_address, "0x0dfe1681").await?);
+    let token1 = decode_address_result_word(&rpc.eth_call(pool_address, "0xd21220a7").await?);
+    Ok((token0, token1))
+}
+
+async fn read_pool_fee_bps(rpc: &JsonRpcClient, pool_address: &str) -> Result<f64> {
+    let raw = rpc.eth_call(pool_address, "0xddca3f43").await?;
+    Ok(parse_hex_u64_lossy(&raw)
+        .map(|value| value as f64 / 100.0)
+        .unwrap_or(0.0))
+}
+
+fn decode_address_result_word(hex: &str) -> String {
+    let s = hex.trim_start_matches("0x");
+    let tail = if s.len() >= 40 { &s[s.len() - 40..] } else { s };
+    format!("0x{}", tail.to_ascii_lowercase())
+}
+
+fn price_token1_per_token0(sqrt_x96: f64, decimals0: u8, decimals1: u8) -> f64 {
+    let p_raw = (sqrt_x96 / 79_228_162_514_264_337_593_543_950_336.0).powi(2);
+    p_raw * 10f64.powi(decimals0 as i32 - decimals1 as i32)
+}
+
+async fn infer_base_weth_usd(rpc: &JsonRpcClient, reference_pool: &str) -> Result<Option<f64>> {
+    let state = rpc.read_cl_pool_state(reference_pool).await?;
+    let (token0, token1) = read_pool_tokens(rpc, reference_pool).await?;
+    let Some(decimals0) = read_erc20_decimals(rpc, &token0).await? else {
+        return Ok(None);
+    };
+    let Some(decimals1) = read_erc20_decimals(rpc, &token1).await? else {
+        return Ok(None);
+    };
+    let price = price_token1_per_token0(
+        hex_word_to_f64(&state.sqrt_price_x96_hex),
+        decimals0,
+        decimals1,
+    );
+    if is_base_weth(&token0) && is_base_stable(&token1) {
+        Ok(Some(price))
+    } else if is_base_stable(&token0) && is_base_weth(&token1) && price > 0.0 {
+        Ok(Some(1.0 / price))
+    } else {
+        Ok(None)
+    }
+}
+
+fn infer_token0_usd(
+    token0: &str,
+    token1: &str,
+    price_token1_per_token0: f64,
+    fallback_token0_usd: Option<f64>,
+    weth_usd: Option<f64>,
+) -> Option<(f64, String)> {
+    if is_base_stable(token0) {
+        return Some((1.0, "token0_stable".to_string()));
+    }
+    if is_base_stable(token1) && price_token1_per_token0 > 0.0 {
+        return Some((price_token1_per_token0, "token1_stable".to_string()));
+    }
+    if let Some(value) = fallback_token0_usd {
+        return Some((value, "manual_fallback".to_string()));
+    }
+    if let Some(weth_usd) = weth_usd {
+        if is_base_weth(token0) {
+            return Some((weth_usd, "weth_usdc_reference_token0".to_string()));
+        }
+        if is_base_weth(token1) && price_token1_per_token0 > 0.0 {
+            return Some((
+                price_token1_per_token0 * weth_usd,
+                "weth_usdc_reference_token1".to_string(),
+            ));
+        }
+    }
+    None
+}
+
+fn is_base_weth(address: &str) -> bool {
+    address.eq_ignore_ascii_case(BASE_WETH)
+}
+
+fn is_base_stable(address: &str) -> bool {
+    [BASE_USDC, BASE_USDBC, BASE_USDT, BASE_DAI]
+        .iter()
+        .any(|stable| address.eq_ignore_ascii_case(stable))
+}
+
+fn capacity_truth_note(active_pct: f64, worst_impact_bps: f64, gate_bps: f64) -> String {
+    match (active_pct > 25.0, worst_impact_bps > gate_bps) {
+        (true, true) => "LP-share large; same-pool rebalance limited".to_string(),
+        (true, false) => "LP-share large; same-pool rebalance ok".to_string(),
+        (false, true) => "same-pool rebalance limited".to_string(),
+        (false, false) => "capacity ok for this local check".to_string(),
+    }
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+fn round6(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
 struct ScanActivityArgs {
     rpc_url: String,
     min_tvl_usd: f64,
@@ -9640,6 +10051,46 @@ mod tests {
         assert_eq!(
             risk_token_inventory_share(1.0, 1.0, 0.0, RiskTokenSide::Token1),
             0.0
+        );
+    }
+
+    #[test]
+    fn capacity_truth_infers_stable_and_weth_token0_usd() {
+        let token1_stable = infer_token0_usd(BASE_WETH, BASE_USDC, 1_600.0, None, None)
+            .expect("stable token1 infers token0 USD");
+        assert_eq!(token1_stable.0, 1_600.0);
+        assert_eq!(token1_stable.1, "token1_stable");
+
+        let token0_stable = infer_token0_usd(BASE_USDC, BASE_WETH, 0.000625, None, None)
+            .expect("stable token0 infers $1");
+        assert_eq!(token0_stable.0, 1.0);
+        assert_eq!(token0_stable.1, "token0_stable");
+
+        let weth_reference = infer_token0_usd(
+            BASE_WETH,
+            "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+            3_400.0,
+            None,
+            Some(1_600.0),
+        )
+        .expect("WETH reference infers non-stable pair token0 USD");
+        assert_eq!(weth_reference.0, 1_600.0);
+        assert_eq!(weth_reference.1, "weth_usdc_reference_token0");
+    }
+
+    #[test]
+    fn capacity_truth_note_splits_lp_share_from_same_pool_impact() {
+        assert_eq!(
+            capacity_truth_note(2.0, 10.0, 30.0),
+            "capacity ok for this local check"
+        );
+        assert_eq!(
+            capacity_truth_note(2.0, 45.0, 30.0),
+            "same-pool rebalance limited"
+        );
+        assert_eq!(
+            capacity_truth_note(40.0, 45.0, 30.0),
+            "LP-share large; same-pool rebalance limited"
         );
     }
 

@@ -4,6 +4,14 @@ Snapshot: 2026-06-30 CST. Decision document built only from existing evidence
 (no new experiments). It answers one question: **given everything we have learned,
 should we deploy capital into an automated LP strategy now?**
 
+**Revision note:** the no-go decision for unattended deployment still stands, but
+the capacity wording below is too broad. A later live audit in
+[`capacity-truth-audit.md`](capacity-truth-audit.md) shows that mainstream deep
+WETH-USDC pools can support `$50k-$100k` local capacity; the `$1k-$3k` claim applies
+to the specific high-fee WETH-USDC 200 bps pool and same-pool rebalance impact, not
+to all mainstream pools or the whole autoLP thesis. The corrected next step is
+capacity-first mainstream-pool validation, not more thin hot-pool scanning.
+
 Bottom line up front: **NO-GO for deploying capital now.** The research succeeded —
 it produced a validated mechanism *and* a validated negative: at retail capital scale,
 edge net of cost and capacity is ≈ 0. Stop spending build cycles on pool-hunting;

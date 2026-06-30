@@ -2,6 +2,14 @@
 
 Snapshot: 2026-06-28 15:25 CST.
 
+Revision note, 2026-06-30 CST: this document's `$1k-$3k` pilot recommendation was
+based on the high-fee WETH-USDC 200 bps pool's same-pool rebalance impact. It should
+not be read as a global mainstream-pool capacity ceiling. See
+[`capacity-truth-audit.md`](capacity-truth-audit.md): deep WETH-USDC capacity is much
+larger, while fee density is lower. The launch recommendation remains "no autonomous
+live trading," but the next shadow milestone should be a `$10k/$50k/$100k`
+capacity-first matrix across mainstream pools.
+
 ## Current Score
 
 The strategy has **evidence of edge**, but it is not the naive strategy we started
