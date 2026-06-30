@@ -165,3 +165,110 @@ Next bounded step, if continuing:
    because cross-regime drift is what killed the merged replay;
 3. do not spend time on pools whose credible fee APR is below `100%`;
 4. do not promote Meteora API APR until historical active-bin liquidity is solved.
+
+## Follow-up: Orca Resample and Stand-down Filter
+
+Follow-up snapshot: 2026-06-30 CST.
+
+The next bounded push tested two hypotheses:
+
+1. the prior Orca `SOL-USDC` fresh sample was sparse because the sampler was broken;
+2. CARDS-like pools can be rescued by a no-lookahead platform filter that stands
+   down after trend/volatile windows and only re-enters after a prior range window.
+
+### Orca SOL-USDC Resample
+
+A direct diagnostic of the newest `200` pool-address signatures showed:
+
+- `33` successful transactions;
+- `25` Whirlpool swap logs among successful transactions;
+- token balance owner deltas correctly included the pool address.
+
+So the parser was not structurally broken. The previous `8`-row fresh sample was a
+bad/quiet slice with many failed transactions and few successful swaps.
+
+Rerunning the sampler later produced a valid current burst:
+
+- scanned `468` successful signatures;
+- kept `97` swaps;
+- tx errors `0`;
+- slot span `429799968..429800955`;
+- replay wall-clock span about `6.6` minutes.
+
+The current burst still rejected:
+
+| policy | net PnL | vs hold | fees | fee-LVR | mechanical net APR | max DD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| delta_hedged | -$0.12 | $8.08 | $0.11 | $0.07 | -92% | $0.14 |
+| hedged_wide | -$0.01 | $8.18 | $0.01 | $0.01 | -10% | $0.02 |
+| vol_scaled_rebalance | -$8.43 | -$0.23 | $0.22 | $0.15 | -6731% | $8.44 |
+
+Rolling delta-hedged gate:
+
+| window | windows | win vs hold | mean net | mean vs hold | p05 net APR | verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 25:10 | 8 | 100% | $0.01 | $2.09 | -107% | reject |
+| 40:15 | 4 | 100% | $0.00 | $2.95 | -36% | reject |
+| 60:20 | 2 | 100% | -$0.01 | $4.25 | -23% | reject |
+
+Merging the old `187` rows with the new `97` rows produced `284` unique rows and a
+stronger rejection:
+
+| window | windows | win vs hold | mean net | mean vs hold | p05 net APR | verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 25:10 | 26 | 54% | -$2.15 | -$8.33 | -926% | reject |
+| 40:15 | 17 | 47% | -$5.07 | -$19.64 | -680% | reject |
+| 60:20 | 12 | 50% | -$7.15 | -$27.57 | -309% | reject |
+| 80:25 | 9 | 44% | -$9.57 | -$36.60 | -198% | reject |
+
+Decision: **Orca SOL-USDC stays unpromoted.** It has capacity and credible
+`>=100%` 24h APR, but the current fee density is not enough after rolling
+fee-minus-LVR and hold comparison.
+
+### Stand-down Cash Filter
+
+The CLI now supports `stand-down-cash` inside `replay-promotion-gate
+--gate-policy lagged-policy-switch`. It is a strict no-lookahead window control:
+use the previous window's regime, and if the rule selects `stand_down_cash`, model
+the next window as holding cash with:
+
+- net PnL `0`;
+- fees `0`;
+- drawdown `0`;
+- `vs_hold = -hold_50_50_window_pnl`.
+
+This intentionally keeps the benchmark hard. Standing down only helps if avoiding
+inventory beats holding the underlying tokens.
+
+CARDS merged sample (`316` rows) results:
+
+| rule | window | windows | win vs hold | mean net | mean vs hold | p05 net APR | worst DD | verdict |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| range=delta, others=stand_down | 25:10 | 29 | 62% | -$8.21 | $45.02 | 0% | $319.01 | reject |
+| range=delta, others=stand_down | 40:15 | 18 | 67% | -$9.80 | $80.33 | -1128% | $275.65 | reject |
+| range=delta, others=stand_down | 60:20 | 12 | 58% | $4.61 | $142.23 | 0% | $10.91 | reject |
+| range=delta, others=stand_down | 80:25 | 9 | 67% | -$17.03 | $227.34 | -804% | $202.11 | reject |
+| all=stand_down | 40:15 | 18 | 61% | $0.00 | $90.13 | 0% | $0.00 | reject |
+
+Decision: **simple platform filtering is not enough.** It reduces drawdown, but it
+also converts left-tail APR to `0%` or leaves negative windows from delayed
+classification. That does not satisfy the `>=500%` promotion tail gate and does
+not meet the user's `APR>=100%` continuation rule.
+
+### Updated Stage Decision
+
+The latest push makes the state sharper:
+
+- `Orca SOL-USDC`: reject for now despite capacity.
+- `SNDK-USDC`: reject.
+- `CARDS-USDC`: short-burst edge exists, but merged regime and stand-down filters
+  reject.
+
+The next useful work is not more small parameter tuning. It is either:
+
+1. solve Meteora historical active-bin replay for a genuinely high fee-density
+   venue; or
+2. build a different CARDS-style entry signal that predicts the burst before the
+   adverse platform migration, not after it.
+
+Until then, there is still **no deployable AILP strategy**.

@@ -107,6 +107,7 @@ impl PromotionGatePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 enum RegimeSwitchPolicy {
+    StandDownCash,
     Hold,
     PassiveWide,
     NarrowRebalance,
@@ -117,6 +118,7 @@ enum RegimeSwitchPolicy {
 impl RegimeSwitchPolicy {
     fn label(self) -> &'static str {
         match self {
+            Self::StandDownCash => "stand_down_cash",
             Self::Hold => "hold_50_50",
             Self::PassiveWide => "passive_wide",
             Self::NarrowRebalance => "narrow_rebalance",
@@ -7664,10 +7666,14 @@ fn summarize_lagged_policy_switch_rows(
             continue;
         };
         let target_policy = rule.policy_for_prior_regime(&prior_regime);
-        if let Some(row) = rows
-            .iter()
-            .find(|row| row.window_index == window_index && row.policy == target_policy)
-        {
+        let selected_row = if target_policy == "stand_down_cash" {
+            stand_down_cash_row(rows, window_index)
+        } else {
+            rows.iter()
+                .find(|row| row.window_index == window_index && row.policy == target_policy)
+                .cloned()
+        };
+        if let Some(row) = selected_row {
             selected.push(row.clone());
         } else {
             skipped += 1;
@@ -7717,6 +7723,22 @@ fn summarize_lagged_policy_switch_rows(
             .map(|row| row.max_drawdown_usd)
             .fold(0.0, f64::max),
     }]
+}
+
+fn stand_down_cash_row(rows: &[WindowPolicyRow], window_index: usize) -> Option<WindowPolicyRow> {
+    let hold = rows
+        .iter()
+        .find(|row| row.window_index == window_index && row.policy == "hold_50_50")?;
+    let mut row = hold.clone();
+    row.policy = "stand_down_cash".to_string();
+    row.net_pnl_usd = 0.0;
+    row.net_vs_hold_usd = -hold.net_pnl_usd;
+    row.fee_minus_lvr_usd = 0.0;
+    row.net_apr_pct = Some(0.0);
+    row.fee_lvr_apr_pct = Some(0.0);
+    row.max_drawdown_usd = 0.0;
+    row.rebalances = 0;
+    Some(row)
 }
 
 fn summarize_lagged_policy_blend_rows(
@@ -10343,6 +10365,32 @@ mod tests {
         assert_eq!(summary[0].mean_net_pnl_usd, 9.0);
         assert_eq!(summary[0].mean_net_vs_hold_usd, 7.0);
         assert_eq!(summary[0].p05_net_apr_pct, Some(900.0));
+    }
+
+    #[test]
+    fn lagged_policy_switch_can_stand_down_to_cash() {
+        let rule = RegimePolicyRule {
+            range_policy: RegimeSwitchPolicy::DeltaHedged,
+            volatile_policy: RegimeSwitchPolicy::StandDownCash,
+            trend_money_policy: RegimeSwitchPolicy::StandDownCash,
+            trend_risk_policy: RegimeSwitchPolicy::StandDownCash,
+        };
+        let rows = vec![
+            policy_window_row(0, "volatile_range", "hold_50_50", -5.0, 0.0, -500.0, 5.0),
+            policy_window_row(0, "volatile_range", "delta_hedged", 1.0, 6.0, 100.0, 1.0),
+            policy_window_row(1, "range", "hold_50_50", -7.0, 0.0, -700.0, 7.0),
+            policy_window_row(1, "range", "delta_hedged", -2.0, 5.0, -200.0, 2.0),
+        ];
+
+        let summary = summarize_lagged_policy_switch_rows(&rows, &rule);
+
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].windows, 1);
+        assert_eq!(summary[0].skipped_windows, 1);
+        assert_eq!(summary[0].mean_net_pnl_usd, 0.0);
+        assert_eq!(summary[0].mean_net_vs_hold_usd, 7.0);
+        assert_eq!(summary[0].p05_net_apr_pct, Some(0.0));
+        assert_eq!(summary[0].worst_max_drawdown_usd, 0.0);
     }
 
     #[test]
