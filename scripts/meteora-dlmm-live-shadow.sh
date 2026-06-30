@@ -15,6 +15,7 @@ FLOW_LIMIT="${FLOW_LIMIT:-40}"
 SIGNATURE_SCAN_LIMIT="${SIGNATURE_SCAN_LIMIT:-250}"
 MAX_SIGNATURE_PAGES="${MAX_SIGNATURE_PAGES:-2}"
 REQUEST_SLEEP_MS="${REQUEST_SLEEP_MS:-100}"
+BEFORE_SIGNATURE="${BEFORE_SIGNATURE:-}"
 MAX_SLOT_DISTANCE="${MAX_SLOT_DISTANCE:-250}"
 WINDOW_OBSERVATIONS="${WINDOW_OBSERVATIONS:-15}"
 STEP_OBSERVATIONS="${STEP_OBSERVATIONS:-5}"
@@ -35,6 +36,7 @@ Options:
   --signature-scan-limit <n>       Signatures to scan per page.
   --max-signature-pages <n>        Signature pages to scan.
   --request-sleep-ms <n>           Sleep between transaction requests.
+  --before-signature <sig>         Start swap-flow scan before this signature.
   --max-slot-distance <n>          Strict join distance in slots.
   --window-observations <n>        Rolling DLMM replay window size.
   --step-observations <n>          Rolling DLMM replay step size.
@@ -73,6 +75,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --request-sleep-ms)
       REQUEST_SLEEP_MS="$2"
+      shift 2
+      ;;
+    --before-signature)
+      BEFORE_SIGNATURE="$2"
       shift 2
       ;;
     --max-slot-distance)
@@ -117,6 +123,11 @@ done
 
 mkdir -p "${OUT_DIR}" "$(dirname "${REPORT_OUT}")"
 
+FLOW_CURSOR_ARGS=()
+if [[ -n "${BEFORE_SIGNATURE}" ]]; then
+  FLOW_CURSOR_ARGS=(--before-signature "${BEFORE_SIGNATURE}")
+fi
+
 FLOW="${OUT_DIR}/dlmm-swap-flow.jsonl"
 FLOW_LATEST="${OUT_DIR}/dlmm-swap-flow.latest.json"
 SNAPSHOTS="${OUT_DIR}/dlmm-bin-snapshots.jsonl"
@@ -131,6 +142,9 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
   echo "spec=${SPEC}"
   echo "out_dir=${OUT_DIR}"
   echo "flow_limit=${FLOW_LIMIT} signature_scan_limit=${SIGNATURE_SCAN_LIMIT} max_signature_pages=${MAX_SIGNATURE_PAGES}"
+  if [[ -n "${BEFORE_SIGNATURE}" ]]; then
+    echo "before_signature=${BEFORE_SIGNATURE}"
+  fi
   echo "max_slot_distance=${MAX_SLOT_DISTANCE} window_observations=${WINDOW_OBSERVATIONS} step_observations=${STEP_OBSERVATIONS} capital_usd=${CAPITAL_USD}"
   echo
 
@@ -153,6 +167,7 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
     --limit "${FLOW_LIMIT}" \
     --signature-scan-limit "${SIGNATURE_SCAN_LIMIT}" \
     --max-signature-pages "${MAX_SIGNATURE_PAGES}" \
+    "${FLOW_CURSOR_ARGS[@]}" \
     --request-sleep-ms "${REQUEST_SLEEP_MS}" \
     --append
 

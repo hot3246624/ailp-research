@@ -520,6 +520,16 @@ under 250 slots and 6 under 400; capacity is better at about `0.12x`, but no rep
 window exists yet. SPCX is now the more useful live-shadow continuation than HYPE or
 cbBTC, unless a fresh Meteora queue reveals a higher active-liquidity USDC pool.
 
+Next heartbeat update: SPCX stayed blocked after another sample, with 50 flow rows but
+still only 4 joined under 250 slots and 6 under 400. A refreshed Meteora queue plus
+active-bin snapshots moved the lead to `MU-USDC` 20bps: HYPE 10bps active-liq was only
+about `$2.3k`, MET-USDC pools were about `$0.9k-$1.1k`, MU 50bps was about `$14.3k`,
+and MU 20bps was about `$16.0k`. MU 20bps decoded 9 swaps from 267 scanned signatures
+with 0 tx errors, and all 9 joined under strict 250 slots. It is not replayable yet,
+but it is the best current data-quality candidate. `scripts/meteora-dlmm-live-shadow.sh`
+now supports `--before-signature` so the next run can collect small cursor batches
+instead of repeating newest signatures.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text

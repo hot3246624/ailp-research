@@ -1078,6 +1078,22 @@ but also lacks enough joined rows for a promotion gate. The next useful heartbea
 to continue SPCX same-slot sampling, or refresh the Meteora queue for a higher
 active-liquidity USDC-numeraire pool rather than spending more cycles on HYPE.
 
+Follow-up sampling showed SPCX was also near-slot blocked: after a second strict run,
+SPCX had 50 flow rows but still only 4 joined rows under 250 slots and 6 joined under
+400 slots. Refreshing the Meteora queue moved attention to MU-USDC. Snapshot screening
+found the older HYPE 10bps pool had only about `$2.3k` active-bin liquidity and both
+MET-USDC pools were around `$0.9k-$1.1k`, while `MU-USDC` 50bps had about `$14.3k`
+and the larger `MU-USDC` 20bps pool had about `$16.0k`.
+
+The 20bps MU pool became the best current live-shadow target: it decoded 9 swaps from
+267 scanned signatures with 0 tx errors, and all 9 joined under the strict 250-slot
+gate. That is not enough for a 15-row replay window, but it is a better data-quality
+signal than SPCX/HYPE because the blocker is sample count, not stale joining. The
+live-shadow wrapper now exposes `--before-signature` so future heartbeats can use the
+swap-flow cursor and collect older pages instead of repeating the newest signatures.
+Large cursor scans were too slow on the current public RPC, so the next bounded step is
+small cursor batches or a better RPC/indexer, not a wider blind scan.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
