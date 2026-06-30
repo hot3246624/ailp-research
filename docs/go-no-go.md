@@ -11,6 +11,9 @@ WETH-USDC pools can support `$50k-$100k` local capacity; the `$1k-$3k` claim app
 to the specific high-fee WETH-USDC 200 bps pool and same-pool rebalance impact, not
 to all mainstream pools or the whole autoLP thesis. The corrected next step is
 capacity-first mainstream-pool validation, not more thin hot-pool scanning.
+After the user's 2026-06-30 business threshold, only pools with credible current
+APR `>=100%` should enter that validation; sub-100% pools are controls, not
+strategy candidates.
 
 Bottom line up front: **NO-GO for deploying capital now.** The research succeeded —
 it produced a validated mechanism *and* a validated negative: at retail capital scale,

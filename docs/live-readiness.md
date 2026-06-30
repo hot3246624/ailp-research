@@ -8,7 +8,9 @@ not be read as a global mainstream-pool capacity ceiling. See
 [`capacity-truth-audit.md`](capacity-truth-audit.md): deep WETH-USDC capacity is much
 larger, while fee density is lower. The launch recommendation remains "no autonomous
 live trading," but the next shadow milestone should be a `$10k/$50k/$100k`
-capacity-first matrix across mainstream pools.
+capacity-first matrix across mainstream pools **only when credible current APR is
+at least `100%`**. Sub-100% pools are useful controls but should not consume strategy
+build cycles.
 
 ## Current Score
 

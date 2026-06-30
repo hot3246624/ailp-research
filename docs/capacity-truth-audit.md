@@ -89,10 +89,32 @@ Therefore the current state is not "autoLP is dead." The corrected state is:
 capacity-first on mainstream pools, then prove fee/vol edge after LVR, funding,
 and routing costs.**
 
+## APR Kill Gate
+
+New business threshold: **do not advance a pool when credible current APR is below
+`100%`**. Capacity is necessary but not sufficient. A deep pool with `10 bps` swap
+impact and `10%-50%` APR is not worth the strategy stack.
+
+Use the gate this way:
+
+- reported or formula-implied organic fee APR must be at least `100%`;
+- reward-heavy APR does not pass unless reward liquidation and emissions durability
+  are modeled;
+- replay/shadow promotion must still prove positive fee-minus-LVR after rebalance,
+  hedge funding, routing, and operational costs;
+- pools below `100%` may be kept only as control datasets, not strategy candidates.
+
+Fresh Base/Aerodrome scan on 2026-06-30 with `tvl >= $100k` and `volume_1d >= $100k`
+found **no strategy candidate above `100%` APR**. The highest listed row was
+`EURC-USDC` at about `53.7%`; `WETH-AERO` was about `13.6%`; the WETH-USDC high-fee
+row was `0%` APY and below the 1d volume threshold. Therefore the Base mainstream
+capacity matrix should pause until a `>=100%` candidate appears.
+
 ## Next Research Direction
 
 Stop optimizing the memecoin/DLMM strict-window scanner until historical active
-liquidity is available. Move to a capacity-first matrix:
+liquidity is available. Move only `>=100%` APR candidates into a capacity-first
+matrix:
 
 1. Base/Aerodrome: WETH-USDC deep, WETH-AERO, AERO-USDC, cbBTC/USDC if available.
 2. Solana: SOL-USDC and major quote-asset pools, but capacity must come from real
@@ -104,5 +126,5 @@ liquidity is available. Move to a capacity-first matrix:
 
 The new go/no-go question is no longer "can we find a 2000% APR pool?" It is:
 
-**Can a mainstream pool produce enough fee density at `$50k-$100k` capacity after
-LVR, funding, and routed rebalance cost?**
+**Can a `>=100%` APR mainstream pool produce enough fee density at `$50k-$100k`
+capacity after LVR, funding, and routed rebalance cost?**
