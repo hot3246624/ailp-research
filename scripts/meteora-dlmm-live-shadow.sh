@@ -16,6 +16,7 @@ SIGNATURE_SCAN_LIMIT="${SIGNATURE_SCAN_LIMIT:-250}"
 MAX_SIGNATURE_PAGES="${MAX_SIGNATURE_PAGES:-2}"
 REQUEST_SLEEP_MS="${REQUEST_SLEEP_MS:-100}"
 BEFORE_SIGNATURE="${BEFORE_SIGNATURE:-}"
+CURSOR_FILE="${CURSOR_FILE:-}"
 MAX_SLOT_DISTANCE="${MAX_SLOT_DISTANCE:-250}"
 WINDOW_OBSERVATIONS="${WINDOW_OBSERVATIONS:-15}"
 STEP_OBSERVATIONS="${STEP_OBSERVATIONS:-5}"
@@ -37,6 +38,7 @@ Options:
   --max-signature-pages <n>        Signature pages to scan.
   --request-sleep-ms <n>           Sleep between transaction requests.
   --before-signature <sig>         Start swap-flow scan before this signature.
+  --cursor-file <path>             Read/write the next before-signature cursor.
   --max-slot-distance <n>          Strict join distance in slots.
   --window-observations <n>        Rolling DLMM replay window size.
   --step-observations <n>          Rolling DLMM replay step size.
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       BEFORE_SIGNATURE="$2"
       shift 2
       ;;
+    --cursor-file)
+      CURSOR_FILE="$2"
+      shift 2
+      ;;
     --max-slot-distance)
       MAX_SLOT_DISTANCE="$2"
       shift 2
@@ -123,6 +129,10 @@ done
 
 mkdir -p "${OUT_DIR}" "$(dirname "${REPORT_OUT}")"
 
+if [[ -z "${BEFORE_SIGNATURE}" && -n "${CURSOR_FILE}" && -s "${CURSOR_FILE}" ]]; then
+  BEFORE_SIGNATURE="$(head -n 1 "${CURSOR_FILE}")"
+fi
+
 FLOW_CURSOR_ARGS=()
 if [[ -n "${BEFORE_SIGNATURE}" ]]; then
   FLOW_CURSOR_ARGS=(--before-signature "${BEFORE_SIGNATURE}")
@@ -144,6 +154,9 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
   echo "flow_limit=${FLOW_LIMIT} signature_scan_limit=${SIGNATURE_SCAN_LIMIT} max_signature_pages=${MAX_SIGNATURE_PAGES}"
   if [[ -n "${BEFORE_SIGNATURE}" ]]; then
     echo "before_signature=${BEFORE_SIGNATURE}"
+  fi
+  if [[ -n "${CURSOR_FILE}" ]]; then
+    echo "cursor_file=${CURSOR_FILE}"
   fi
   echo "max_slot_distance=${MAX_SLOT_DISTANCE} window_observations=${WINDOW_OBSERVATIONS} step_observations=${STEP_OBSERVATIONS} capital_usd=${CAPITAL_USD}"
   echo
@@ -170,6 +183,16 @@ PROXY_LATEST="${OUT_DIR}/dlmm-bin-flow-proxy.latest.json"
     "${FLOW_CURSOR_ARGS[@]}" \
     --request-sleep-ms "${REQUEST_SLEEP_MS}" \
     --append
+  if [[ -n "${CURSOR_FILE}" ]]; then
+    NEXT_BEFORE_SIGNATURE="$(
+      node -e 'const fs=require("fs"); const p=process.argv[1]; const j=JSON.parse(fs.readFileSync(p, "utf8")); const v=j.summary?.next_before_signature ?? j.next_before_signature ?? ""; if (v) process.stdout.write(v);' "${FLOW_LATEST}"
+    )"
+    if [[ -n "${NEXT_BEFORE_SIGNATURE}" ]]; then
+      mkdir -p "$(dirname "${CURSOR_FILE}")"
+      printf '%s\n' "${NEXT_BEFORE_SIGNATURE}" > "${CURSOR_FILE}"
+      echo "next_before_signature=${NEXT_BEFORE_SIGNATURE}"
+    fi
+  fi
 
   echo
   echo "== snapshot after =="

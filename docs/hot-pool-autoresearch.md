@@ -1094,6 +1094,26 @@ swap-flow cursor and collect older pages instead of repeating the newest signatu
 Large cursor scans were too slow on the current public RPC, so the next bounded step is
 small cursor batches or a better RPC/indexer, not a wider blind scan.
 
+The next MU run confirmed the sampling shape. A newest-page small batch added 10 fresh
+MU rows and raised strict 250-slot joined rows from 9 to 12. An older-page cursor batch
+added 5 more flow rows, but strict joined rows stayed at 12 because those older swaps
+were outside the available live snapshot window. Rejoining the accumulated stream with
+a wider 400-slot proxy admitted 15 rows and produced one tiny rolling window:
+
+```text
+MU-USDC 20bps, 400-slot proxy: observations=15, windows=1, cap/active-liq ~0.07x
+centered: reject_proxy, net -$3.57, vs hold +$2.39, fees $2.89, p05APR -7388%, maxDD $6.46
+static:   reject_proxy, net -$4.71, vs hold +$1.24, fees $1.24, p05APR -9770%, maxDD $5.96
+```
+
+This is not a promotion signal. It does show MU has real fee capture and acceptable
+capacity, but inventory drift still dominates in the one available proxy window. The
+more important engineering lesson is that cursor backfill can add flow rows but cannot
+create strict historical active-liquidity snapshots. The live-shadow wrapper now also
+supports `--cursor-file`, which reads and writes the `next_before_signature` cursor so
+future heartbeats can run small continuous backfill batches without manually copying
+signatures.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage

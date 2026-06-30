@@ -530,6 +530,14 @@ but it is the best current data-quality candidate. `scripts/meteora-dlmm-live-sh
 now supports `--before-signature` so the next run can collect small cursor batches
 instead of repeating newest signatures.
 
+Follow-up MU sampling raised strict joined rows to 12 after a newest-page batch, but an
+older cursor batch added flow without adding strict joins because the older swaps were
+outside the live snapshot window. A 400-slot proxy join produced the first 15-row,
+1-window MU replay, and it rejected: centered net `-$3.57`, vs hold `+$2.39`, fees
+`$2.89`, p05 APR about `-7388%`, max drawdown `$6.46`, cap/active-liq about `0.07x`.
+This is still not a strategy promotion. The live-shadow runner now also supports
+`--cursor-file` to persist `next_before_signature` across small batches.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text
