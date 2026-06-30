@@ -62,6 +62,12 @@ as ready replay wins.
 
 Yes: the next candidate search should be Solana-first.
 
+Update: the first bounded replay pass after this queue is recorded in
+[`solana-apr100-stage-result.md`](solana-apr100-stage-result.md). Stage decision:
+`SNDK-USDC` rejected, `CARDS-USDC` shows a short-burst edge but fails merged
+cross-regime gates, and `Orca SOL-USDC` remains unpromoted because fresh sampling
+was too sparse while prior rolling gates rejected.
+
 Do **not** restart broad memecoin scanning. The next useful bounded work is:
 
 1. rerun Orca `SOL-USDC` normalized replay with current data, because it is the only
