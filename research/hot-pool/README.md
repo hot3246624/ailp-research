@@ -545,6 +545,13 @@ mean fees `$1.16`, p05 APR about `-5930%`, worst drawdown `$7.42`, cap/active-li
 about `0.08x`. This is the best strict MU evidence yet, but it is not a promoted
 strategy.
 
+The next wait-aligned MU batch decoded 10 more swaps with 0 tx errors, but strict
+joined rows stayed at 22 and rolling windows stayed at 2. The newest decoded swap was
+slot `429781160`, while the batch snapshots were `429782390` and `429783301`, outside
+the 250-slot strict join gate. MU therefore remains inconclusive after the existing
+negative two-window read; the immediate blocker is intermittent contemporaneous flow,
+not decoder failure.
+
 Orca `HYPE-USDC` final P1 coverage replay:
 
 ```text

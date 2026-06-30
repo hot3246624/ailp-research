@@ -1132,6 +1132,17 @@ and centered/static did beat hold in both tiny windows, but inventory drift stil
 overwhelmed fees. MU remains a live-shadow candidate for more windows, not a promoted
 strategy.
 
+The following wait-aligned heartbeat did not add strict windows. It decoded another
+10 MU swaps with 0 tx errors, but strict 250-slot joined rows stayed at 22 and rolling
+windows stayed at 2. The latest decoded flow in that batch was slot `429781160`, while
+the wait-aligned snapshots were `429782390` and `429783301`, so the newest visible
+swaps were still more than 250 slots away from the live active-liquidity snapshots.
+Interpretation: the wait-aligned method works when the pool has contemporaneous flow,
+but MU flow was intermittent in this period. This is not a promotion or a fresh
+strategy rejection beyond the existing two-window negative result; it means the next
+heartbeat should either collect another wait-aligned batch or refresh the Meteora queue
+if MU continues to produce no new strict rows.
+
 ### Orca HYPE-USDC Replay
 
 `HYPE-USDC` was the remaining replayable Orca P1 candidate after the SOL-pair coverage
